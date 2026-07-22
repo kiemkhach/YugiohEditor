@@ -1,0 +1,2 @@
+coverage>=7.6
+ruff>=0.9

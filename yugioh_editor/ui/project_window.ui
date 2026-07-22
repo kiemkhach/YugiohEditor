@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>ProjectWindow</class>
+ <widget class="QWidget" name="ProjectWindow">
+  <property name="minimumSize"><size><width>1100</width><height>700</height></size></property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item><layout class="QHBoxLayout" name="toolbarLayout">
+    <item><widget class="QPushButton" name="btnCardList"><property name="text"><string>Card List</string></property></widget></item>
+    <item><widget class="QPushButton" name="btnSaveFile"><property name="text"><string>Save Current File</string></property></widget></item>
+    <item><widget class="QPushButton" name="btnBuild"><property name="text"><string>Build</string></property></widget></item>
+    <item><widget class="QPushButton" name="btnBuildAndRun"><property name="text"><string>Run</string></property></widget></item>
+    <item><spacer name="horizontalSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
+    <item><widget class="QPushButton" name="btnCloseProject"><property name="text"><string>Close Project</string></property></widget></item>
+   </layout></item>
+   <item><widget class="QSplitter" name="splitter"><property name="orientation"><enum>Qt::Horizontal</enum></property>
+    <widget class="QTreeWidget" name="treeFiles">
+     <property name="minimumWidth"><number>200</number></property>
+     <property name="maximumWidth"><number>460</number></property>
+     <property name="horizontalScrollBarPolicy"><enum>Qt::ScrollBarAsNeeded</enum></property>
+     <column><property name="text"><string>Files</string></property></column>
+    </widget>
+    <widget class="QWidget" name="editorHost"><layout class="QVBoxLayout" name="editorLayout">
+     <property name="leftMargin"><number>0</number></property>
+     <property name="topMargin"><number>0</number></property>
+     <property name="rightMargin"><number>0</number></property>
+     <property name="bottomMargin"><number>0</number></property>
+    </layout></widget>
+   </widget></item>
+   <item><widget class="QProgressBar" name="pgbProgress"><property name="visible"><bool>false</bool></property><property name="minimum"><number>0</number></property><property name="maximum"><number>0</number></property><property name="textVisible"><bool>false</bool></property></widget></item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

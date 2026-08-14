@@ -3,6 +3,8 @@ import multiprocessing
 import queue
 import tempfile
 import unittest
+from copy import deepcopy
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +12,8 @@ import pandas as pd
 from PIL import Image
 
 from tests.pipeline_support import encode_description_resources
-from yugioh_editor.common.errors import ProjectValidationError
+from yugioh_editor.common import subfile_rules_config
+from yugioh_editor.common.errors import ProjectValidationError, RulePipelineError
 from yugioh_editor.models.entities import (
     ContainerArchive,
     ContainerEntry,
@@ -39,6 +42,37 @@ def _pack_project_process(project_root: str, result_queue) -> None:
 
 class ProjectPipelineTests(unittest.TestCase):
     @staticmethod
+    def _synthetic_executable_rule_config() -> tuple[bytes, dict, tuple[dict, ...]]:
+        profile = deepcopy(subfile_rules_config.EXECUTABLE_CARD_CAPACITY_PROFILE)
+        sites = (
+            *profile["integer_patch_sites"],
+            *profile["conditional_patch_sites"],
+        )
+        source_size = max(site["offset"] + len(site["expected"]) for site in sites)
+        source = bytearray(b"\xcc" * (source_size + 16))
+        for site in sites:
+            offset = site["offset"]
+            expected = site["expected"]
+            source[offset : offset + len(expected)] = expected
+        for site in profile["conditional_patch_sites"]:
+            source[site["offset"] - 2 : site["offset"]] = b"\xf3\xa5"
+        source_bytes = bytes(source)
+        profile["source_sha256"] = sha256(source_bytes).hexdigest()
+        profile["known_output_sha256"] = {}
+
+        configs = deepcopy(subfile_rules_config.SUBFILE_RULE_CONFIGS)
+        executable_rule = next(
+            config for config in configs if config["pattern"] == "*_pc.exe"
+        )
+        patch_step = next(
+            step
+            for step in executable_rule["pre_encode"]
+            if step["method_name"] == "patch_executable_card_capacity"
+        )
+        patch_step["params"]["profile"] = profile
+        return source_bytes, profile, configs
+
+    @staticmethod
     def _write_required_files(game):
         game.write_container(
             "data.dat",
@@ -46,10 +80,18 @@ class ProjectPipelineTests(unittest.TestCase):
                 source_name="data.dat",
                 entries=[
                     ContainerEntry(
+                        "bin#/card_id.bin",
+                        data=GameRepository.encode_binary_resource(
+                            "card_id.bin",
+                            pd.DataFrame({"value": [-1]}),
+                        ),
+                        order=0,
+                    ),
+                    ContainerEntry(
                         "misc/raw.yga",
                         data=b"RAW",
                         compressed=True,
-                        order=0,
+                        order=1,
                     ),
                 ],
             ),
@@ -95,6 +137,89 @@ class ProjectPipelineTests(unittest.TestCase):
             )
             output = service.pack_project(reloaded)
             self.assertEqual((output / "mai_pc.exe").read_bytes(), b"MZ-demo")
+
+    def test_pack_patches_executable_from_dynamic_card_id_count_only(self):
+        source, profile, configs = self._synthetic_executable_rule_config()
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch(
+                "yugioh_editor.repositories.game.repository.SUBFILE_RULE_CONFIGS",
+                configs,
+            ),
+        ):
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            game.write_executable("joey_pc.exe", source)
+
+            service = ProjectService()
+            manifest = service.create_project(
+                "Dynamic executable",
+                root_path / "workspace",
+                game_path,
+                "mai",
+            )
+            workspace_executable = manifest.root / "mai" / "mai_pc.exe"
+            self.assertEqual(workspace_executable.read_bytes(), source)
+
+            project = ProjectRepository(manifest)
+            project.save_table(
+                "card_ids",
+                pd.DataFrame({"value": [-1, *range(1115)]}),
+            )
+            observed_counts: list[int] = []
+            original_patch = GameRepository.patch_executable_card_capacity
+
+            def observe_patch(value, *, context, profile):
+                observed_counts.append(context.metadata["card_record_count"])
+                return original_patch(value, context=context, profile=profile)
+
+            with patch.object(
+                GameRepository,
+                "patch_executable_card_capacity",
+                new=staticmethod(observe_patch),
+            ):
+                first_output = service.pack_project(manifest)
+                first_packed = (first_output / "mai_pc.exe").read_bytes()
+                second_output = service.pack_project(manifest)
+                second_packed = (second_output / "mai_pc.exe").read_bytes()
+
+            self.assertEqual(observed_counts, [1116, 1116])
+            self.assertNotEqual(first_packed, source)
+            self.assertEqual(
+                sum(before != after for before, after in zip(source, first_packed)),
+                20,
+            )
+            self.assertEqual(second_packed, first_packed)
+            self.assertEqual(workspace_executable.read_bytes(), source)
+            self.assertEqual((game_path / "joey_pc.exe").read_bytes(), source)
+
+            derived = GameRepository._calculate_executable_card_capacity_values(
+                1116,
+                profile,
+            )
+            for site in profile["integer_patch_sites"]:
+                expected = bytearray(site["expected"])
+                start = site["value_offset"]
+                width = site["value_width"]
+                expected[start : start + width] = int(
+                    derived[site["value_name"]]
+                ).to_bytes(width, "little")
+                offset = site["offset"]
+                self.assertEqual(
+                    first_packed[offset : offset + len(expected)],
+                    bytes(expected),
+                    site["description"],
+                )
+            for site in profile["conditional_patch_sites"]:
+                offset = site["offset"]
+                self.assertEqual(first_packed[offset - 2 : offset], b"\xf3\xa5")
+                self.assertEqual(
+                    first_packed[offset : offset + len(site["expected"])],
+                    site["even_record_bytes"],
+                    site["description"],
+                )
 
     def test_create_project_uses_exact_required_prefix(self):
         with tempfile.TemporaryDirectory() as root:
@@ -268,6 +393,7 @@ class ProjectPipelineTests(unittest.TestCase):
             game_path = root_path / "game"
             game = GameFolderConnection(game_path)
             self._write_required_files(game)
+            game.write_executable("joey_pc.exe", b"MZ-rollback")
             card_ids = GameRepository.encode_binary_resource(
                 "card_id.bin",
                 pd.DataFrame({"value": [-1, 0, 1, 2068]}),
@@ -312,6 +438,15 @@ class ProjectPipelineTests(unittest.TestCase):
                 if path.is_file()
             }
 
+            def fail_executable_encode(
+                value,
+                *,
+                context,
+                profile,
+            ):
+                del value, context, profile
+                raise OSError("controlled executable encode failure")
+
             failures = (
                 (
                     "encode",
@@ -320,6 +455,7 @@ class ProjectPipelineTests(unittest.TestCase):
                         "encode_archive",
                         side_effect=OSError("controlled encode failure"),
                     ),
+                    OSError,
                 ),
                 (
                     "container write",
@@ -328,14 +464,24 @@ class ProjectPipelineTests(unittest.TestCase):
                         "write_container",
                         side_effect=OSError("controlled container write failure"),
                     ),
+                    OSError,
+                ),
+                (
+                    "executable encode",
+                    patch.object(
+                        GameRepository,
+                        "patch_executable_card_capacity",
+                        new=staticmethod(fail_executable_encode),
+                    ),
+                    RulePipelineError,
                 ),
             )
-            for label, failure in failures:
+            for label, failure, expected_error in failures:
                 with (
                     self.subTest(failure=label),
                     failure,
                     self.assertLogs(level="ERROR"),
-                    self.assertRaisesRegex(OSError, "controlled"),
+                    self.assertRaisesRegex(expected_error, "controlled"),
                 ):
                     service.pack_project(manifest)
 
@@ -352,6 +498,10 @@ class ProjectPipelineTests(unittest.TestCase):
                     if entry.relative_path.casefold().endswith("card_intid.bin")
                 )
                 self.assertEqual(reverse_after, reverse_before)
+                self.assertEqual(
+                    (game_path / "joey_pc.exe").read_bytes(),
+                    b"MZ-rollback",
+                )
                 self.assertEqual(
                     list(manifest.root.parent.glob(".Demo.pack.*.tmp")),
                     [],

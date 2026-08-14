@@ -144,8 +144,9 @@ The virtual `card_intid.bin` sidecar is generated as a reverse Card ID lookup,
 naturally sized to the containing power of two and encoded in full as unsigned
 16-bit little-endian records. The editor imposes no fixed record-count cap,
 while the codec still validates each record's representable range. A longer
-generated file does not guarantee support from the original game executable;
-analyzing or patching executable limits is a separate task.
+generated file does not guarantee support from an arbitrary game executable.
+For the supported Joey executable, Pack independently applies a SHA-identified
+capacity profile described below.
 
 Manifest loading validates localized paths and explicit language metadata.
 Unsupported language codes are reported with the affected resource path; the
@@ -200,6 +201,29 @@ Packing creates:
 ├── Region.dat
 └── <prefix>_pc.exe
 ```
+
+When an executable is present, Pack derives its active card capacity from the
+actual row count of the logical `card_ids` table. The count is not hard-coded to
+1116 and is not stored in `project.json`. The original game executable and the
+project's workspace executable remain byte-identical source files; only the
+copy written into Pack staging passes through the physical `*_pc.exe` rule,
+which uses the existing generic binary codec and a declarative pre-encode
+profile.
+
+The current Joey profile preserves bytes for counts through 1115, supports
+formula-driven encoding for counts 1116 through its statically inferred safe
+maximum 2166, and rejects larger counts without truncating card data. A patch
+requires the exact whole-file SHA-256 and validates every original instruction
+site before changing only declared immediates and the odd/even trailing-WORD
+instruction. The count-1116 output has a known regression hash; other counts
+are not rejected merely because they lack a known output hash. Unknown
+executables fail Pack when a patch is required, and normal Pack rollback keeps
+the previous `bin` intact.
+
+The formulas and one-card binary output are statically verified. One-card
+Windows runtime behavior is not yet dynamically verified. Counts above 1116
+are formula-driven but not runtime verified, and 2166 is inferred from the next
+known global address rather than being a general editor limit.
 
 The Project window's **Run** button only launches this already-packed
 executable; it never starts Pack or Build implicitly. A successful launch does

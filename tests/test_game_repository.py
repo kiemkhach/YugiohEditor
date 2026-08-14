@@ -1,6 +1,8 @@
+import hashlib
 import re
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -52,6 +54,119 @@ class GameConnectionTests(unittest.TestCase):
 
 
 class GameRepositoryTests(unittest.TestCase):
+    @staticmethod
+    def _synthetic_executable_profile():
+        source = bytearray(b"\xcc" * 104)
+        integer_sites = (
+            {
+                "offset": 4,
+                "expected": b"\x66\x81\xfe\x5b\x04",
+                "value_offset": 3,
+                "value_width": 2,
+                "value_name": "maximum_internal_id",
+                "description": "Synthetic maximum-ID getter.",
+            },
+            {
+                "offset": 16,
+                "expected": b"\x81\xfe\x5b\x04\x00\x00",
+                "value_offset": 2,
+                "value_width": 4,
+                "value_name": "exclusive_upper_bound",
+                "description": "Synthetic exclusive upper bound.",
+            },
+            {
+                "offset": 28,
+                "expected": b"\x3d\x82\x45\xa5\x00",
+                "value_offset": 1,
+                "value_width": 4,
+                "value_name": "state_end_address",
+                "description": "Synthetic state end pointer.",
+            },
+            {
+                "offset": 40,
+                "expected": b"\x3d\xb6\x08\x00\x00",
+                "value_offset": 1,
+                "value_width": 4,
+                "value_name": "state_byte_count",
+                "description": "Synthetic snapshot byte count.",
+            },
+            {
+                "offset": 52,
+                "expected": b"\xb9\x2d\x02\x00\x00",
+                "value_offset": 1,
+                "value_width": 4,
+                "value_name": "snapshot_dword_count",
+                "description": "Synthetic snapshot DWORD count.",
+            },
+            {
+                "offset": 64,
+                "expected": b"\x81\xec\xc8\x08\x00\x00",
+                "value_offset": 2,
+                "value_width": 4,
+                "value_name": "snapshot_stack_size",
+                "description": "Synthetic stack allocation.",
+            },
+            {
+                "offset": 76,
+                "expected": b"\x81\xc4\xc8\x08\x00\x00",
+                "value_offset": 2,
+                "value_width": 4,
+                "value_name": "snapshot_stack_size",
+                "description": "Synthetic stack release.",
+            },
+        )
+        conditional_sites = (
+            {
+                "offset": 88,
+                "expected": b"\x66\xa5",
+                "odd_record_bytes": b"\x66\xa5",
+                "even_record_bytes": b"\x90\x90",
+                "description": "Synthetic trailing WORD copy.",
+            },
+        )
+        for site in (*integer_sites, *conditional_sites):
+            offset = site["offset"]
+            expected = site["expected"]
+            source[offset : offset + len(expected)] = expected
+        immutable_source = bytes(source)
+        profile = {
+            "source_sha256": hashlib.sha256(immutable_source).hexdigest(),
+            "known_output_sha256": {},
+            "legacy_card_record_count": 1115,
+            "minimum_patched_record_count": 1116,
+            "maximum_card_record_count": 2166,
+            "state_base_address": 0x00A53CCC,
+            "state_limit_address": 0x00A54DB8,
+            "state_record_size": 2,
+            "snapshot_stack_overhead": 0x10,
+            "integer_patch_sites": integer_sites,
+            "conditional_patch_sites": conditional_sites,
+        }
+        return immutable_source, profile
+
+    @staticmethod
+    def _executable_patch_context(repository, metadata):
+        rule = repository.find_rule("mai_pc.exe")
+        return repository._create_rule_context(
+            rule,
+            relative_path="mai_pc.exe",
+            language=None,
+            metadata=metadata,
+        )
+
+    @classmethod
+    def _patch_synthetic_executable(cls, source, profile, record_count):
+        repository = GameRepository.from_root(".")
+        context = cls._executable_patch_context(
+            repository,
+            {"card_record_count": record_count},
+        )
+        return repository.patch_executable_card_capacity(
+            source,
+            context=context,
+            profile=profile,
+        )
+
     @staticmethod
     def _reverse_lookup_resources(values: list[int]) -> list[ProjectResource]:
         return [
@@ -269,6 +384,319 @@ class GameRepositoryTests(unittest.TestCase):
         )
         self.assertTrue(all(EXECUTABLE_PATTERN.fullmatch(name) for name in valid))
         self.assertTrue(all(not EXECUTABLE_PATTERN.fullmatch(name) for name in invalid))
+
+    def test_executable_card_capacity_formulas_are_dynamic_for_even_and_odd_counts(
+        self,
+    ):
+        _, profile = self._synthetic_executable_profile()
+        calculate = GameRepository._calculate_executable_card_capacity_values
+        self.assertEqual(
+            calculate(1116, profile),
+            {
+                "maximum_internal_id": 1115,
+                "exclusive_upper_bound": 1116,
+                "state_byte_count": 0x8B8,
+                "state_end_address": 0x00A54584,
+                "snapshot_dword_count": 0x22E,
+                "snapshot_has_tail_word": False,
+                "snapshot_stack_size": 0x8C8,
+            },
+        )
+        self.assertEqual(
+            calculate(1117, profile),
+            {
+                "maximum_internal_id": 1116,
+                "exclusive_upper_bound": 1117,
+                "state_byte_count": 0x8BA,
+                "state_end_address": 0x00A54586,
+                "snapshot_dword_count": 0x22E,
+                "snapshot_has_tail_word": True,
+                "snapshot_stack_size": 0x8CA,
+            },
+        )
+        maximum = calculate(2166, profile)
+        self.assertEqual(maximum["state_end_address"], 0x00A54DB8)
+        self.assertEqual(maximum["state_byte_count"], 0x10EC)
+
+    def test_executable_patch_rejects_non_binary_input(self):
+        _, profile = self._synthetic_executable_profile()
+        repository = GameRepository.from_root(".")
+        context = self._executable_patch_context(
+            repository,
+            {"card_record_count": 1116},
+        )
+
+        for value in (None, "bytes", memoryview(b"bytes"), [1, 2, 3]):
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaisesRegex(TypeError, "bytes or bytearray"):
+                    repository.patch_executable_card_capacity(
+                        value,
+                        context=context,
+                        profile=profile,
+                    )
+
+    def test_executable_patch_legacy_count_returns_arbitrary_input_unchanged(self):
+        _, profile = self._synthetic_executable_profile()
+        arbitrary = bytearray(b"not a recognized Joey executable")
+        original = bytes(arbitrary)
+
+        output = self._patch_synthetic_executable(arbitrary, profile, 1115)
+
+        self.assertIsInstance(output, bytes)
+        self.assertEqual(output, original)
+        self.assertEqual(arbitrary, bytearray(original))
+
+    def test_executable_patch_updates_all_derived_values_deterministically(self):
+        source, profile = self._synthetic_executable_profile()
+        mutable_source = bytearray(source)
+        original_profile = deepcopy(profile)
+
+        output = self._patch_synthetic_executable(mutable_source, profile, 1116)
+        repeated = self._patch_synthetic_executable(source, profile, 1116)
+
+        self.assertIsInstance(output, bytes)
+        self.assertEqual(output, repeated)
+        self.assertEqual(mutable_source, bytearray(source))
+        self.assertEqual(profile, original_profile)
+        expected_values = {
+            "maximum_internal_id": 1115,
+            "exclusive_upper_bound": 1116,
+            "state_end_address": 0x00A54584,
+            "state_byte_count": 0x8B8,
+            "snapshot_dword_count": 0x22E,
+            "snapshot_stack_size": 0x8C8,
+        }
+        encoded_values = {}
+        for site in profile["integer_patch_sites"]:
+            start = site["offset"] + site["value_offset"]
+            stop = start + site["value_width"]
+            value = int.from_bytes(output[start:stop], "little", signed=False)
+            encoded_values.setdefault(site["value_name"], []).append(value)
+            self.assertEqual(value, expected_values[site["value_name"]])
+        self.assertEqual(
+            encoded_values["snapshot_stack_size"],
+            [0x8C8, 0x8C8],
+        )
+
+        getter = profile["integer_patch_sites"][0]
+        getter_start = getter["offset"]
+        getter_stop = getter_start + len(getter["expected"])
+        self.assertEqual(output[getter_start:getter_stop], getter["expected"])
+        tail = profile["conditional_patch_sites"][0]
+        tail_start = tail["offset"]
+        tail_stop = tail_start + len(tail["expected"])
+        self.assertEqual(output[tail_start:tail_stop], b"\x90\x90")
+
+        covered = set()
+        for site in (
+            *profile["integer_patch_sites"],
+            *profile["conditional_patch_sites"],
+        ):
+            covered.update(
+                range(site["offset"], site["offset"] + len(site["expected"]))
+            )
+        self.assertTrue(
+            all(
+                output[index] == source[index]
+                for index in range(len(source))
+                if index not in covered
+            )
+        )
+
+    def test_executable_patch_uses_tail_word_and_dynamic_values_for_odd_count(self):
+        source, profile = self._synthetic_executable_profile()
+
+        output = self._patch_synthetic_executable(source, profile, 1117)
+
+        expected_values = {
+            "maximum_internal_id": 1116,
+            "exclusive_upper_bound": 1117,
+            "state_end_address": 0x00A54586,
+            "state_byte_count": 0x8BA,
+            "snapshot_dword_count": 0x22E,
+            "snapshot_stack_size": 0x8CA,
+        }
+        for site in profile["integer_patch_sites"]:
+            start = site["offset"] + site["value_offset"]
+            stop = start + site["value_width"]
+            self.assertEqual(
+                int.from_bytes(output[start:stop], "little", signed=False),
+                expected_values[site["value_name"]],
+            )
+        tail = profile["conditional_patch_sites"][0]
+        self.assertEqual(
+            output[tail["offset"] : tail["offset"] + len(tail["expected"])],
+            b"\x66\xa5",
+        )
+
+    def test_executable_patch_validates_known_hash_without_using_it_as_allowlist(self):
+        source, profile = self._synthetic_executable_profile()
+        expected = self._patch_synthetic_executable(source, profile, 1116)
+        checked_profile = deepcopy(profile)
+        checked_profile["known_output_sha256"] = {
+            1116: hashlib.sha256(expected).hexdigest()
+        }
+
+        self.assertEqual(
+            self._patch_synthetic_executable(source, checked_profile, 1116),
+            expected,
+        )
+        odd_output = self._patch_synthetic_executable(
+            source,
+            checked_profile,
+            1117,
+        )
+        self.assertNotEqual(odd_output, expected)
+
+        mismatched_profile = deepcopy(checked_profile)
+        mismatched_profile["known_output_sha256"][1116] = "0" * 64
+        with self.assertRaisesRegex(
+            ValueError,
+            r"Generated executable SHA-256 mismatch.*actual",
+        ):
+            self._patch_synthetic_executable(source, mismatched_profile, 1116)
+
+    def test_executable_patch_rejects_unknown_source_hash_with_actual_hash(self):
+        source, profile = self._synthetic_executable_profile()
+        unknown = bytearray(source)
+        unknown[0] ^= 0x01
+        actual_hash = hashlib.sha256(unknown).hexdigest()
+
+        with self.assertRaises(ValueError) as raised:
+            self._patch_synthetic_executable(unknown, profile, 1116)
+
+        self.assertIn(actual_hash, str(raised.exception).casefold())
+        self.assertEqual(unknown[0], source[0] ^ 0x01)
+
+    def test_executable_patch_reports_complete_site_mismatch(self):
+        source, profile = self._synthetic_executable_profile()
+        invalid_profile = deepcopy(profile)
+        site = invalid_profile["integer_patch_sites"][0]
+        site["expected"] = b"\x66\x81\xfe\x00\x04"
+
+        with self.assertRaises(ValueError) as raised:
+            self._patch_synthetic_executable(source, invalid_profile, 1116)
+
+        message = str(raised.exception).casefold()
+        self.assertIn(f"0x{site['offset']:x}", message)
+        self.assertIn(site["description"].casefold(), message)
+        self.assertTrue(
+            site["expected"].hex() in message or site["expected"].hex(" ") in message
+        )
+        actual = source[site["offset"] : site["offset"] + len(site["expected"])]
+        self.assertTrue(actual.hex() in message or actual.hex(" ") in message)
+
+    def test_executable_patch_reports_out_of_file_region_without_partial_output(self):
+        source, profile = self._synthetic_executable_profile()
+        truncated = source[:80]
+        invalid_profile = deepcopy(profile)
+        invalid_profile["source_sha256"] = hashlib.sha256(truncated).hexdigest()
+
+        with self.assertRaises(ValueError) as raised:
+            self._patch_synthetic_executable(truncated, invalid_profile, 1116)
+
+        message = str(raised.exception).casefold()
+        self.assertIn("region extends", message)
+        self.assertIn("expected", message)
+        self.assertIn("actual", message)
+        self.assertEqual(source[:80], truncated)
+
+    def test_executable_patch_rejects_derived_value_that_does_not_fit_site(self):
+        source, profile = self._synthetic_executable_profile()
+        narrow_profile = deepcopy(profile)
+        narrow_profile["integer_patch_sites"][0]["value_width"] = 1
+
+        with self.assertRaisesRegex(ValueError, r"does not fit unsigned 1-byte"):
+            self._patch_synthetic_executable(source, narrow_profile, 1116)
+
+    def test_executable_patch_rejects_capacity_before_source_validation(self):
+        _, profile = self._synthetic_executable_profile()
+        arbitrary = bytearray(b"not the profiled executable")
+
+        with self.assertRaisesRegex(ValueError, r"2166"):
+            self._patch_synthetic_executable(arbitrary, profile, 2167)
+
+        self.assertEqual(arbitrary, bytearray(b"not the profiled executable"))
+        self.assertNotEqual(
+            hashlib.sha256(arbitrary).hexdigest(), profile["source_sha256"]
+        )
+
+    def test_executable_patch_rejects_missing_and_invalid_count_metadata(self):
+        source, profile = self._synthetic_executable_profile()
+        repository = GameRepository.from_root(".")
+        cases = (
+            ("missing", {}),
+            ("string", {"card_record_count": "1116"}),
+            ("float", {"card_record_count": 1116.0}),
+            ("bool", {"card_record_count": True}),
+            ("negative", {"card_record_count": -1}),
+        )
+        for label, metadata in cases:
+            with self.subTest(label=label):
+                context = self._executable_patch_context(repository, metadata)
+                with self.assertRaisesRegex(
+                    (TypeError, ValueError),
+                    "card_record_count",
+                ):
+                    repository.patch_executable_card_capacity(
+                        source,
+                        context=context,
+                        profile=profile,
+                    )
+
+    def test_executable_patch_rejects_representative_invalid_profiles(self):
+        source, profile = self._synthetic_executable_profile()
+
+        invalid_hash = deepcopy(profile)
+        invalid_hash["source_sha256"] = "not-a-sha256"
+        invalid_width = deepcopy(profile)
+        invalid_width["integer_patch_sites"][0]["value_width"] = 3
+        empty_sites = deepcopy(profile)
+        empty_sites["integer_patch_sites"] = ()
+        overlapping_sites = deepcopy(profile)
+        overlapping_sites["integer_patch_sites"][1]["offset"] = 5
+        excessive_capacity = deepcopy(profile)
+        excessive_capacity["maximum_card_record_count"] = 2167
+        legacy_known_hash = deepcopy(profile)
+        legacy_known_hash["known_output_sha256"] = {
+            1115: "0" * 64,
+        }
+        missing_stack_epilogue = deepcopy(profile)
+        missing_stack_epilogue["integer_patch_sites"] = tuple(
+            site
+            for site in missing_stack_epilogue["integer_patch_sites"]
+            if site["description"] != "Synthetic stack release."
+        )
+        invalid_conditional_length = deepcopy(profile)
+        invalid_conditional_length["conditional_patch_sites"][0][
+            "even_record_bytes"
+        ] = b"\x90"
+        cases = (
+            ("hash", invalid_hash, r"sha-?256|hash"),
+            ("width", invalid_width, r"width|1, 2.*4"),
+            ("empty integer sites", empty_sites, r"integer.*(empty|non-empty)"),
+            ("overlap", overlapping_sites, r"overlap"),
+            ("capacity", excessive_capacity, r"capacity|2166"),
+            ("legacy known hash", legacy_known_hash, r"patched range 1116\.\.2166"),
+            (
+                "missing stack epilogue",
+                missing_stack_epilogue,
+                r"exactly two.*snapshot_stack_size",
+            ),
+            (
+                "conditional length",
+                invalid_conditional_length,
+                r"replacement lengths",
+            ),
+        )
+        for label, invalid_profile, message in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex((TypeError, ValueError), message):
+                    self._patch_synthetic_executable(
+                        source,
+                        invalid_profile,
+                        1116,
+                    )
 
     def test_repository_top_level_read_write_and_rules(self):
         with tempfile.TemporaryDirectory() as directory:

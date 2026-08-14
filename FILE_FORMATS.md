@@ -54,7 +54,96 @@ The required version prefix comes from the project-creation UI and is stored
 verbatim after surrounding whitespace is removed and validation succeeds.
 There is no implicit prefix when the field or manifest property is missing.
 The project stores executable bytes at `<prefix>/<prefix>_pc.exe` and packs
-them as `bin/<prefix>_pc.exe`. Executable data always remains raw bytes.
+them as `bin/<prefix>_pc.exe`. The original game file and editable workspace
+file always retain the source bytes. Only Pack staging receives the result of
+the physical `*_pc.exe` rule's generic-binary `pre_encode` pipeline.
+
+#### Dynamic card-capacity profile
+
+Pack reads the logical physical `card_ids` table and sets:
+
+```text
+card_record_count = len(card_id.bin records)
+maximum_internal_id = card_record_count - 1
+exclusive_upper_bound = card_record_count
+state_base_address = 0x00A53CCC
+state_record_size = 2
+state_byte_count = card_record_count * state_record_size
+state_end_address = state_base_address + state_byte_count
+snapshot_dword_count = state_byte_count // 4
+snapshot_has_tail_word = state_byte_count % 4 == 2
+snapshot_stack_size = state_byte_count + 0x10
+```
+
+Index zero remains the dummy, so real internal IDs occupy
+`1..card_record_count-1`. The formula is not specialized for count 1116 and
+does not use the maximum external Card ID, `card_intid.bin`, or `card_sort`.
+The count is operation metadata derived at Pack time and is not stored in the
+manifest.
+
+The supported Joey profile declares:
+
+| Field | Value |
+|---|---:|
+| Legacy record count | 1115 |
+| First patched record count | 1116 |
+| Maximum safe record count | 2166 |
+| State base | `0x00A53CCC` |
+| First known following data | `0x00A54DB8` |
+| State record size | 2 bytes |
+| Snapshot stack overhead | `0x10` bytes |
+| Source SHA-256 | `c5749eb934a1cf68d9236e44ff81e98b8aaee486b4f8ebd417440505d44ac1ea` |
+
+The maximum follows from
+`(0x00A54DB8 - 0x00A53CCC) / 2 = 2166`. This is a static
+safe limit of this executable profile, not an editor or card-data format limit.
+Counts at or below 1115 return the source bytes unchanged and do not require the
+Joey hash. Counts from 1116 through 2166 require the exact source hash and all
+original instruction bytes. Count 2167 or greater fails before mutation and
+does not truncate any card table.
+
+The profile declares 21 integer sites and one conditional site:
+
+| Derived value | File offsets |
+|---|---|
+| `maximum_internal_id` | `0x2315`, `0x6E5C7`, `0x6E5CE`, `0x76339`, `0x76340` |
+| `exclusive_upper_bound` | `0x3A9B2`, `0x3AA9D`, `0x45703`, `0x6E5B3`, `0x76327`, `0x7DBFD` |
+| `state_end_address` | `0x63F18`, `0x63F8B`, `0x7DA75`, `0x7DC7D`, `0x1BED0D`, `0x1BEE16` |
+| `snapshot_stack_size` | `0x7DCE0`, `0x7DDAB` |
+| `snapshot_dword_count` | `0x7DCEA` |
+| `state_byte_count` | `0x7DD89` |
+| conditional final WORD | `0x7DCFE` |
+
+Each integer entry stores the full expected original instruction, immediate
+offset and width, derived-value name, and description. Pack validates the full
+instruction, then replaces only its unsigned little-endian immediate. The
+conditional site is original `66 A5` (`MOVSW`): odd record counts retain it,
+while even record counts use `90 90` so the DWORD copy does not copy two extra
+bytes. Snapshot stack prologue and epilogue always use the same generated size.
+
+For the current one-card regression:
+
+```text
+card_record_count = 1116
+maximum_internal_id = 1115
+state_byte_count = 0x8B8
+state_end_address = 0x00A54584
+snapshot_dword_count = 0x22E
+snapshot_has_tail_word = false
+snapshot_stack_size = 0x8C8
+```
+
+The known output SHA-256 is
+`cd04132ea2915e186fa7c4d67f7db73fe9fdb784fc0c95c7ab5b96733d3da699`,
+with 20 changed bytes. A declared patch site may legitimately produce bytes
+identical to the original; for count 1116 this occurs at the getter and both
+stack-size sites, which are still validated. Known hashes are regression checks
+for selected counts, not the list of supported counts.
+
+Patch formulas and the one-card binary output are **Statically verified**.
+One-card Windows runtime behavior is **Not yet dynamically verified**. Counts
+above 1116 are **Formula-driven but not runtime verified**. The maximum 2166 is
+**Inferred from the next known global address**.
 
 ## `KCEJYUGI` container
 
@@ -371,6 +460,7 @@ The canonical structured rules are:
 
 | Filename pattern | Representation |
 |---|---|
+| `*_pc.exe` | physical binary with Pack-time capacity pre-encode |
 | `card_id.bin` | signed 16-bit table (`-1` is the card-back ID) |
 | `card_intid.bin` | generated reverse-ID table |
 | `card_pack.bin` | pack-mask table |
@@ -386,7 +476,8 @@ The canonical structured rules are:
 | `mini/list_card.txt` | mini-image catalog table |
 
 All other binary formats, including YGA resources and unknown `.bin` files,
-remain raw bytes.
+remain raw bytes. The executable workspace representation is also raw binary;
+its configured transformation exists only in the Pack encode pipeline.
 
 ### Generic structured operations
 
@@ -509,10 +600,10 @@ that codec as unsigned 16-bit little-endian records. The codec continues to
 reject values outside the representable record domain, but the editor does not
 apply a cap to the number of records.
 
-Generating a longer `card_intid.bin` establishes only the editor's output
-behavior. It does not establish that the original game executable can address
-additional cards; executable compatibility analysis or patching is a separate
-task and does not change this binary format.
+Generating a longer `card_intid.bin` establishes only the editor's data output
+behavior. The supported Joey executable uses the independent, SHA-identified
+Pack profile above; this does not imply compatibility for other executables and
+does not change the `card_intid.bin` format.
 
 ### `card_pack.bin`
 
@@ -978,10 +1069,12 @@ canonical CRLF record layout rather than preserving arbitrary input endings.
 
 ### Raw binary, YGA, and unknown formats
 
-Unknown `.bin` files, YGA resources, `Region.dat`, executables, and any
-unclassified payload remain raw bytes. Hexadecimal is only an editor
-presentation. A save operation converts displayed byte pairs back to binary;
-hexadecimal text is never used as the persisted representation.
+Unknown `.bin` files, YGA resources, `Region.dat`, and any unclassified payload
+remain raw bytes. Executables also remain raw in the original game folder and
+project workspace; a matching `*_pc.exe` is transformed only while its binary
+rule encodes Pack staging. Hexadecimal is only an editor presentation. A save
+operation converts displayed byte pairs back to binary; hexadecimal text is
+never used as the persisted representation.
 
 ## Virtual resources and pack dependencies
 
@@ -1065,6 +1158,9 @@ Packing applies these checks:
 - `card_sort<language>.bin` count equals the next power of two containing the
   `card_id.bin` row count;
 - card property values are representable;
+- a project executable has a `card_ids` logical table; its Pack metadata count
+  is within the selected profile, and any required source/output hashes and all
+  declared original instruction regions match;
 - output entry order and paths follow manifest metadata;
 - output offsets and sizes are recalculated;
 - container compression follows the requested policy.
@@ -1144,12 +1240,15 @@ validates row counts and splits it back into physical workspace tables.
 ### Raw workspace files
 
 Images, audio, executables, region data, YGA files, and unknown binary resources
-are written as raw bytes after container decompression.
+are written as raw bytes after container decompression. The executable
+workspace file is always the source version; its Pack-time encoded output is
+never written back to this path.
 
 Project creation uses a sibling staging directory and an atomic final rename.
 Packing builds a complete sibling output directory, validates it, and
 atomically replaces `bin`. A failure removes staging and preserves the previous
-output.
+output. Executable hash, patch-site, capacity, or output-hash failure uses this
+same rollback boundary, so already-written staging containers are not exposed.
 
 Card edits use the same transaction boundary. The project is cloned to staging,
 all new/replacement large and mini images are applied in one batch, logical

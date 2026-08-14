@@ -20,6 +20,30 @@ def physical(relative="bin#/card_id.bin", workspace="data/bin#/card_id.bin"):
 
 
 class ManifestValidationTests(unittest.TestCase):
+    def test_executable_capacity_count_is_derived_and_not_manifest_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = ProjectManifest(
+                "Executable metadata",
+                directory,
+                version_prefix="mai",
+                executable=ExecutableManifest(
+                    source_name="joey_pc.exe",
+                    relative_path="mai/mai_pc.exe",
+                ),
+            )
+
+            serialized = manifest.to_dict()
+
+            self.assertEqual(
+                serialized["executable"],
+                {
+                    "source_name": "joey_pc.exe",
+                    "relative_path": "mai/mai_pc.exe",
+                },
+            )
+            self.assertNotIn("card_record_count", serialized)
+            self.assertNotIn("card_record_count", serialized["executable"])
+
     def test_legacy_codec_and_generator_metadata_is_migrated(self):
         removed_generator_key = "gene" + "rator"
         with tempfile.TemporaryDirectory() as directory:

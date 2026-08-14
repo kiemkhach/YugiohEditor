@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -378,20 +379,53 @@ class GameRepository:
         file_name: str,
         workspace_path: str,
     ) -> ProjectResource:
-        resource = self.read_raw_resource(
-            file_name,
-            workspace_path,
-            file_kind="exe",
+        data = self._connection.read_executable(file_name)
+        matched = self._match_rule(workspace_path)
+        value: object = data
+        if matched is not None:
+            value = self._decode_rule_value(
+                matched[0],
+                data,
+                self._match_language(matched),
+                {},
+                relative_path=workspace_path,
+            )
+        if not isinstance(value, bytes):
+            raise TypeError(
+                f"Executable rule for '{workspace_path}' must decode to bytes."
+            )
+        return ProjectResource(
+            ProjectFileRecord(
+                source_file=file_name,
+                relative_path=workspace_path,
+                workspace_path=workspace_path,
+                file_kind="exe",
+                storage_format="binary",
+            ),
+            value,
         )
-        resource.record.relative_path = workspace_path
-        return resource
 
     def write_executable_resource(
         self,
         file_name: str,
         resource: ProjectResource,
+        *,
+        metadata: Mapping[str, object] | None = None,
     ) -> Path:
-        return self._connection.write_executable(file_name, bytes(resource.value))
+        resources = {self._normalize(resource.record.relative_path): resource}
+        operation_metadata: dict[str, object] = {
+            "resources": resources,
+            "generated_values": {},
+            "generation_stack": [],
+        }
+        if metadata is not None:
+            operation_metadata.update(metadata)
+        data = self._encode_resource(
+            resource,
+            resources,
+            metadata=operation_metadata,
+        )
+        return self._connection.write_executable(file_name, data)
 
     def read_binary_resource(
         self,
@@ -822,6 +856,594 @@ class GameRepository:
                             f"method '{step.method_name}' must be an existing "
                             "static method of GameRepository."
                         )
+
+    @staticmethod
+    def patch_executable_card_capacity(
+        value: object,
+        *,
+        context: RuleProcessingContext,
+        profile: Mapping[str, object],
+    ) -> bytes:
+        if not isinstance(value, (bytes, bytearray)):
+            raise TypeError(
+                "Executable capacity patch input must be bytes or bytearray."
+            )
+        source = bytes(value)
+        metadata = context.metadata
+        if not isinstance(metadata, Mapping):
+            raise TypeError("Executable encode metadata must be a mapping.")
+        if "card_record_count" not in metadata:
+            raise ValueError(
+                "Executable encode metadata is missing 'card_record_count'."
+            )
+        record_count = metadata["card_record_count"]
+        if type(record_count) is not int:
+            raise TypeError("'card_record_count' must be an integer and not bool.")
+        if record_count < 0:
+            raise ValueError("'card_record_count' cannot be negative.")
+
+        GameRepository._validate_executable_card_capacity_profile(profile)
+        legacy_count = GameRepository._require_executable_profile_integer(
+            profile,
+            "legacy_card_record_count",
+        )
+        minimum_count = GameRepository._require_executable_profile_integer(
+            profile,
+            "minimum_patched_record_count",
+        )
+        maximum_count = GameRepository._require_executable_profile_integer(
+            profile,
+            "maximum_card_record_count",
+        )
+        if record_count <= legacy_count:
+            return source
+        if record_count < minimum_count:
+            raise ValueError(
+                "Executable profile does not support card record count "
+                f"{record_count}; its patched range starts at {minimum_count}."
+            )
+        if record_count > maximum_count:
+            raise ValueError(
+                "Executable profile supports at most "
+                f"{maximum_count} card records; got {record_count}."
+            )
+
+        derived = GameRepository._calculate_executable_card_capacity_values(
+            record_count,
+            profile,
+        )
+        state_limit = GameRepository._require_executable_profile_integer(
+            profile,
+            "state_limit_address",
+        )
+        if int(derived["state_end_address"]) > state_limit:
+            raise ValueError(
+                "Generated card-state end address exceeds the executable profile "
+                f"limit 0x{state_limit:08X}."
+            )
+
+        integer_sites = profile["integer_patch_sites"]
+        conditional_sites = profile["conditional_patch_sites"]
+        assert isinstance(integer_sites, Sequence)
+        assert isinstance(conditional_sites, Sequence)
+        encoded_values: list[bytes] = []
+        for site in integer_sites:
+            assert isinstance(site, Mapping)
+            value_name = str(site["value_name"])
+            width = int(site["value_width"])
+            generated_value = derived[value_name]
+            if type(generated_value) is not int:
+                raise TypeError(
+                    f"Derived executable value '{value_name}' must be an integer."
+                )
+            if generated_value < 0 or generated_value >= 1 << (width * 8):
+                raise ValueError(
+                    f"Derived value '{value_name}' ({generated_value}) does not fit "
+                    f"unsigned {width}-byte patch site '{site['description']}'."
+                )
+            encoded_values.append(generated_value.to_bytes(width, "little"))
+
+        source_sha256 = hashlib.sha256(source).hexdigest()
+        expected_source_sha256 = str(profile["source_sha256"]).casefold()
+        if source_sha256 != expected_source_sha256:
+            raise ValueError(
+                "Unsupported executable source SHA-256: "
+                f"expected {expected_source_sha256}, actual {source_sha256}."
+            )
+        GameRepository._validate_executable_patch_regions(
+            source,
+            integer_sites,
+            conditional_sites,
+        )
+
+        output = bytearray(source)
+        for site, encoded_value in zip(integer_sites, encoded_values, strict=True):
+            assert isinstance(site, Mapping)
+            offset = int(site["offset"])
+            value_offset = int(site["value_offset"])
+            start = offset + value_offset
+            output[start : start + len(encoded_value)] = encoded_value
+
+        has_tail_word = derived["snapshot_has_tail_word"]
+        if type(has_tail_word) is not bool:
+            raise TypeError("Derived snapshot tail marker must be bool.")
+        for site in conditional_sites:
+            assert isinstance(site, Mapping)
+            offset = int(site["offset"])
+            replacement = (
+                site["odd_record_bytes"] if has_tail_word else site["even_record_bytes"]
+            )
+            assert isinstance(replacement, bytes)
+            output[offset : offset + len(replacement)] = replacement
+
+        result = bytes(output)
+        GameRepository._validate_generated_executable_patch(
+            result,
+            integer_sites,
+            conditional_sites,
+            encoded_values,
+            has_tail_word=has_tail_word,
+        )
+        known_hashes = profile["known_output_sha256"]
+        assert isinstance(known_hashes, Mapping)
+        known_sha256 = known_hashes.get(record_count)
+        if known_sha256 is not None:
+            generated_sha256 = hashlib.sha256(result).hexdigest()
+            if generated_sha256 != str(known_sha256).casefold():
+                raise ValueError(
+                    "Generated executable SHA-256 mismatch for card record count "
+                    f"{record_count}: expected {known_sha256}, "
+                    f"actual {generated_sha256}."
+                )
+        return result
+
+    @staticmethod
+    def _calculate_executable_card_capacity_values(
+        record_count: int,
+        profile: Mapping[str, object],
+    ) -> dict[str, int | bool]:
+        if type(record_count) is not int:
+            raise TypeError(
+                "Executable card record count must be an integer and not bool."
+            )
+        if record_count < 0:
+            raise ValueError("Executable card record count cannot be negative.")
+        if not isinstance(profile, Mapping):
+            raise TypeError("Executable card-capacity profile must be a mapping.")
+        state_base = GameRepository._require_executable_profile_integer(
+            profile,
+            "state_base_address",
+        )
+        state_record_size = GameRepository._require_executable_profile_integer(
+            profile,
+            "state_record_size",
+        )
+        stack_overhead = GameRepository._require_executable_profile_integer(
+            profile,
+            "snapshot_stack_overhead",
+        )
+        if state_record_size <= 0:
+            raise ValueError("'state_record_size' must be positive.")
+        state_byte_count = record_count * state_record_size
+        return {
+            "maximum_internal_id": record_count - 1,
+            "exclusive_upper_bound": record_count,
+            "state_byte_count": state_byte_count,
+            "state_end_address": state_base + state_byte_count,
+            "snapshot_dword_count": state_byte_count // 4,
+            "snapshot_has_tail_word": state_byte_count % 4 == 2,
+            "snapshot_stack_size": state_byte_count + stack_overhead,
+        }
+
+    @staticmethod
+    def _validate_executable_card_capacity_profile(
+        profile: Mapping[str, object],
+    ) -> None:
+        if not isinstance(profile, Mapping):
+            raise TypeError("Executable card-capacity profile must be a mapping.")
+        required_fields = {
+            "source_sha256",
+            "known_output_sha256",
+            "legacy_card_record_count",
+            "minimum_patched_record_count",
+            "maximum_card_record_count",
+            "state_base_address",
+            "state_limit_address",
+            "state_record_size",
+            "snapshot_stack_overhead",
+            "integer_patch_sites",
+            "conditional_patch_sites",
+        }
+        missing = required_fields.difference(profile)
+        if missing:
+            raise ValueError(
+                "Executable card-capacity profile is missing fields: "
+                + ", ".join(sorted(missing))
+                + "."
+            )
+        unknown = set(profile).difference(required_fields)
+        if unknown:
+            raise ValueError(
+                "Executable card-capacity profile has unknown fields: "
+                + ", ".join(sorted(str(field) for field in unknown))
+                + "."
+            )
+
+        GameRepository._validate_executable_sha256(
+            profile["source_sha256"],
+            "source_sha256",
+        )
+        known_hashes = profile["known_output_sha256"]
+        if not isinstance(known_hashes, Mapping):
+            raise TypeError("'known_output_sha256' must be a mapping.")
+        for count, digest in known_hashes.items():
+            if type(count) is not int or count < 0:
+                raise TypeError(
+                    "'known_output_sha256' keys must be non-negative integers "
+                    "and not bool."
+                )
+            GameRepository._validate_executable_sha256(
+                digest,
+                f"known_output_sha256[{count}]",
+            )
+
+        legacy_count = GameRepository._require_executable_profile_integer(
+            profile,
+            "legacy_card_record_count",
+        )
+        minimum_count = GameRepository._require_executable_profile_integer(
+            profile,
+            "minimum_patched_record_count",
+        )
+        maximum_count = GameRepository._require_executable_profile_integer(
+            profile,
+            "maximum_card_record_count",
+        )
+        state_base = GameRepository._require_executable_profile_integer(
+            profile,
+            "state_base_address",
+        )
+        state_limit = GameRepository._require_executable_profile_integer(
+            profile,
+            "state_limit_address",
+        )
+        state_record_size = GameRepository._require_executable_profile_integer(
+            profile,
+            "state_record_size",
+        )
+        GameRepository._require_executable_profile_integer(
+            profile,
+            "snapshot_stack_overhead",
+        )
+        if minimum_count != legacy_count + 1:
+            raise ValueError(
+                "'minimum_patched_record_count' must immediately follow "
+                "'legacy_card_record_count'."
+            )
+        if maximum_count < minimum_count:
+            raise ValueError(
+                "'maximum_card_record_count' must not be less than the minimum."
+            )
+        if state_base >= state_limit:
+            raise ValueError("'state_base_address' must be below the state limit.")
+        if state_record_size != 2:
+            raise ValueError(
+                "'state_record_size' must be 2 for the trailing-WORD snapshot rule."
+            )
+        state_capacity = state_limit - state_base
+        if state_capacity % state_record_size:
+            raise ValueError(
+                "Executable state capacity must be divisible by 'state_record_size'."
+            )
+        safe_record_count = state_capacity // state_record_size
+        if maximum_count > safe_record_count:
+            raise ValueError(
+                "'maximum_card_record_count' exceeds the state-address capacity "
+                f"of {safe_record_count}."
+            )
+        for known_count in known_hashes:
+            if known_count < minimum_count or known_count > maximum_count:
+                raise ValueError(
+                    f"Known output count {known_count} is outside the patched "
+                    f"range {minimum_count}..{maximum_count}."
+                )
+
+        integer_sites = GameRepository._require_executable_patch_sequence(
+            profile["integer_patch_sites"],
+            "integer_patch_sites",
+            allow_empty=False,
+        )
+        conditional_sites = GameRepository._require_executable_patch_sequence(
+            profile["conditional_patch_sites"],
+            "conditional_patch_sites",
+            allow_empty=False,
+        )
+        allowed_value_names = {
+            "maximum_internal_id",
+            "exclusive_upper_bound",
+            "state_end_address",
+            "state_byte_count",
+            "snapshot_dword_count",
+            "snapshot_stack_size",
+        }
+        integer_fields = {
+            "offset",
+            "expected",
+            "value_offset",
+            "value_width",
+            "value_name",
+            "description",
+        }
+        for index, site in enumerate(integer_sites):
+            GameRepository._validate_executable_patch_site_fields(
+                site,
+                integer_fields,
+                label=f"integer_patch_sites[{index}]",
+            )
+            offset = GameRepository._require_executable_site_integer(
+                site,
+                "offset",
+                label=f"integer_patch_sites[{index}]",
+            )
+            value_offset = GameRepository._require_executable_site_integer(
+                site,
+                "value_offset",
+                label=f"integer_patch_sites[{index}]",
+            )
+            expected = site["expected"]
+            if not isinstance(expected, bytes) or not expected:
+                raise TypeError(
+                    f"integer_patch_sites[{index}].expected must be non-empty bytes."
+                )
+            width = site["value_width"]
+            if type(width) is not int or width not in (1, 2, 4):
+                raise ValueError(
+                    f"integer_patch_sites[{index}].value_width must be 1, 2, or 4."
+                )
+            if value_offset + width > len(expected):
+                raise ValueError(
+                    f"integer_patch_sites[{index}] immediate exceeds expected bytes."
+                )
+            value_name = site["value_name"]
+            if not isinstance(value_name, str) or value_name not in allowed_value_names:
+                raise ValueError(
+                    f"integer_patch_sites[{index}].value_name is not supported: "
+                    f"{value_name!r}."
+                )
+            GameRepository._require_executable_site_description(
+                site,
+                label=f"integer_patch_sites[{index}]",
+            )
+            del offset
+        stack_site_count = sum(
+            site["value_name"] == "snapshot_stack_size" for site in integer_sites
+        )
+        if stack_site_count != 2:
+            raise ValueError(
+                "Executable profile must declare exactly two "
+                "'snapshot_stack_size' sites for stack allocation and release."
+            )
+
+        conditional_fields = {
+            "offset",
+            "expected",
+            "odd_record_bytes",
+            "even_record_bytes",
+            "description",
+        }
+        for index, site in enumerate(conditional_sites):
+            GameRepository._validate_executable_patch_site_fields(
+                site,
+                conditional_fields,
+                label=f"conditional_patch_sites[{index}]",
+            )
+            GameRepository._require_executable_site_integer(
+                site,
+                "offset",
+                label=f"conditional_patch_sites[{index}]",
+            )
+            expected = site["expected"]
+            odd_bytes = site["odd_record_bytes"]
+            even_bytes = site["even_record_bytes"]
+            if not isinstance(expected, bytes) or not expected:
+                raise TypeError(
+                    f"conditional_patch_sites[{index}].expected must be "
+                    "non-empty bytes."
+                )
+            if not isinstance(odd_bytes, bytes) or not isinstance(even_bytes, bytes):
+                raise TypeError(
+                    f"conditional_patch_sites[{index}] replacements must be bytes."
+                )
+            if len(odd_bytes) != len(expected) or len(even_bytes) != len(expected):
+                raise ValueError(
+                    f"conditional_patch_sites[{index}] replacement lengths must "
+                    "match expected bytes."
+                )
+            GameRepository._require_executable_site_description(
+                site,
+                label=f"conditional_patch_sites[{index}]",
+            )
+        declared_regions = sorted(
+            (
+                int(site["offset"]),
+                int(site["offset"]) + len(site["expected"]),
+                str(site["description"]),
+            )
+            for site in (*integer_sites, *conditional_sites)
+        )
+        for previous, current in zip(
+            declared_regions,
+            declared_regions[1:],
+            strict=False,
+        ):
+            if current[0] < previous[1]:
+                raise ValueError(
+                    "Executable patch regions overlap: "
+                    f"0x{previous[0]:X} ({previous[2]}) and "
+                    f"0x{current[0]:X} ({current[2]})."
+                )
+
+    @staticmethod
+    def _require_executable_profile_integer(
+        profile: Mapping[str, object],
+        field: str,
+    ) -> int:
+        value = profile.get(field)
+        if type(value) is not int:
+            raise TypeError(f"Executable profile field '{field}' must be an integer.")
+        if value < 0:
+            raise ValueError(f"Executable profile field '{field}' cannot be negative.")
+        return value
+
+    @staticmethod
+    def _validate_executable_sha256(value: object, field: str) -> None:
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9A-Fa-f]{64}", value) is None
+        ):
+            raise ValueError(
+                f"Executable profile field '{field}' must be 64 hex chars."
+            )
+
+    @staticmethod
+    def _require_executable_patch_sequence(
+        value: object,
+        field: str,
+        *,
+        allow_empty: bool,
+    ) -> Sequence[Mapping[str, object]]:
+        if not isinstance(value, Sequence) or isinstance(
+            value,
+            (str, bytes, bytearray),
+        ):
+            raise TypeError(f"Executable profile field '{field}' must be a sequence.")
+        if not allow_empty and not value:
+            raise ValueError(f"Executable profile field '{field}' cannot be empty.")
+        for index, site in enumerate(value):
+            if not isinstance(site, Mapping):
+                raise TypeError(f"{field}[{index}] must be a mapping.")
+        return value
+
+    @staticmethod
+    def _validate_executable_patch_site_fields(
+        site: Mapping[str, object],
+        required_fields: set[str],
+        *,
+        label: str,
+    ) -> None:
+        missing = required_fields.difference(site)
+        if missing:
+            raise ValueError(
+                f"{label} is missing fields: {', '.join(sorted(missing))}."
+            )
+        unknown = set(site).difference(required_fields)
+        if unknown:
+            raise ValueError(
+                f"{label} has unknown fields: "
+                + ", ".join(sorted(str(field) for field in unknown))
+                + "."
+            )
+
+    @staticmethod
+    def _require_executable_site_integer(
+        site: Mapping[str, object],
+        field: str,
+        *,
+        label: str,
+    ) -> int:
+        value = site.get(field)
+        if type(value) is not int:
+            raise TypeError(f"{label}.{field} must be an integer and not bool.")
+        if value < 0:
+            raise ValueError(f"{label}.{field} cannot be negative.")
+        return value
+
+    @staticmethod
+    def _require_executable_site_description(
+        site: Mapping[str, object],
+        *,
+        label: str,
+    ) -> str:
+        description = site.get("description")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError(f"{label}.description must be non-empty text.")
+        return description
+
+    @staticmethod
+    def _validate_executable_patch_regions(
+        source: bytes,
+        integer_sites: Sequence[Mapping[str, object]],
+        conditional_sites: Sequence[Mapping[str, object]],
+    ) -> None:
+        regions: list[tuple[int, int, str, bytes]] = []
+        for site in (*integer_sites, *conditional_sites):
+            offset = int(site["offset"])
+            expected = site["expected"]
+            description = str(site["description"])
+            assert isinstance(expected, bytes)
+            end = offset + len(expected)
+            if end > len(source):
+                actual = source[offset : min(end, len(source))]
+                raise ValueError(
+                    f"Executable patch site mismatch at 0x{offset:X} "
+                    f"({description}): expected {expected.hex(' ')}, "
+                    f"actual {actual.hex(' ')}; region extends past the "
+                    f"{len(source)}-byte source file."
+                )
+            regions.append((offset, end, description, expected))
+        previous: tuple[int, int, str, bytes] | None = None
+        for region in sorted(regions, key=lambda item: item[0]):
+            if previous is not None and region[0] < previous[1]:
+                raise ValueError(
+                    "Executable patch regions overlap: "
+                    f"0x{previous[0]:X} ({previous[2]}) and "
+                    f"0x{region[0]:X} ({region[2]})."
+                )
+            previous = region
+        for offset, end, description, expected in regions:
+            actual = source[offset:end]
+            if actual != expected:
+                raise ValueError(
+                    f"Executable patch site mismatch at 0x{offset:X} "
+                    f"({description}): expected {expected.hex(' ')}, "
+                    f"actual {actual.hex(' ')}."
+                )
+
+    @staticmethod
+    def _validate_generated_executable_patch(
+        result: bytes,
+        integer_sites: Sequence[Mapping[str, object]],
+        conditional_sites: Sequence[Mapping[str, object]],
+        encoded_values: Sequence[bytes],
+        *,
+        has_tail_word: bool,
+    ) -> None:
+        stack_values: list[int] = []
+        for site, encoded_value in zip(integer_sites, encoded_values, strict=True):
+            offset = int(site["offset"]) + int(site["value_offset"])
+            actual = result[offset : offset + len(encoded_value)]
+            if actual != encoded_value:
+                raise ValueError(
+                    "Generated executable failed validation at "
+                    f"0x{offset:X} ({site['description']})."
+                )
+            if site["value_name"] == "snapshot_stack_size":
+                stack_values.append(int.from_bytes(actual, "little"))
+        if len(set(stack_values)) > 1:
+            raise ValueError(
+                "Generated snapshot stack allocation and release sizes differ."
+            )
+        for site in conditional_sites:
+            offset = int(site["offset"])
+            expected = (
+                site["odd_record_bytes"] if has_tail_word else site["even_record_bytes"]
+            )
+            assert isinstance(expected, bytes)
+            if result[offset : offset + len(expected)] != expected:
+                raise ValueError(
+                    "Generated executable conditional patch failed validation at "
+                    f"0x{offset:X} ({site['description']})."
+                )
 
     @staticmethod
     def sequence_to_dataframe(

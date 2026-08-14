@@ -167,9 +167,11 @@ a codec/connection implementation, a new logical construction requires a
 whitelisted repository static method, and a new logical/composite table or
 editor may require repository or UI code.
 
-Unknown `.bin`, YGA, executable, image, and audio payloads are preserved as raw
-bytes unless an explicit rule matches. A language-looking suffix does not turn
-an unknown binary into text.
+Unknown `.bin`, YGA, image, and audio payloads are preserved as raw bytes unless
+an explicit rule matches. Source and workspace executable payloads are also
+preserved exactly. A physical `*_pc.exe` rule uses the generic binary codec so
+that only Pack encode can apply its declarative capacity `pre_encode` step. A
+language-looking suffix does not turn an unknown binary into text.
 
 ## Game connection and codecs
 
@@ -336,10 +338,11 @@ the maximum non-negative `card_id`, initializes missing IDs to zero, and uses
 the last card index for duplicates. The complete valid natural sequence is
 encoded as unsigned 16-bit little-endian records, with the generic integer codec
 still enforcing its value range; the editor does not cap the record count.
-This permits output longer than the original data but does not establish that
-the original executable can address additional cards. Executable compatibility
-or patching is a separate concern. `card_sort` keeps index zero as a dummy rank
-zero and sorts every real row `1..N-1` into inverse ranks `0..N-2`. It uses
+This permits output longer than the original data. Compatibility with the
+supported Joey executable is handled independently by its Pack-time profile;
+other executable versions are not inferred from card data. `card_sort` keeps
+index zero as a dummy rank zero and sorts every real row `1..N-1` into inverse
+ranks `0..N-2`. It uses
 localized name and Card ID as its sort key, then pads to the next power of two
 containing `len(card_id)`. It has no `card_intid` dependency, and the maximum
 Card ID does not determine output length.
@@ -481,6 +484,35 @@ create sibling output staging directory
 
 Failures remove staging data. A failed pack preserves the previous `bin`
 directory.
+
+When a project has an executable, `ProjectService` obtains the active count only
+through `len(project.get_table("card_ids"))`. It passes that integer as
+operation metadata to `GameRepository`; it never parses CSV or binary data and
+does not persist the derived count. The executable resource then follows the
+same rule orchestration as other physical resources:
+
+```text
+workspace source bytes
+-> *_pc.exe binary rule
+-> patch_executable_card_capacity pre_encode
+-> generic binary codec
+-> Pack staging/<prefix>_pc.exe
+```
+
+The profile contains plain frozen data: the original whole-file SHA-256, safe
+state bounds, 21 integer instruction sites, one conditional `MOVSW` site, and
+optional known output hashes. Counts `<=1115` remain byte-identical without a
+source-hash requirement. Counts `1116..2166` are encoded from formulas after
+hash, instruction, region, overlap, width, and capacity validation. A count
+above 2166 fails before mutation. Repacking always starts from the unchanged
+workspace executable, so identical source/count input is deterministic. Any
+failure discards the complete Pack staging directory and leaves the prior
+`bin`, workspace executable, and original game installation unchanged.
+
+The patch formulas and the count-1116 binary result are **Statically
+verified**. Windows runtime behavior for the added card is **Not yet dynamically
+verified**. Counts above 1116 are **Formula-driven but not runtime verified**.
+The 2166 maximum is **Inferred** from the next known global address.
 
 `CardService` uses only:
 

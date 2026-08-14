@@ -3,6 +3,7 @@ import inspect
 import multiprocessing
 import queue
 import unittest
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -436,6 +437,315 @@ class SubfileRuleConfigTests(unittest.TestCase):
             with self.subTest(method_name=method_name):
                 descriptor = inspect.getattr_static(GameRepository, method_name)
                 self.assertIsInstance(descriptor, staticmethod)
+
+    def test_executable_card_capacity_rule_has_exact_profile_and_whitelist(self):
+        config = next(
+            item for item in SUBFILE_RULE_CONFIGS if item["pattern"] == "*_pc.exe"
+        )
+        self.assertEqual(config["codec_name"], "binary")
+        self.assertFalse(config["virtual"])
+        self.assertEqual(config["decode_params"], {})
+        self.assertEqual(config["encode_params"], {})
+        self.assertEqual(len(config["pre_encode"]), 1)
+        step = config["pre_encode"][0]
+        self.assertEqual(step["method_name"], "patch_executable_card_capacity")
+        self.assertIn("patch_executable_card_capacity", ALLOWED_RULE_METHODS)
+        self.assertNotIn("executable", CODEC_OPERATIONS)
+
+        profile = step["params"]["profile"]
+        self.assertEqual(
+            {
+                key: profile[key]
+                for key in (
+                    "legacy_card_record_count",
+                    "minimum_patched_record_count",
+                    "maximum_card_record_count",
+                    "state_base_address",
+                    "state_limit_address",
+                    "state_record_size",
+                    "snapshot_stack_overhead",
+                )
+            },
+            {
+                "legacy_card_record_count": 1115,
+                "minimum_patched_record_count": 1116,
+                "maximum_card_record_count": 2166,
+                "state_base_address": 0x00A53CCC,
+                "state_limit_address": 0x00A54DB8,
+                "state_record_size": 2,
+                "snapshot_stack_overhead": 0x10,
+            },
+        )
+        self.assertEqual(
+            profile["source_sha256"],
+            "c5749eb934a1cf68d9236e44ff81e98b8aaee486b4f8ebd417440505d44ac1ea",
+        )
+        self.assertEqual(
+            profile["known_output_sha256"],
+            {
+                1116: (
+                    "cd04132ea2915e186fa7c4d67f7db73fe9fdb784fc0c95c7ab5b96733d3da699"
+                )
+            },
+        )
+        integer_sites = profile["integer_patch_sites"]
+        conditional_sites = profile["conditional_patch_sites"]
+        self.assertEqual(len(integer_sites), 21)
+        self.assertEqual(len(conditional_sites), 1)
+        self.assertEqual(
+            Counter(site["value_name"] for site in integer_sites),
+            {
+                "maximum_internal_id": 5,
+                "exclusive_upper_bound": 6,
+                "state_end_address": 6,
+                "snapshot_stack_size": 2,
+                "snapshot_dword_count": 1,
+                "state_byte_count": 1,
+            },
+        )
+        self.assertEqual(
+            [
+                (
+                    site["offset"],
+                    site["expected"],
+                    site["value_offset"],
+                    site["value_width"],
+                    site["value_name"],
+                )
+                for site in integer_sites
+            ],
+            [
+                (
+                    0x2315,
+                    b"\x66\x81\xfe\x5b\x04",
+                    3,
+                    2,
+                    "maximum_internal_id",
+                ),
+                (
+                    0x3A9B2,
+                    b"\x81\xfe\x5b\x04\x00\x00",
+                    2,
+                    4,
+                    "exclusive_upper_bound",
+                ),
+                (
+                    0x3AA9D,
+                    b"\x81\xfb\x5b\x04\x00\x00",
+                    2,
+                    4,
+                    "exclusive_upper_bound",
+                ),
+                (
+                    0x45703,
+                    b"\x81\xfe\x5b\x04\x00\x00",
+                    2,
+                    4,
+                    "exclusive_upper_bound",
+                ),
+                (
+                    0x6E5B3,
+                    b"\x3d\x5b\x04\x00\x00",
+                    1,
+                    4,
+                    "exclusive_upper_bound",
+                ),
+                (
+                    0x76327,
+                    b"\x3d\x5b\x04\x00\x00",
+                    1,
+                    4,
+                    "exclusive_upper_bound",
+                ),
+                (
+                    0x7DBFD,
+                    b"\x81\xff\x5b\x04\x00\x00",
+                    2,
+                    4,
+                    "exclusive_upper_bound",
+                ),
+                (
+                    0x6E5C7,
+                    b"\x3d\x5a\x04\x00\x00",
+                    1,
+                    4,
+                    "maximum_internal_id",
+                ),
+                (
+                    0x6E5CE,
+                    b"\xb8\x5a\x04\x00\x00",
+                    1,
+                    4,
+                    "maximum_internal_id",
+                ),
+                (
+                    0x76339,
+                    b"\x3d\x5a\x04\x00\x00",
+                    1,
+                    4,
+                    "maximum_internal_id",
+                ),
+                (
+                    0x76340,
+                    b"\xb8\x5a\x04\x00\x00",
+                    1,
+                    4,
+                    "maximum_internal_id",
+                ),
+                (
+                    0x63F18,
+                    b"\x3d\x82\x45\xa5\x00",
+                    1,
+                    4,
+                    "state_end_address",
+                ),
+                (
+                    0x63F8B,
+                    b"\x81\xfe\x82\x45\xa5\x00",
+                    2,
+                    4,
+                    "state_end_address",
+                ),
+                (
+                    0x7DA75,
+                    b"\x81\xfe\x82\x45\xa5\x00",
+                    2,
+                    4,
+                    "state_end_address",
+                ),
+                (
+                    0x7DC7D,
+                    b"\x81\xff\x82\x45\xa5\x00",
+                    2,
+                    4,
+                    "state_end_address",
+                ),
+                (
+                    0x1BED0D,
+                    b"\x3d\x82\x45\xa5\x00",
+                    1,
+                    4,
+                    "state_end_address",
+                ),
+                (
+                    0x1BEE16,
+                    b"\x81\xfe\x82\x45\xa5\x00",
+                    2,
+                    4,
+                    "state_end_address",
+                ),
+                (
+                    0x7DCE0,
+                    b"\x81\xec\xc8\x08\x00\x00",
+                    2,
+                    4,
+                    "snapshot_stack_size",
+                ),
+                (
+                    0x7DDAB,
+                    b"\x81\xc4\xc8\x08\x00\x00",
+                    2,
+                    4,
+                    "snapshot_stack_size",
+                ),
+                (
+                    0x7DCEA,
+                    b"\xb9\x2d\x02\x00\x00",
+                    1,
+                    4,
+                    "snapshot_dword_count",
+                ),
+                (
+                    0x7DD89,
+                    b"\x3d\xb6\x08\x00\x00",
+                    1,
+                    4,
+                    "state_byte_count",
+                ),
+            ],
+        )
+        self.assertEqual(conditional_sites[0]["offset"], 0x7DCFE)
+        self.assertEqual(conditional_sites[0]["expected"], b"\x66\xa5")
+        self.assertEqual(conditional_sites[0]["odd_record_bytes"], b"\x66\xa5")
+        self.assertEqual(conditional_sites[0]["even_record_bytes"], b"\x90\x90")
+        self.assertTrue(all(site["description"].strip() for site in integer_sites))
+        self.assertTrue(all(site["description"].strip() for site in conditional_sites))
+
+        repository = GameRepository.from_root(".")
+        for name in (
+            "joey_pc.exe",
+            "mai_pc.exe",
+            "eng_pc.exe",
+            "version-2_pc.exe",
+            "YUGI_PC.EXE",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    repository.find_rule(name).source_pattern,
+                    "*_pc.exe",
+                )
+        self.assertIsNone(repository.subfile_rule("launcher.exe"))
+
+    def test_executable_profile_is_frozen_and_each_pipeline_call_gets_a_copy(self):
+        repository = GameRepository.from_root(".")
+        rule = repository.find_rule("mai_pc.exe")
+        frozen_profile = rule.pre_encode[0].params["profile"]
+        with self.assertRaises(TypeError):
+            frozen_profile["maximum_card_record_count"] = 9999
+        with self.assertRaises(TypeError):
+            frozen_profile["integer_patch_sites"][0]["offset"] = -1
+
+        observed_profiles = []
+        observed_offsets_before_mutation = []
+        observed_context_states = []
+
+        def probe(value, *, context, profile):
+            observed_profiles.append(profile)
+            self.assertIsInstance(profile["integer_patch_sites"], list)
+            observed_offsets_before_mutation.append(
+                profile["integer_patch_sites"][0]["offset"]
+            )
+            observed_context_states.append(context.metadata.get("mutated"))
+            profile["integer_patch_sites"][0]["offset"] = -1
+            context.metadata["mutated"] = True
+            return value
+
+        contexts = [
+            repository._create_rule_context(
+                rule,
+                relative_path="mai_pc.exe",
+                language=None,
+                metadata={"card_record_count": 1116},
+            )
+            for _ in range(2)
+        ]
+        with patch.object(
+            GameRepository,
+            "patch_executable_card_capacity",
+            new=staticmethod(probe),
+        ):
+            for context in contexts:
+                repository._run_rule_pipeline(
+                    b"source",
+                    rule.pre_encode,
+                    context=context,
+                    phase="pre_encode",
+                )
+
+        self.assertIsNot(observed_profiles[0], observed_profiles[1])
+        self.assertIsNot(
+            observed_profiles[0]["integer_patch_sites"],
+            observed_profiles[1]["integer_patch_sites"],
+        )
+        self.assertEqual(observed_offsets_before_mutation, [0x2315, 0x2315])
+        self.assertEqual(observed_context_states, [None, None])
+        self.assertNotEqual(
+            frozen_profile["integer_patch_sites"][0]["offset"],
+            -1,
+        )
+        self.assertIsNot(contexts[0].metadata, contexts[1].metadata)
+        self.assertTrue(contexts[0].metadata["mutated"])
+        self.assertTrue(contexts[1].metadata["mutated"])
 
 
 class SubfileRuleMatchingTests(unittest.TestCase):

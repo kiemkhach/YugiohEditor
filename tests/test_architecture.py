@@ -230,6 +230,34 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(VALID_CODEC_NAMES, CODEC_OPERATIONS)
         self.assertTrue(all(rule.codec_name in VALID_CODEC_NAMES for rule in rules))
 
+    def test_executable_capacity_patch_uses_the_existing_binary_rule_pipeline(self):
+        executable_rule = next(
+            config for config in SUBFILE_RULE_CONFIGS if config["pattern"] == "*_pc.exe"
+        )
+        self.assertEqual(executable_rule["codec_name"], "binary")
+        self.assertFalse(executable_rule["virtual"])
+        self.assertEqual(
+            [step["method_name"] for step in executable_rule["pre_encode"]],
+            ["patch_executable_card_capacity"],
+        )
+        self.assertIn("patch_executable_card_capacity", ALLOWED_RULE_METHODS)
+        self.assertNotIn("executable", CODEC_OPERATIONS)
+        self.assertFalse(
+            (ROOT / "repositories" / "game" / "codecs" / "executable.py").exists()
+        )
+
+        production_source = "\n".join(
+            path.read_text(encoding="utf-8") for path in ROOT.rglob("*.py")
+        )
+        self.assertNotIn("Executable" + "Patcher", production_source)
+        self.assertNotIn("Executable" + "Codec", production_source)
+
+        service_source = (ROOT / "services" / "project_service.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('get_table("card_ids")', service_source)
+        self.assertIn("card_record_count", service_source)
+
     def test_removed_helpers_and_duplicate_registries_stay_absent(self):
         game_source = (ROOT / "repositories" / "game" / "repository.py").read_text(
             encoding="utf-8"

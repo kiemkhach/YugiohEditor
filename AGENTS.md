@@ -64,7 +64,9 @@ Yu-Gi-Oh! Power of Chaos: Joey the Passion game files.
 
 - Do not remove or simplify LZSS compression.
 - The LZSS codec must support both `compress()` and `decompress()`.
-- Preserve binary, image, audio, executable, and YGA files as raw bytes.
+- Preserve binary, image, audio, and YGA files as raw bytes. Preserve source
+  and workspace executable bytes exactly; only the executable written to Pack
+  staging may be transformed by its configured binary `pre_encode` pipeline.
 - Structured lists and tables in the project workspace may be stored as CSV.
 - Do not save binary files as hexadecimal text.
 - Do not use long if/elif or match/case blocks for file dispatch.
@@ -215,7 +217,27 @@ Yu-Gi-Oh! Power of Chaos: Joey the Passion game files.
   natural reverse lookup as unsigned 16-bit little-endian records; retain codec
   range validation and do not impose an editor-side record-count cap. Producing
   a longer table does not prove that the original game executable supports
-  additional cards; changing or patching executable limits is a separate task.
+  additional cards. Executable compatibility is controlled independently by
+  the explicit Pack-time executable profile below.
+- Executables matching `*_pc.exe` use the generic `binary` codec and the
+  `patch_executable_card_capacity` `pre_encode` rule. Create Project and card
+  Save never patch an executable. Pack derives `card_record_count` from
+  `len(ProjectRepository.get_table("card_ids"))`, passes it only as operation
+  metadata, and writes transformed bytes only beneath Pack staging. Do not
+  persist the derived count in the manifest or derive it from external Card
+  IDs, `cards`, `card_intid.bin`, or `card_sort`.
+- The Joey executable profile identifies its supported source with the whole-
+  file SHA-256, validates every complete original instruction before mutation,
+  and declares all integer immediates plus the conditional trailing `MOVSW`.
+  Counts at or below 1115 preserve the executable byte-for-byte without a hash
+  requirement. Counts 1116 through 2166 use formula-driven bounds, state end,
+  snapshot size, DWORD count, and odd/even trailing-WORD behavior. Counts above
+  2166 fail Pack; this is a profile safety limit inferred from the next known
+  global address, not an editor or card-format limit. The known count-1116
+  output hash is a regression check, not a supported-count allowlist.
+- Executable patch formulas and the one-card binary output are statically
+  verified. One-card Windows runtime behavior is not yet dynamically verified;
+  counts above 1116 are formula-driven but not runtime verified.
 - `card_sort[lang].bin` is virtual. Index zero is a dummy with rank zero; all
   real rows `1..N-1` participate and receive inverse ranks `0..N-2`. Sort keys
   use the localized card name and Card ID. Size the output to

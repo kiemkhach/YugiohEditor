@@ -381,9 +381,11 @@ class ProjectService:
                     raise ProjectValidationError(
                         "Executable project data is missing or duplicated."
                     )
+                card_record_count = len(project.get_table("card_ids"))
                 output.write_executable_resource(
                     Path(manifest.executable.relative_path).name,
                     project.export_resources(executable_records)[0],
+                    metadata={"card_record_count": card_record_count},
                 )
             result = project.commit_pack(staging)
             logging.info(

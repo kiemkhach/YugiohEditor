@@ -350,7 +350,39 @@ validates it again. There is no Python default or manifest fallback. Executable
 candidates must match `<name>_pc.exe` case-insensitively. When several
 candidates exist, the first case-insensitively sorted filename is selected.
 The workspace path is `<prefix>/<prefix>_pc.exe`, and packing writes
-`bin/<prefix>_pc.exe`.
+`bin/<prefix>_pc.exe`. Source discovery and project creation preserve the
+executable bytes exactly. The physical `*_pc.exe` subfile rule uses the generic
+`binary` operation; its `patch_executable_card_capacity` step runs only while
+Pack encodes the workspace resource into staging.
+
+Do not add an executable codec, patcher class, patch script, manifest count, or
+filename dispatch. `ProjectService.pack_project()` must obtain the current
+record count through:
+
+```python
+card_record_count = len(project.get_table("card_ids"))
+```
+
+Pass the integer as rule-operation metadata. Do not calculate it from maximum
+external Card ID, the composite `cards` table, `card_intid.bin`, or
+`card_sort`. Keep the declarative profile in `subfile_rules_config.py` as plain
+data and let the existing factory deep-freeze it.
+
+The patch method validates the profile, whole-file source SHA-256, every full
+original instruction, immediate widths, file bounds, and non-overlapping
+regions before allocating a mutable output buffer. Derived values use integer
+arithmetic only. Preserve the trailing `MOVSW` for odd record counts and replace
+it with `NOP NOP` for even counts. Update both snapshot stack allocation sites
+from the same derived size. Counts through the legacy 1115 remain byte-identical
+without requiring the Joey hash; 1116 through the profile maximum 2166 are
+formula-driven; larger counts fail Pack without truncating card data. Optional
+known-output hashes validate specific regression counts but never form an
+allowlist.
+
+The count-1116 formulas and binary output are statically verified. Do not claim
+Windows runtime verification until the packed executable has actually been
+tested. Counts above 1116 remain formula-driven but not runtime verified, and
+2166 is inferred from the next known global address.
 
 ## Working with project tables
 
@@ -699,8 +731,8 @@ duplicate row to win. Its natural count is
 complete valid natural sequence to the unsigned 16-bit little-endian integer
 codec, retain its value-range checks, and do not add an editor-side fixed record
 count or replacement cap. A larger generated file alone does not demonstrate
-support in the original executable; executable-limit analysis or patching
-belongs to a separate task.
+support in an arbitrary executable; the supported Joey version uses the
+independent Pack-time SHA-identified profile described above.
 
 `card_sort[lang].bin` depends on localized card names and `card_id.bin`. Keep
 index zero as dummy rank zero. Stable-sort all real rows `1..N-1`, write inverse

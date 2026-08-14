@@ -28,6 +28,7 @@ ALLOWED_RULE_METHODS = frozenset(
         "load_card_sort_records",
         "load_dependency_table",
         "log_dataframe_summary",
+        "patch_executable_card_capacity",
         "generate_reverse_lookup",
         "generate_sort_indices",
         "generate_string_offsets",

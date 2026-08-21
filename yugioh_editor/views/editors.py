@@ -4,7 +4,7 @@ import re
 from collections.abc import Callable
 
 import pandas as pd
-from PySide6.QtCore import Qt, QThreadPool, QUrl
+from PySide6.QtCore import Qt, QThreadPool, QUrl, Signal
 from PySide6.QtGui import QPixmap, QStandardItem, QStandardItemModel
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -25,6 +25,8 @@ from yugioh_editor.workers.task_runner import TaskRunner
 
 
 class FileEditor(QWidget):
+    project_mutation_state_changed = Signal(bool)
+
     def __init__(
         self,
         service: ProjectService,
@@ -35,9 +37,20 @@ class FileEditor(QWidget):
         self.service = service
         self.manifest = manifest
         self.record = record
+        self._project_mutation_in_progress = False
 
     def save(self) -> None:
         raise NotImplementedError
+
+    @property
+    def is_project_mutation_in_progress(self) -> bool:
+        return self._project_mutation_in_progress
+
+    def _set_project_mutation_in_progress(self, busy: bool) -> None:
+        if self._project_mutation_in_progress == busy:
+            return
+        self._project_mutation_in_progress = busy
+        self.project_mutation_state_changed.emit(busy)
 
 
 class TextEditor(FileEditor):
@@ -124,19 +137,28 @@ class ImageEditor(FileEditor):
         self.replace_button = QPushButton("Replace Image")
         self.replace_button.clicked.connect(self._replace)
         self._thread_pool = QThreadPool.globalInstance()
+        self._replace_runner: TaskRunner | None = None
         layout = QVBoxLayout(self)
         layout.addWidget(self.preview, 1)
         layout.addWidget(self.replace_button)
         self._refresh()
 
     def _replace(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select replacement image",
-            "",
-            "Images (*.bmp *.png *.jpg *.jpeg *.gif)",
-        )
-        if path:
+        if self.is_project_mutation_in_progress:
+            return
+        self._set_project_mutation_in_progress(True)
+        self.replace_button.setEnabled(False)
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select replacement image",
+                "",
+                "Images (*.bmp *.png *.jpg *.jpeg *.gif)",
+            )
+            if not path:
+                self.replace_button.setEnabled(True)
+                self._set_project_mutation_in_progress(False)
+                return
             runner = TaskRunner(
                 lambda: self.service.replace_project_image(
                     self.manifest,
@@ -144,6 +166,7 @@ class ImageEditor(FileEditor):
                     path,
                 )
             )
+            self._replace_runner = runner
             runner.signals.succeeded.connect(lambda _result: self._refresh())
             runner.signals.failed.connect(
                 lambda error: QMessageBox.critical(
@@ -152,7 +175,21 @@ class ImageEditor(FileEditor):
                     str(error),
                 )
             )
+            runner.signals.finished.connect(lambda: self._replace_finished(runner))
             self._thread_pool.start(runner)
+        except Exception:
+            if self._replace_runner is not None:
+                self._replace_finished(self._replace_runner)
+            else:
+                self.replace_button.setEnabled(True)
+                self._set_project_mutation_in_progress(False)
+            raise
+
+    def _replace_finished(self, runner: TaskRunner) -> None:
+        if self._replace_runner is runner:
+            self._replace_runner = None
+            self.replace_button.setEnabled(True)
+            self._set_project_mutation_in_progress(False)
 
     def _refresh(self) -> None:
         pixmap = QPixmap()
@@ -204,19 +241,25 @@ class AudioEditor(FileEditor):
         self.player.play()
 
     def _replace(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select replacement audio",
-            "",
-            "Wave Audio (*.wav)",
-        )
-        if path:
-            self.service.replace_project_file(
-                self.manifest,
-                self.record,
-                path,
+        if self.is_project_mutation_in_progress:
+            return
+        self._set_project_mutation_in_progress(True)
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select replacement audio",
+                "",
+                "Wave Audio (*.wav)",
             )
-            self._set_source()
+            if path:
+                self.service.replace_project_file(
+                    self.manifest,
+                    self.record,
+                    path,
+                )
+                self._set_source()
+        finally:
+            self._set_project_mutation_in_progress(False)
 
     def save(self) -> None:
         return None

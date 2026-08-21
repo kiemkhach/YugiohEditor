@@ -20,6 +20,71 @@ def physical(relative="bin#/card_id.bin", workspace="data/bin#/card_id.bin"):
 
 
 class ManifestValidationTests(unittest.TestCase):
+    def test_optional_project_icon_is_backward_compatible_and_relative(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = ProjectManifest.from_dict(
+                {
+                    "name": "Legacy icon",
+                    "root_path": directory,
+                    "version_prefix": "mai",
+                }
+            )
+            self.assertIsNone(legacy.icon_path)
+            self.assertNotIn("icon_path", legacy.to_dict())
+
+            configured = ProjectManifest(
+                "Configured icon",
+                directory,
+                version_prefix="mai",
+                icon_path="project.ico",
+            )
+            configured.validate()
+            self.assertEqual(
+                ProjectManifest.from_dict(configured.to_dict()).icon_path,
+                "project.ico",
+            )
+
+            legacy_icon = ProjectManifest(
+                "Legacy configured icon",
+                directory,
+                version_prefix="mai",
+                icon_path="project.icon",
+            )
+            legacy_icon.validate()
+            self.assertEqual(
+                ProjectManifest.from_dict(legacy_icon.to_dict()).icon_path,
+                "project.icon",
+            )
+
+            for invalid in (
+                "",
+                "../project.icon",
+                "/absolute/project.icon",
+                "C:/absolute/project.icon",
+                "C:drive-relative.icon",
+                r"\\server\share\project.icon",
+            ):
+                with self.subTest(icon_path=invalid):
+                    manifest = ProjectManifest(
+                        "Invalid icon",
+                        directory,
+                        version_prefix="mai",
+                        icon_path=invalid,
+                    )
+                    with self.assertRaises(ValueError):
+                        manifest.validate()
+
+    def test_application_workspace_preference_is_not_manifest_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            serialized = ProjectManifest(
+                "No application preferences",
+                directory,
+                version_prefix="mai",
+            ).to_dict()
+
+            self.assertNotIn("workspace", serialized)
+            self.assertNotIn("workspace/last_folder", serialized)
+
     def test_executable_capacity_count_is_derived_and_not_manifest_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest = ProjectManifest(
@@ -109,7 +174,25 @@ class ManifestValidationTests(unittest.TestCase):
                     "Demo",
                     directory,
                     version_prefix="mai",
+                    files=[physical("C:drive-relative.bin", "data/escape.bin")],
+                ),
+                ProjectManifest(
+                    "Demo",
+                    directory,
+                    version_prefix="mai",
+                    files=[physical(r"\\server\share\escape.bin", "data/escape.bin")],
+                ),
+                ProjectManifest(
+                    "Demo",
+                    directory,
+                    version_prefix="mai",
                     files=[physical(workspace="C:/absolute/file.bin")],
+                ),
+                ProjectManifest(
+                    "Demo",
+                    directory,
+                    version_prefix="mai",
+                    files=[physical(workspace="C:drive-relative.bin")],
                 ),
                 ProjectManifest(
                     "Demo",

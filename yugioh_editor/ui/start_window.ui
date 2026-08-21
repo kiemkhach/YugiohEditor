@@ -3,7 +3,7 @@
  <class>StartWindow</class>
  <widget class="QWidget" name="StartWindow">
   <property name="geometry">
-   <rect><x>0</x><y>0</y><width>760</width><height>200</height></rect>
+   <rect><x>0</x><y>0</y><width>760</width><height>230</height></rect>
   </property>
   <property name="sizePolicy">
    <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
@@ -11,8 +11,8 @@
     <verstretch>0</verstretch>
    </sizepolicy>
   </property>
-  <property name="minimumSize"><size><width>760</width><height>200</height></size></property>
-  <property name="maximumSize"><size><width>760</width><height>200</height></size></property>
+  <property name="minimumSize"><size><width>760</width><height>230</height></size></property>
+  <property name="maximumSize"><size><width>760</width><height>230</height></size></property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item><widget class="QLabel" name="lblTitle"><property name="text"><string>Yu-Gi-Oh! Power of Chaos Editor</string></property><property name="alignment"><set>Qt::AlignCenter</set></property></widget></item>
    <item>
@@ -22,9 +22,11 @@
      <item row="1" column="0"><widget class="QLabel" name="lblVersionPrefix"><property name="text"><string>Version prefix</string></property></widget></item>
      <item row="1" column="1"><widget class="QLineEdit" name="versionPrefixLineEdit"><property name="text"><string>mai</string></property></widget></item>
      <item row="2" column="0"><widget class="QLabel" name="lblWorkspace"><property name="text"><string>Workspace folder</string></property></widget></item>
-     <item row="2" column="1"><layout class="QHBoxLayout" name="workspaceLayout"><item><widget class="QLineEdit" name="txtWorkspace"><property name="text"><string>D:\Projects\YGOMOD\Mod_Editor_Projects</string></property></widget></item><item><widget class="QPushButton" name="btnBrowseWorkspace"><property name="text"><string>Browse...</string></property></widget></item></layout></item>
+     <item row="2" column="1"><layout class="QHBoxLayout" name="workspaceLayout"><item><widget class="QLineEdit" name="txtWorkspace"/></item><item><widget class="QPushButton" name="btnBrowseWorkspace"><property name="text"><string>Browse...</string></property></widget></item></layout></item>
      <item row="3" column="0"><widget class="QLabel" name="lblGameFolder"><property name="text"><string>Game folder</string></property></widget></item>
-     <item row="3" column="1"><layout class="QHBoxLayout" name="gameLayout"><item><widget class="QLineEdit" name="txtGameFolder"><property name="text"><string>D:\Game\Yugioh\Yu-Gi-Oh! Power of Chaos JOEY THE PASSION</string></property></widget></item><item><widget class="QPushButton" name="btnBrowseGame"><property name="text"><string>Browse...</string></property></widget></item></layout></item>
+     <item row="3" column="1"><layout class="QHBoxLayout" name="gameLayout"><item><widget class="QLineEdit" name="txtGameFolder"/></item><item><widget class="QPushButton" name="btnBrowseGame"><property name="text"><string>Browse...</string></property></widget></item></layout></item>
+     <item row="4" column="0"><widget class="QLabel" name="lblIcon"><property name="text"><string>Icon</string></property></widget></item>
+     <item row="4" column="1"><layout class="QHBoxLayout" name="iconLayout"><item><widget class="QLineEdit" name="txtIcon"/></item><item><widget class="QPushButton" name="btnBrowseIcon"><property name="text"><string>Browse...</string></property></widget></item></layout></item>
     </layout>
    </item>
    <item><layout class="QHBoxLayout" name="actionLayout"><item><widget class="QPushButton" name="btnCreateProject"><property name="text"><string>Create Project</string></property></widget></item><item><widget class="QPushButton" name="btnLoadProject"><property name="text"><string>Load Project</string></property></widget></item></layout></item>

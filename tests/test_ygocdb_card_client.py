@@ -267,6 +267,22 @@ class TestYgocdbCardClient(unittest.TestCase):
                 select(query, candidates)
         with self.assertRaises(JapaneseReadingCrawlError):
             select("名前", ["invalid"])
+        for invalid_cid in (True, False, 1.0, 1.5, "not-an-integer"):
+            with (
+                self.subTest(invalid_cid=invalid_cid),
+                self.assertRaisesRegex(JapaneseReadingCrawlError, "invalid cid"),
+            ):
+                select(
+                    "名前",
+                    [{"cid": invalid_cid, "jp_name": "別名", "jp_ruby": "ルビ"}],
+                )
+        self.assertEqual(
+            select(
+                "名前",
+                [{"cid": "1", "jp_name": "名前", "jp_ruby": "ルビ"}],
+            ),
+            "ルビ",
+        )
         with self.assertRaisesRegex(JapaneseReadingCrawlError, "jp_ruby"):
             select("名前", [{"jp_name": "名前", "jp_ruby": ""}])
 

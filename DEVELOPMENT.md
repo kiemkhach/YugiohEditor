@@ -84,13 +84,27 @@ Long-running Pack work must remain in `TaskRunner`. Retain the runner until
 requests, and restore all busy controls in the finished callback. Log the full
 traceback while keeping dialogs short and resource-aware.
 
+Export Files follows the same retained background-task rule. Serialize it with
+Pack, and call `ProjectService.export_project_files()` only after the user has
+selected a destination. Its backend must share Pack's resource reconstruction
+helpers and stop before container compression; never implement it by extracting
+the original game archives or deleting the destination directory. Pack and
+Export must also serialize against retained project mutations at the view
+boundary and disable the project tree/editor, Save Current File, Card List, and
+Run until reconstruction finishes. Retain asynchronous editor replacements and
+block tree navigation and project close until their finished signal clears the
+mutation state. Propagate Card List Save and editor replacement busy signals
+through `ProjectView` so neither modeless surface can start a write while the
+other owns the project mutation boundary.
+
 Keep the Project window's `Run` action separate from Pack. Its visible label is
 `Run`; it dispatches `ProjectService.run_packed_game()` in the existing retained
 background runner and only launches an executable already packed under `bin`.
-It must not call `pack_project()`, block on the process lifetime, or show a
-success modal. Launch exceptions continue through the existing failure dialog
-and traceback logging, and both success and failure must clear the progress
-state and retained runner.
+It passes exactly `-full` and `-speedy` through an argument-list API, preserves
+the executable-parent cwd, and must not call `pack_project()`, block on the
+process lifetime, or show a success modal. Launch exceptions continue through
+the existing failure dialog and traceback logging, and both success and failure
+must clear the progress state and retained runner.
 
 ## Tests
 
@@ -425,6 +439,20 @@ manifest per image, expose a physical file before its record, or expose a record
 before its file. On preparation, write, catalog, manifest, or commit failure,
 discard staging and leave the original project untouched.
 
+Normalize localized card names and descriptions on cloned drafts for each
+language's target encoding before strict validation. Public preflight
+validation must use a normalized projection without mutating its caller. Only
+after the staging commit succeeds may `CardService` copy normalized localized
+text back to the corresponding original drafts and mark them clean; every
+failure retains their original text, dirty/new flags, touched fields, password,
+and staged image sources.
+
+For an unsupported character without an approved target-encoding fallback,
+keep strict validation and identify the card index, Card ID, localized field,
+language, encoding, character position, character, Unicode code point, and
+Unicode name. Report only the offending character rather than dumping a full
+name or description into the validation message.
+
 ## Logical project tables
 
 Services request stable logical names:
@@ -618,10 +646,11 @@ When a batch adds new physical files, obtain the actual case-preserved
 `Data.dat` name from the repository and select its records case-insensitively.
 Combine every existing record for that source with every new large and mini
 record, then sort them by
-`normalize_project_path(record.relative_path).as_posix().casefold()`. This is
-ordinary deterministic lexicographical ordering over the complete normalized
-path, not basename-only, natural, case-sensitive, group-append, or batch-input
-ordering. Keep each stored path's original spelling/casing, renumber the sorted
+`"\\".join(normalize_project_path(record.relative_path).parts).casefold()`.
+This is deterministic global lexicographical ordering over the complete
+normalized Windows-style path, not recursive files-first traversal,
+basename-only, natural, case-sensitive, group-append, or batch-input ordering.
+Keep each stored path's original spelling/casing, renumber the sorted
 `Data.dat` records from `0` through `N-1`, and do not change any other source.
 Do not sort `card/list_card.txt` or `mini/list_card.txt` as a side effect.
 
@@ -715,9 +744,21 @@ handling, or manifest language metadata for these rules. The specific
 `list_card.txt` regex-table rule must remain later in configuration so it keeps
 UTF-8-SIG decode and UTF-8 encode behavior.
 
+When saving the composite cards table, derive ordinary catalog names from the
+editable English name. Preserve the existing per-variant catalog name wherever
+the Card ID is negative; do this in the repository split transformation, not in
+the generic regex codec or UI.
+
 Open a project through `ApplicationController.open_project()` using
 `ProjectView.showMaximized()`. Do not maximize the Start window or move this
 presentation policy into the `ProjectView` constructor.
+
+Open Card List with `showMaximized()` and centralize continued enforcement in
+`CardListView`: allow minimize, then defer a maximized restore for any visible
+non-minimized normal state. Save must synchronously set busy controls/progress,
+then defer snapshot preparation through the Qt event loop. Add Card must open a
+disabled initialization dialog before its retained worker loads the draft, and
+close handling must wait for that worker's callbacks.
 
 Evidence labels used for this area are: **Confirmed** for indexed-text and
 large/mini selector regression vectors; **Audited** for current `card_sort`
@@ -748,6 +789,20 @@ Resolve packaged resources with `yugioh_editor.resources.get_resource_path()`.
 The title-bar icon must remain named `resources/app.icon`. Startup creates a
 `QIcon`, rejects `QIcon.isNull()`, and sets the icon on `QApplication` once.
 Package data must include both `resources/*.icon` and runtime-loaded `ui/*.ui`.
+The optional user-selected project icon is different: validate it as ICO, copy
+it to `project.ico` during Create staging, store only that relative path, and
+update only the Pack-staged executable after binary pre-encode. Existing
+manifests may continue to reference `project.icon`; the stored path remains
+authoritative, with no rename or schema migration. Do not modify the source or
+workspace executable.
+
+Use INI-format, user-scope `QSettings` with organization/application
+`YugiohEditor` and key `workspace/last_folder` for the last valid Workspace
+path. It is writable application state, never installation-resource or manifest
+data. Load Project may use it only as an initial chooser directory. Registry
+discovery uses the logical Konami HKLM key with `KEY_WOW64_32KEY`, treats
+missing/non-Windows as normal, and yields to any already nonempty Game Folder
+UI value.
 
 ## Validation checklist
 

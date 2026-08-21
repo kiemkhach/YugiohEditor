@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import unicodedata
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -11,11 +12,13 @@ from unittest.mock import Mock, call, patch
 import pandas as pd
 from PIL import Image
 
+from tests.pipeline_support import decode_description_resource
 from tests.test_repository_tables import ProjectTableFixture
 from yugioh_editor.common import worker_limits
 from yugioh_editor.common.card_errors import (
     CardImportError,
     CardPersistenceError,
+    CardValidationError,
 )
 from yugioh_editor.common.card_images import (
     build_card_image_pair,
@@ -44,7 +47,21 @@ from yugioh_editor.repositories.project.repository import (
     ProjectRepository,
     normalize_project_path,
 )
-from yugioh_editor.services.card_service import CardService
+from yugioh_editor.services.card_service import (
+    CardService,
+    normalize_card_text_for_encoding,
+)
+
+BLACK_CIRCLE_DESCRIPTION = (
+    'Target 1 "Red Dragon Archfiend" you control; if that monster you '
+    "control battles an opponent's monster this turn, apply these effects "
+    "until the end of the Damage Step. ●It gains 1000 ATK. "
+    "●Your opponent cannot activate cards or effects. "
+    "●If it attacks a Defense Position monster, inflict piercing battle "
+    "damage to your opponent. "
+    "●Any battle damage your opponent takes from that battle is doubled."
+)
+OFFICIAL_UNENCODABLE_JAPANESE_NAME = "熒焅聖 アレクゥス"
 
 
 class CardEditingModelTests(unittest.TestCase):
@@ -181,6 +198,447 @@ class CardEditingServiceTests(unittest.TestCase):
             monster_type_code=class_code,
             card_category_code=category_code,
             attribute_code=2 if is_monster else 0,
+        )
+
+    def test_card_text_preflight_normalizes_projection_without_mutating_draft(self):
+        draft = self.service.get_card_detail(self.manifest, 1).to_draft()
+        draft.localized_text.descriptions["eng"] = BLACK_CIRCLE_DESCRIPTION
+        draft.dirty = True
+        draft.touched_fields.add("description:eng")
+
+        normalized = normalize_card_text_for_encoding(
+            BLACK_CIRCLE_DESCRIPTION,
+            "cp1252",
+        )
+        errors = self.service.validate_card_draft(draft)
+
+        self.assertEqual(BLACK_CIRCLE_DESCRIPTION.count("●"), 4)
+        self.assertEqual(BLACK_CIRCLE_DESCRIPTION.index("●"), 168)
+        self.assertEqual(normalized.count("•"), 4)
+        self.assertNotIn("●", normalized)
+        normalized.encode("cp1252", errors="strict")
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            draft.localized_text.descriptions["eng"],
+            BLACK_CIRCLE_DESCRIPTION,
+        )
+        self.assertTrue(draft.dirty)
+        self.assertEqual(draft.touched_fields, {"description:eng"})
+
+    def test_official_japanese_name_audits_every_cp932_character(self):
+        with self.assertRaises(UnicodeEncodeError) as raised:
+            OFFICIAL_UNENCODABLE_JAPANESE_NAME.encode("cp932", errors="strict")
+
+        self.assertEqual(raised.exception.start, 0)
+        self.assertEqual(raised.exception.end, 1)
+        unsupported: list[tuple[int, str, str, str]] = []
+        encoded: dict[int, bytes] = {}
+        for index, character in enumerate(OFFICIAL_UNENCODABLE_JAPANESE_NAME):
+            try:
+                encoded[index] = character.encode("cp932", errors="strict")
+            except UnicodeEncodeError:
+                unsupported.append(
+                    (
+                        index,
+                        character,
+                        f"U+{ord(character):04X}",
+                        unicodedata.name(character),
+                    )
+                )
+
+        self.assertEqual(
+            unsupported,
+            [
+                (0, "熒", "U+7192", "CJK UNIFIED IDEOGRAPH-7192"),
+                (1, "焅", "U+7105", "CJK UNIFIED IDEOGRAPH-7105"),
+            ],
+        )
+        self.assertEqual(
+            encoded,
+            {
+                2: b"\x90\xb9",
+                3: b"\x20",
+                4: b"\x83\x41",
+                5: b"\x83\x8c",
+                6: b"\x83\x4e",
+                7: b"\x83\x44",
+                8: b"\x83\x58",
+            },
+        )
+        self.assertEqual(
+            normalize_card_text_for_encoding(
+                OFFICIAL_UNENCODABLE_JAPANESE_NAME,
+                "cp932",
+            ),
+            OFFICIAL_UNENCODABLE_JAPANESE_NAME,
+        )
+
+    def test_official_japanese_name_remains_exact_through_suggest_merge(self):
+        draft = self.service.create_card_draft(self.manifest)
+        draft.localized_text.names["eng"] = "Arequus the Shining Mars Saint"
+        reference = CardReferenceData(
+            matched_name="Arequus the Shining Mars Saint",
+            matched_language="eng",
+            localized_names={
+                "eng": "Arequus the Shining Mars Saint",
+                "jpn": OFFICIAL_UNENCODABLE_JAPANESE_NAME,
+            },
+            localized_descriptions={},
+            canonical_id="21966",
+            source="official_card_database",
+        )
+        self.reference_service.suggest_card_reference.return_value = reference
+
+        suggestion = self.service.suggest_card_draft(
+            self.manifest,
+            draft,
+            include_image=False,
+        )
+
+        self.assertIn("name:jpn", suggestion.applied_fields)
+        self.assertEqual(
+            suggestion.draft.localized_text.names["jpn"],
+            OFFICIAL_UNENCODABLE_JAPANESE_NAME,
+        )
+        self.assertEqual(
+            reference.localized_names["jpn"],
+            OFFICIAL_UNENCODABLE_JAPANESE_NAME,
+        )
+
+    def test_official_japanese_name_reports_identity_and_fails_before_staging(self):
+        before = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+        draft = self.service.get_card_detail(self.manifest, 1).to_draft()
+        draft.localized_text.names["jpn"] = OFFICIAL_UNENCODABLE_JAPANESE_NAME
+        draft.dirty = True
+        draft.touched_fields.add("name:jpn")
+        expected = (
+            "Card index 1, ID 2: name:jpn cannot be encoded using cp932 at "
+            "character 0: '熒' (U+7192 CJK UNIFIED IDEOGRAPH-7192)."
+        )
+
+        self.assertEqual(self.service.validate_card_draft(draft), [expected])
+        self.assertEqual(
+            draft.localized_text.names["jpn"],
+            OFFICIAL_UNENCODABLE_JAPANESE_NAME,
+        )
+        self.assertTrue(draft.dirty)
+        self.assertEqual(draft.touched_fields, {"name:jpn"})
+
+        with (
+            patch.object(self.repository, "begin_update") as begin_update,
+            self.assertRaises(CardValidationError) as raised,
+        ):
+            self.service.save_card_changes(self.manifest, [draft])
+
+        begin_update.assert_not_called()
+        self.assertEqual(raised.exception.errors, (expected,))
+        after = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(
+            draft.localized_text.names["jpn"],
+            OFFICIAL_UNENCODABLE_JAPANESE_NAME,
+        )
+        self.assertTrue(draft.dirty)
+        self.assertEqual(draft.touched_fields, {"name:jpn"})
+
+    def test_card_text_normalizer_preserves_directly_encodable_characters(self):
+        cp1252_text = "Café • déjà vu"
+        cp932_text = "日本語●"
+        draft = self.service.get_card_detail(self.manifest, 1).to_draft()
+        draft.localized_text.names["jpn"] = cp932_text
+        draft.localized_text.descriptions["jpn"] = "効果●"
+
+        self.assertEqual(
+            normalize_card_text_for_encoding(cp1252_text, "cp1252"),
+            cp1252_text,
+        )
+        self.assertEqual(
+            normalize_card_text_for_encoding(cp932_text, "cp932"),
+            cp932_text,
+        )
+        self.assertEqual("●".encode("cp932", errors="strict"), b"\x81\x9c")
+        errors = self.service.validate_card_draft(draft)
+        self.assertFalse(any("name:jpn" in error for error in errors))
+        self.assertFalse(any("description:jpn" in error for error in errors))
+        self.assertEqual(draft.localized_text.names["jpn"], cp932_text)
+        self.assertEqual(draft.localized_text.descriptions["jpn"], "効果●")
+
+    def test_card_text_normalizer_canonicalizes_cp1252_aliases(self):
+        for encoding in ("cp1252", "CP1252", "windows-1252", "1252"):
+            with self.subTest(encoding=encoding):
+                self.assertEqual(
+                    normalize_card_text_for_encoding("Before ● After", encoding),
+                    "Before • After",
+                )
+
+        self.assertEqual(
+            normalize_card_text_for_encoding("●", "cp932"),
+            "●",
+        )
+        with self.assertRaises(LookupError):
+            normalize_card_text_for_encoding("●", "unknown-card-codec")
+
+    def test_unmapped_card_text_fails_before_staging_without_corruption(self):
+        draft = self.service.get_card_detail(self.manifest, 1).to_draft()
+        unsupported = "Unsupported 😀 marker"
+        draft.localized_text.descriptions["eng"] = unsupported
+        draft.dirty = True
+        expected = (
+            "Card index 1, ID 2: description:eng cannot be encoded using cp1252 "
+            "at character 12: '😀' (U+1F600 GRINNING FACE)."
+        )
+
+        with (
+            patch.object(self.repository, "begin_update") as begin_update,
+            self.assertRaises(CardValidationError) as raised,
+        ):
+            self.service.save_card_changes(self.manifest, [draft])
+
+        begin_update.assert_not_called()
+        self.assertEqual(raised.exception.errors, (expected,))
+        self.assertEqual(draft.localized_text.descriptions["eng"], unsupported)
+        self.assertIn("😀", draft.localized_text.descriptions["eng"])
+        self.assertNotIn("?", draft.localized_text.descriptions["eng"])
+        self.assertTrue(draft.dirty)
+
+    def test_card_save_normalizes_syncs_reloads_and_rebuilds_description_pair(self):
+        draft = self.service.get_card_detail(self.manifest, 1).to_draft()
+        draft.localized_text.names["eng"] = "Dragon ●"
+        draft.localized_text.descriptions["eng"] = BLACK_CIRCLE_DESCRIPTION
+        draft.dirty = True
+        draft.touched_fields.update({"name:eng", "description:eng"})
+        expected_name = "Dragon •"
+        expected = normalize_card_text_for_encoding(
+            BLACK_CIRCLE_DESCRIPTION,
+            "cp1252",
+        )
+
+        self.service.save_card_changes(self.manifest, [draft])
+
+        self.assertEqual(draft.localized_text.names["eng"], expected_name)
+        self.assertEqual(draft.localized_text.descriptions["eng"], expected)
+        self.assertFalse(draft.dirty)
+        self.assertEqual(
+            draft.touched_fields,
+            {"name:eng", "description:eng"},
+        )
+        reloaded = CardService(
+            ProjectRepository(self.repository.root),
+            Mock(),
+        ).get_card_detail(self.manifest, 1)
+        self.assertEqual(reloaded.localized_text.names["eng"], expected_name)
+        self.assertEqual(reloaded.localized_text.descriptions["eng"], expected)
+
+        archive = GameRepository.from_root(self.root).encode_archive(
+            "Data.dat",
+            self.repository.export_resources(
+                self.repository.list_resources(
+                    self.manifest,
+                    include_virtual=True,
+                )
+            ),
+        )
+        payloads = {
+            entry.relative_path.replace("\\", "/"): entry.data
+            for entry in archive.entries
+        }
+        name_data = payloads["bin#/card_nameeng.bin"]
+        description_data = payloads["bin#/card_desceng.bin"]
+        index_data = payloads["bin#/card_indxeng.bin"]
+        decoded = decode_description_resource(description_data, index_data, "eng")
+        decoded_names = GameRepository.decode_binary_resource(
+            "bin#/card_nameeng.bin",
+            name_data,
+            "eng",
+        )
+
+        self.assertEqual(len(index_data), 8192)
+        self.assertEqual(description_data.count(b"\x95"), 4)
+        self.assertEqual(decoded_names.iloc[1]["value"], expected_name)
+        self.assertEqual(decoded.iloc[1]["text"], expected)
+        self.assertFalse(decoded.iloc[1]["is_reserved"])
+
+    def test_suggest_text_remains_unicode_until_centralized_save(self):
+        draft = self.service.create_card_draft(self.manifest)
+        draft.localized_text.names["eng"] = "Suggested Card"
+        reference = CardReferenceData(
+            matched_name="Suggested Card",
+            matched_language="eng",
+            localized_names={"eng": "Suggested Card"},
+            localized_descriptions={"eng": BLACK_CIRCLE_DESCRIPTION},
+        )
+        self.reference_service.suggest_card_reference.return_value = reference
+
+        suggestion = self.service.suggest_card_draft(
+            self.manifest,
+            draft,
+            include_image=False,
+        )
+        suggested = suggestion.draft
+        self.assertEqual(
+            suggested.localized_text.descriptions["eng"],
+            BLACK_CIRCLE_DESCRIPTION,
+        )
+        self.assertEqual(
+            reference.localized_descriptions["eng"],
+            BLACK_CIRCLE_DESCRIPTION,
+        )
+
+        self.service.save_card_changes(self.manifest, [suggested])
+
+        expected = normalize_card_text_for_encoding(
+            BLACK_CIRCLE_DESCRIPTION,
+            "cp1252",
+        )
+        self.assertEqual(suggested.localized_text.descriptions["eng"], expected)
+        self.assertEqual(
+            self.service.get_card_detail(self.manifest, 2).localized_text.descriptions[
+                "eng"
+            ],
+            expected,
+        )
+        self.assertEqual(
+            reference.localized_descriptions["eng"],
+            BLACK_CIRCLE_DESCRIPTION,
+        )
+
+    def test_late_commit_failure_preserves_unnormalized_draft_and_project(self):
+        before = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+        draft = self.service.create_card_draft(self.manifest)
+        draft.localized_text.descriptions["eng"] = BLACK_CIRCLE_DESCRIPTION
+        draft.password = "00abcdef"
+        draft.image_name = "usr096.bmp"
+        draft.large_image_source, draft.small_image_source = build_card_image_pair(
+            self._image_payload("purple")
+        )
+        draft.dirty = True
+        draft.touched_fields.update({"description:eng", "password", "image_name"})
+        original_large = draft.large_image_source
+        original_small = draft.small_image_source
+
+        with (
+            patch.object(
+                self.repository,
+                "commit_update",
+                side_effect=OSError("controlled commit failure"),
+            ),
+            self.assertRaises(CardPersistenceError),
+        ):
+            self.service.save_card_changes(self.manifest, [draft])
+
+        after = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(
+            list(
+                self.repository.root.parent.glob(
+                    f".{self.repository.root.name}.cards.*.tmp"
+                )
+            ),
+            [],
+        )
+        self.assertEqual(
+            draft.localized_text.descriptions["eng"],
+            BLACK_CIRCLE_DESCRIPTION,
+        )
+        self.assertEqual(draft.password, "00abcdef")
+        self.assertTrue(draft.dirty)
+        self.assertTrue(draft.is_new)
+        self.assertEqual(
+            draft.touched_fields,
+            {"description:eng", "password", "image_name"},
+        )
+        self.assertIs(draft.large_image_source, original_large)
+        self.assertIs(draft.small_image_source, original_small)
+
+    def test_final_logging_failure_does_not_fail_or_desynchronize_committed_save(self):
+        draft = self.service.get_card_detail(self.manifest, 1).to_draft()
+        draft.localized_text.descriptions["eng"] = "Effect ●"
+        draft.dirty = True
+        draft.touched_fields.add("description:eng")
+        staging = self.repository.begin_update()
+        completion_logs = 0
+
+        def fail_completion_log(message, *_args, **_kwargs):
+            nonlocal completion_logs
+            if str(message).startswith("Card Save completed:"):
+                completion_logs += 1
+                raise RuntimeError("controlled completion log failure")
+
+        with (
+            patch.object(
+                self.repository,
+                "begin_update",
+                return_value=staging,
+            ) as begin_update,
+            patch.object(
+                self.repository,
+                "commit_update",
+                wraps=self.repository.commit_update,
+            ) as commit_update,
+            patch.object(staging, "discard", wraps=staging.discard) as discard,
+            patch(
+                "yugioh_editor.services.card_service.logging.info",
+                side_effect=fail_completion_log,
+            ),
+        ):
+            self.service.save_card_changes(self.manifest, [draft])
+
+        expected = "Effect •"
+        begin_update.assert_called_once_with()
+        commit_update.assert_called_once_with(staging)
+        discard.assert_not_called()
+        self.assertEqual(completion_logs, 1)
+        self.assertEqual(draft.localized_text.descriptions["eng"], expected)
+        self.assertFalse(draft.dirty)
+        self.assertFalse(draft.is_new)
+        self.assertEqual(draft.touched_fields, {"description:eng"})
+        self.assertEqual(
+            self.service.get_card_detail(self.manifest, 1).localized_text.descriptions[
+                "eng"
+            ],
+            expected,
+        )
+
+    def test_multi_card_validation_failure_is_positional_and_all_or_nothing(self):
+        first = self.service.get_card_detail(self.manifest, 0).to_draft()
+        second = self.service.get_card_detail(self.manifest, 1).to_draft()
+        first.localized_text.descriptions["eng"] = "First ●"
+        second.localized_text.descriptions["eng"] = "Second 😀"
+        first.dirty = True
+        second.dirty = True
+
+        with (
+            patch.object(self.repository, "begin_update") as begin_update,
+            self.assertRaises(CardValidationError),
+        ):
+            self.service.save_card_changes(self.manifest, [first, second])
+
+        begin_update.assert_not_called()
+        self.assertEqual(first.localized_text.descriptions["eng"], "First ●")
+        self.assertEqual(second.localized_text.descriptions["eng"], "Second 😀")
+        self.assertTrue(first.dirty)
+        self.assertTrue(second.dirty)
+        persisted = self.service.load_card_details(self.manifest)
+        self.assertEqual(persisted[0].localized_text.descriptions["eng"], "Back")
+        self.assertEqual(
+            persisted[1].localized_text.descriptions["eng"],
+            "Description",
         )
 
     def test_create_card_defaults_and_atomic_resource_append(self):

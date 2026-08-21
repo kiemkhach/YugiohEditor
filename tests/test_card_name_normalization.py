@@ -5,6 +5,11 @@ from unittest.mock import Mock
 
 import pandas as pd
 
+from yugioh_editor.common.card_errors import (
+    CardReferenceDataResourceError,
+    JapaneseReadingCrawlError,
+    JapaneseReadingNotFoundError,
+)
 from yugioh_editor.common.card_name_normalization import (
     CardNameNormalizer,
     normalize_japanese_reading,
@@ -62,6 +67,37 @@ class CardNameNormalizationTests(unittest.TestCase):
         for alias in ("ja", "jp"):
             with self.subTest(alias=alias), self.assertRaises(ValueError):
                 normalizer.normalize("鎧蜥蜴", alias)
+
+    def test_japanese_true_not_found_returns_original_name_untouched(self):
+        card_reference_data_service = Mock()
+        card_reference_data_service.get_japanese_reading.side_effect = (
+            JapaneseReadingNotFoundError("未登録")
+        )
+        normalizer = CardNameNormalizer(card_reference_data_service)
+        original_name = "未登録 Ａ・１"
+
+        self.assertEqual(normalizer.normalize(original_name, "jpn"), original_name)
+        card_reference_data_service.get_japanese_reading.assert_called_once_with(
+            original_name
+        )
+
+    def test_japanese_non_not_found_failures_propagate(self):
+        for error in (
+            JapaneseReadingCrawlError("invalid JSON"),
+            CardReferenceDataResourceError("write failed"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                card_reference_data_service = Mock()
+                card_reference_data_service.get_japanese_reading.side_effect = error
+                normalizer = CardNameNormalizer(card_reference_data_service)
+
+                with self.assertRaises(type(error)) as raised:
+                    normalizer.normalize("未登録", "jpn")
+
+                self.assertIs(raised.exception, error)
+                card_reference_data_service.get_japanese_reading.assert_called_once_with(
+                    "未登録"
+                )
 
     def test_default_resource_normalizes_without_remote_api(self):
         mocked_ygocdb_card_client = Mock()

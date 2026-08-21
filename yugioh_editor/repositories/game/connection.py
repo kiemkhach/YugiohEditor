@@ -78,6 +78,10 @@ class GameFolderConnection:
     def use_root(self, root: str | Path) -> GameFolderConnection:
         return GameFolderConnection(root, self._container, self._deck)
 
+    def ensure_root(self) -> Path:
+        self.root.mkdir(parents=True, exist_ok=True)
+        return self.root
+
     def resolve(self, relative_path: str | Path) -> Path:
         path = (self.root / relative_path).resolve()
         if path != self.root and self.root not in path.parents:
@@ -195,14 +199,30 @@ class GameFolderConnection:
     def read_deck(self, relative_path: str | Path) -> DeckFile:
         return self._deck.decode(self.read_bytes(relative_path))
 
+    def encode_deck(self, deck: DeckFile) -> bytes:
+        return self._deck.encode(deck)
+
     def write_deck(self, relative_path: str | Path, deck: DeckFile) -> Path:
-        return self.write_bytes(relative_path, self._deck.encode(deck))
+        return self.write_bytes(relative_path, self.encode_deck(deck))
 
     def read_executable(self, relative_path: str | Path) -> bytes:
         return self.read_bytes(relative_path)
 
     def write_executable(self, relative_path: str | Path, data: bytes) -> Path:
         return self.write_bytes(relative_path, data)
+
+    def update_executable_icon(
+        self,
+        relative_path: str | Path,
+        icon_data: bytes,
+    ) -> Path:
+        from yugioh_editor.repositories.game.windows_icon_resources import (
+            update_executable_icon,
+        )
+
+        path = self.resolve(relative_path)
+        update_executable_icon(path, icon_data)
+        return path
 
     def read_binary(self, relative_path: str | Path) -> bytes:
         return self.read_bytes(relative_path)

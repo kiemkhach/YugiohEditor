@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import codecs
 import logging
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import (
     FIRST_COMPLETED,
@@ -83,6 +85,27 @@ _CARD_CATEGORY_VALUES = frozenset(
 _PACK_VALUES = frozenset(PACK_NAMES.values())
 _CARD_NUMERIC_EDIT_FIELDS = ("level", "attack", "defense")
 _CARD_ENUM_EDIT_FIELDS = ("attribute", "card_type", "card_category", "pack")
+_CARD_TEXT_REPLACEMENTS_BY_ENCODING = {
+    "cp1252": {
+        "\N{BLACK CIRCLE}": "\N{BULLET}",
+    },
+}
+
+
+def normalize_card_text_for_encoding(value: str, encoding: str) -> str:
+    """Apply approved fallbacks only to characters rejected by the target codec."""
+
+    canonical_encoding = codecs.lookup(encoding).name
+    replacements = _CARD_TEXT_REPLACEMENTS_BY_ENCODING.get(canonical_encoding, {})
+    normalized: list[str] = []
+    for character in value:
+        try:
+            character.encode(canonical_encoding, errors="strict")
+        except UnicodeEncodeError:
+            normalized.append(replacements.get(character, character))
+        else:
+            normalized.append(character)
+    return "".join(normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +225,7 @@ class CardService:
         changes: Sequence[CardEditDraft],
     ) -> None:
         overall_started = perf_counter()
-        drafts = [draft.clone() for draft in changes]
+        drafts = [self._normalize_card_draft_text(draft) for draft in changes]
         if not drafts:
             return
         validation_errors: list[str] = []
@@ -211,7 +234,7 @@ class CardService:
                 draft.password = normalize_card_password(draft.password)
             except ValueError:
                 pass
-            validation_errors.extend(self.validate_card_draft(draft))
+            validation_errors.extend(self._validate_normalized_card_draft(draft))
         if validation_errors:
             raise CardValidationError(validation_errors)
 
@@ -304,28 +327,59 @@ class CardService:
                 f"the project was not committed: {error}"
             ) from error
 
-        logging.info(
-            "Card Save completed: changed_cards=%d new_image_pairs=%d "
-            "replacement_image_pairs=%d staging_clone=%.3fs images=%.3fs "
-            "tables_and_manifest=%.3fs commit=%.3fs overall=%.3fs",
-            len(drafts),
-            image_stats.new_pairs,
-            image_stats.replacement_pairs,
-            staging_duration,
-            image_duration,
-            table_duration,
-            commit_duration,
-            perf_counter() - overall_started,
-        )
-
         for original, saved in zip(changes, drafts, strict=True):
+            original.localized_text.names.update(saved.localized_text.names)
+            original.localized_text.descriptions.update(
+                saved.localized_text.descriptions
+            )
             original.password = saved.password
             original.dirty = False
             original.is_new = False
             original.large_image_source = None
             original.small_image_source = None
 
+        try:
+            logging.info(
+                "Card Save completed: changed_cards=%d new_image_pairs=%d "
+                "replacement_image_pairs=%d staging_clone=%.3fs images=%.3fs "
+                "tables_and_manifest=%.3fs commit=%.3fs overall=%.3fs",
+                len(drafts),
+                image_stats.new_pairs,
+                image_stats.replacement_pairs,
+                staging_duration,
+                image_duration,
+                table_duration,
+                commit_duration,
+                perf_counter() - overall_started,
+            )
+        except Exception:
+            # Telemetry cannot turn an already committed save into a failure.
+            pass
+
     def validate_card_draft(self, draft: CardEditDraft) -> list[str]:
+        normalized = self._normalize_card_draft_text(draft)
+        return self._validate_normalized_card_draft(normalized)
+
+    @staticmethod
+    def _normalize_card_draft_text(draft: CardEditDraft) -> CardEditDraft:
+        normalized = draft.clone()
+        for language in LANGUAGE_PREFIXES:
+            encoding = language_encoding(language)
+            normalized.localized_text.names[language] = (
+                normalize_card_text_for_encoding(
+                    normalized.localized_text.names[language],
+                    encoding,
+                )
+            )
+            normalized.localized_text.descriptions[language] = (
+                normalize_card_text_for_encoding(
+                    normalized.localized_text.descriptions[language],
+                    encoding,
+                )
+            )
+        return normalized
+
+    def _validate_normalized_card_draft(self, draft: CardEditDraft) -> list[str]:
         errors: list[str] = []
         if not 0 <= draft.card_index <= 9999:
             errors.append(f"card_index {draft.card_index} must be between 0 and 9999.")
@@ -371,17 +425,45 @@ class CardService:
                     )
             except UnicodeEncodeError as error:
                 errors.append(
-                    f"name:{language} cannot be encoded using {encoding} at "
-                    f"character {error.start}."
+                    self._format_card_text_encoding_error(
+                        draft,
+                        "name",
+                        language,
+                        encoding,
+                        error,
+                    )
                 )
             try:
                 description.encode(encoding, errors="strict")
             except UnicodeEncodeError as error:
                 errors.append(
-                    f"description:{language} cannot be encoded using {encoding} at "
-                    f"character {error.start}."
+                    self._format_card_text_encoding_error(
+                        draft,
+                        "description",
+                        language,
+                        encoding,
+                        error,
+                    )
                 )
         return errors
+
+    @staticmethod
+    def _format_card_text_encoding_error(
+        draft: CardEditDraft,
+        field_name: str,
+        language: str,
+        encoding: str,
+        error: UnicodeEncodeError,
+    ) -> str:
+        character = error.object[error.start]
+        code_point = f"U+{ord(character):04X}"
+        unicode_name = unicodedata.name(character, "UNKNOWN")
+        return (
+            f"Card index {draft.card_index}, ID {draft.card_id}: "
+            f"{field_name}:{language} cannot be encoded using {encoding} at "
+            f"character {error.start}: {character!r} "
+            f"({code_point} {unicode_name})."
+        )
 
     def load_card_image(
         self,

@@ -90,7 +90,7 @@ class LanguagePrefixTests(unittest.TestCase):
                 "load_dependency_table",
                 "dataframe_to_indexed_text_records",
                 "generate_string_offsets",
-                "pad_integer_sequence",
+                "pad_integer_sequence_to_power_of_two",
             ],
         )
         self.assertEqual(

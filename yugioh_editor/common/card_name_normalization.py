@@ -4,6 +4,7 @@ import re
 import unicodedata
 from typing import Protocol
 
+from yugioh_editor.common.card_errors import JapaneseReadingNotFoundError
 from yugioh_editor.common.constants import (
     JAPANESE_LANGUAGE,
     normalize_language_code,
@@ -143,7 +144,10 @@ class CardNameNormalizer:
                 raise RuntimeError(
                     "Japanese card-name normalization requires a reading service."
                 )
-            reading = self._card_reference_data_service.get_japanese_reading(name)
+            try:
+                reading = self._card_reference_data_service.get_japanese_reading(name)
+            except JapaneseReadingNotFoundError:
+                return name
             return normalize_japanese_reading(reading)
         return normalize_non_japanese_name(name)
 

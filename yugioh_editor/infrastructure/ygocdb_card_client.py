@@ -491,10 +491,18 @@ class YgocdbCardClient:
                 )
             cid = item.get("cid")
             if cid is not None:
+                if isinstance(cid, bool) or not isinstance(cid, (int, str)):
+                    raise JapaneseReadingCrawlError(
+                        "fetch_japanese_reading received an invalid cid for "
+                        f"{display_name_jpn!r} at position {position}."
+                    )
                 try:
                     cid = int(cid)
-                except (TypeError, ValueError):
-                    continue
+                except (TypeError, ValueError) as error:
+                    raise JapaneseReadingCrawlError(
+                        "fetch_japanese_reading received an invalid cid for "
+                        f"{display_name_jpn!r} at position {position}."
+                    ) from error
             candidates.append(
                 {
                     "jp_name": jp_name,

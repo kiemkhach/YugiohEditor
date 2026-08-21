@@ -385,6 +385,10 @@ regex-table behavior, including canonical CRLF output.
 Card catalog access uses a semantic `large`/`mini` selector. The repository,
 not the service or view, resolves it to `card/list_card.txt` or
 `mini/list_card.txt`; basename-only lookup is not used.
+When the composite cards table is split, nonnegative rows use the editable
+English name, while negative-ID rows keep the existing catalog name separately
+for each variant. The regex codec therefore remains generic and the repository
+that assembles/splits the logical table owns sentinel preservation.
 
 New card images cross the repository boundary as an ordered sequence of
 `NamedCardImagePair` values. `add_named_card_images_batch()` validates every
@@ -414,15 +418,23 @@ compressed          False
 After one or more new physical files are added, ordering is replanned for every
 record belonging to the actual, case-preserved `Data.dat` source. The exact
 comparison key is
-`normalize_project_path(record.relative_path).as_posix().casefold()`: separators
-are normalized, the complete relative path participates, and comparison is
-case-insensitive deterministic lexicographical ordering. The stored
+`"\\".join(normalize_project_path(record.relative_path).parts).casefold()`:
+separators are normalized to the comparison character used by the original
+Windows paths, the complete relative path participates, and comparison is
+case-insensitive deterministic global lexicographical ordering. It is not a
+recursive files-before-folders traversal. The stored
 `relative_path` spelling and casing are not rewritten. The sorted `Data.dat`
 records are renumbered contiguously as `0..N-1`; records belonging to
 `Voice.dat`, `Region.dat`, or any other source are untouched. This does not
 alphabetize either `list_card.txt` catalog. Replacement reuses the existing
 record, path, and compression state and, when no new file is added, does not
 replan order.
+
+The original `data_org.dat` entry sequence confirms the global full-path and
+backslash-separator rule, including the `reaction`, `start`, and `summon`
+prefix collisions. Because every observed source path is lowercase, original
+case-sensitive versus case-insensitive comparison remains **Unresolved**;
+`casefold()` is retained as the editor's deterministic policy.
 
 `ProjectFileRecord.order` remains the single container-order source of truth.
 Project export retains the record on `ProjectResource`; archive construction
@@ -482,6 +494,14 @@ create sibling output staging directory
 -> atomic replace the project bin directory
 ```
 
+Export Files reuses the same project-resource grouping and reconstruction
+helpers. For `Data.dat` and `Voice.dat` it stops at each encoded
+`ContainerEntry.data`, before LZSS/container packing, and writes those final
+decompressed bytes under `data/` and `voice/`. Deck and Region use the same
+pure encoders as Pack and are written beneath `deck/` and `region/`. Virtual
+records participate normally. Destination writes are individually atomic and
+never delete the chosen directory.
+
 Failures remove staging data. A failed pack preserves the previous `bin`
 directory.
 
@@ -497,7 +517,15 @@ workspace source bytes
 -> patch_executable_card_capacity pre_encode
 -> generic binary codec
 -> Pack staging/<prefix>_pc.exe
+-> optional PE icon-group update on that staged file
 ```
+
+Create Project copies a validated optional ICO to `project.ico`; only its
+relative path is stored in the manifest. Older manifests may keep an explicit
+`project.icon` path because Pack treats the manifest path as authoritative.
+Pack reads that project-owned copy before creating output staging, fails clearly
+when it is missing, and updates only icon resource types while retaining
+existing group identities/languages and unrelated PE resources.
 
 The profile contains plain frozen data: the original whole-file SHA-256, safe
 state bounds, 21 integer instruction sites, one conditional `MOVSW` site, and
@@ -655,16 +683,28 @@ live Card Detail dialog. A repeated open request focuses the live dialog. Each
 owner clears its reference from the dialog's `finished` signal, schedules the
 closed dialog for deletion, and creates a fresh instance on the next request.
 
-`ProjectView` retains each active Pack runner until its `finished` signal,
-disables duplicate Pack requests, prevents the project window from closing
-mid-Pack, and restores the button and busy indicator on success or failure.
+`ProjectView` retains each active Pack or Export Files runner until its
+`finished` signal. Before starting, it rejects the request while a retained
+Card List save or image replacement is mutating the workspace. While artifact
+reconstruction runs, it disables the tree/editor, Save Current File, Card List,
+Run, and duplicate artifact requests, prevents the project window from closing,
+and restores controls and the busy indicator on success or failure. This keeps
+Pack and Export on one stable persisted project state. A retained editor
+replacement also blocks tree navigation and project close until its callback
+has finished, so its editor cannot be destroyed while the write is live.
+Card List publishes its retained project-save state to `ProjectView`, and file
+editors publish retained replacement state in the other direction. The owner
+uses those signals to make Card List transactions and Image/Audio replacement
+mutually exclusive even though the two windows are modeless.
 Pack-resource errors retain source, resource, rule, codec, virtual state, and
 pipeline step context; dialogs display only the affected basename.
 
 The Project window's visible `Run` action is separate from Pack. It dispatches
 `ProjectService.run_packed_game()` through the retained background-task path and
 only launches the executable already present under `bin`; it never invokes
-`pack_project()` or waits for the game process to exit. Successful launch ends
+`pack_project()` or waits for the game process to exit. The argument list is
+exactly `<executable>, -full, -speedy`, with the executable parent as cwd.
+Successful launch ends
 the task and clears the busy state without an information, warning, or other
 modal dialog. Missing or unlaunchable executables still flow through the
 existing failure handler, retain traceback logging, show an error, and clean up

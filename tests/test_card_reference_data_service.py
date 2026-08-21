@@ -89,10 +89,12 @@ class TestCardReferenceDataService(unittest.TestCase):
 
     def test_get_japanese_reading_from_resource(self):
         service = self._service()
+        original = self.resource.read_bytes()
         self.assertEqual(
             service.get_japanese_reading("青眼の白龍"),
             "ブルーアイズ",
         )
+        self.assertEqual(self.resource.read_bytes(), original)
         self.mocked_ygocdb_card_client.fetch_japanese_reading.assert_not_called()
 
     def test_try_get_japanese_reading_returns_none(self):
@@ -106,13 +108,63 @@ class TestCardReferenceDataService(unittest.TestCase):
         )
         service = self._service()
         self.assertEqual(service.get_japanese_reading("未登録"), "ミトウロク")
+        persisted = self.resource.read_bytes()
         self.assertEqual(service.get_japanese_reading("未登録"), "ミトウロク")
+        self.assertEqual(self.resource.read_bytes(), persisted)
         self.mocked_ygocdb_card_client.fetch_japanese_reading.assert_called_once_with(
             "未登録"
+        )
+        dataframe = pd.read_csv(
+            self.resource,
+            dtype=str,
+            encoding="utf-8-sig",
+            keep_default_na=False,
+        )
+        self.assertEqual(
+            dataframe.loc[
+                dataframe["display_name_jpn"] == "未登録",
+                ["display_name_jpn", "reading_jpn"],
+            ].values.tolist(),
+            [["未登録", "ミトウロク"]],
         )
         self.assertEqual(
             self._service().try_get_japanese_reading("未登録"),
             "ミトウロク",
+        )
+
+    def test_not_found_does_not_poison_a_later_success(self):
+        self.mocked_ygocdb_card_client.fetch_japanese_reading.side_effect = (
+            JapaneseReadingNotFoundError("未登録"),
+            "ミトウロク",
+        )
+        service = self._service()
+        original = self.resource.read_bytes()
+
+        with self.assertRaises(JapaneseReadingNotFoundError):
+            service.get_japanese_reading("未登録")
+        self.assertEqual(self.resource.read_bytes(), original)
+        self.assertIsNone(service.try_get_japanese_reading("未登録"))
+
+        self.assertEqual(service.get_japanese_reading("未登録"), "ミトウロク")
+        persisted = self.resource.read_bytes()
+        self.assertEqual(service.get_japanese_reading("未登録"), "ミトウロク")
+        self.assertEqual(self.resource.read_bytes(), persisted)
+        self.assertEqual(
+            self.mocked_ygocdb_card_client.fetch_japanese_reading.call_args_list,
+            [call("未登録"), call("未登録")],
+        )
+        dataframe = pd.read_csv(
+            self.resource,
+            dtype=str,
+            encoding="utf-8-sig",
+            keep_default_na=False,
+        )
+        self.assertEqual(
+            dataframe.loc[
+                dataframe["display_name_jpn"] == "未登録",
+                ["display_name_jpn", "reading_jpn"],
+            ].values.tolist(),
+            [["未登録", "ミトウロク"]],
         )
 
     def test_network_lookup_runs_outside_the_resource_lock(self):

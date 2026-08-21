@@ -831,6 +831,7 @@ class SubfileRuleMatchingTests(unittest.TestCase):
 
     def test_virtual_metadata_is_in_the_same_rule(self):
         index = self.repository.find_rule("card_indxeng.bin")
+        dialog_index = self.repository.find_rule("dlg_indxeng.bin")
         description = self.repository.find_rule("card_desceng.bin")
         sort = self.repository.find_rule("card_sorteng.bin")
         self.assertTrue(index.virtual)
@@ -840,12 +841,38 @@ class SubfileRuleMatchingTests(unittest.TestCase):
                 "load_dependency_table",
                 "dataframe_to_indexed_text_records",
                 "generate_string_offsets",
-                "pad_integer_sequence",
+                "pad_integer_sequence_to_power_of_two",
             ],
         )
         self.assertEqual(
             index.pre_encode[0].params["table"],
             "card_desc[lang].bin",
+        )
+        self.assertEqual(
+            dict(index.pre_encode[-1].params),
+            {
+                "minimum_capacity": 2048,
+                "pad_value": 0,
+            },
+        )
+        self.assertIn(
+            "pad_integer_sequence_to_power_of_two",
+            ALLOWED_RULE_METHODS,
+        )
+        self.assertTrue(dialog_index.virtual)
+        self.assertEqual(
+            [step.method_name for step in dialog_index.pre_encode],
+            [
+                "load_dependency_table",
+                "dataframe_to_indexed_text_records",
+                "generate_string_offsets",
+            ],
+        )
+        self.assertFalse(
+            any(
+                "pad_integer_sequence" in step.method_name
+                for step in dialog_index.pre_encode
+            )
         )
         self.assertFalse(index.decode_params["signed"])
         self.assertEqual(index.decode_params["byte_width"], 4)
@@ -886,6 +913,47 @@ class SubfileRuleMatchingTests(unittest.TestCase):
         self.assertFalse(reverse.encode_params["signed"])
         self.assertEqual(reverse.encode_params["byte_width"], 2)
         self.assertEqual(reverse.encode_params["byte_order"], "little")
+
+    def test_power_of_two_integer_padding_covers_card_index_capacity_bands(self):
+        context = Mock()
+        expected_capacities = {
+            1: 2048,
+            1115: 2048,
+            1116: 2048,
+            2047: 2048,
+            2048: 2048,
+            2049: 4096,
+            2389: 4096,
+            4095: 4096,
+            4096: 4096,
+            4097: 8192,
+            8191: 8192,
+            8192: 8192,
+            8193: 16384,
+        }
+        for required_count, expected_capacity in expected_capacities.items():
+            with self.subTest(required_count=required_count):
+                values = list(range(required_count))
+                padded = GameRepository.pad_integer_sequence_to_power_of_two(
+                    values,
+                    context=context,
+                    minimum_capacity=2048,
+                    pad_value=0,
+                )
+                self.assertEqual(len(padded), expected_capacity)
+                self.assertEqual(padded[:required_count], values)
+                self.assertFalse(any(padded[required_count:]))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Minimum integer-sequence capacity must be positive",
+        ):
+            GameRepository.pad_integer_sequence_to_power_of_two(
+                [],
+                context=context,
+                minimum_capacity=0,
+                pad_value=0,
+            )
 
     def test_codec_names_are_generic_operations(self):
         self.assertEqual(VALID_CODEC_NAMES, CODEC_OPERATIONS)
@@ -1083,6 +1151,10 @@ class RulePipelineTests(unittest.TestCase):
             (2047, 2048),
             (2048, 4096),
             (2389, 4096),
+            (4095, 4096),
+            (4096, 8192),
+            (8191, 8192),
+            (8192, 16384),
         ):
             with self.subTest(maximum_id=maximum_id):
                 result = repository.generate_reverse_lookup(
@@ -1162,6 +1234,23 @@ class RulePipelineTests(unittest.TestCase):
                 )
                 self.assertEqual(ranks[: len(names)], expected)
                 self.assertFalse(any(ranks[len(names) :]))
+
+        record_count = 4097
+        records = [
+            {
+                "card_index": index,
+                "name": "" if index == 0 else f"Card {index:04d}",
+                "card_id": -1 if index == 0 else index,
+            }
+            for index in range(record_count)
+        ]
+        ranks = repository.generate_sort_indices(records, context=context)
+        self.assertEqual(len(ranks), 8192)
+        self.assertEqual(
+            sorted(ranks[1:record_count]),
+            list(range(record_count - 1)),
+        )
+        self.assertFalse(any(ranks[record_count:]))
 
     def test_english_sort_exact_blank_hyphen_and_duplicate_order(self):
         repository = GameRepository.from_root(".")

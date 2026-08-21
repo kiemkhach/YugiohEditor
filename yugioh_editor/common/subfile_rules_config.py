@@ -555,9 +555,9 @@ SUBFILE_RULE_CONFIGS: tuple[dict[str, Any], ...] = (
                 },
             },
             {
-                "method_name": "pad_integer_sequence",
+                "method_name": "pad_integer_sequence_to_power_of_two",
                 "params": {
-                    "capacity": 2048,
+                    "minimum_capacity": 2048,
                     "pad_value": 0,
                 },
             },

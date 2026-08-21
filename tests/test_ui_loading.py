@@ -16,16 +16,20 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PYSIDE_AVAILABLE = importlib.util.find_spec("PySide6") is not None
 
 if PYSIDE_AVAILABLE:
-    from PySide6.QtCore import QEvent, QPoint, Qt, QThread
+    from PySide6.QtCore import QEvent, QPoint, QSettings, Qt, QThread
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
+        QFileDialog,
+        QFormLayout,
+        QHBoxLayout,
         QHeaderView,
         QLineEdit,
         QMessageBox,
         QPushButton,
         QTableView,
+        QTreeWidgetItem,
         QWidget,
     )
 
@@ -47,7 +51,12 @@ if PYSIDE_AVAILABLE:
     from yugioh_editor.services.card_service import CardService
     from yugioh_editor.services.project_service import ProjectService
     from yugioh_editor.views.card_list_view import CardListView
-    from yugioh_editor.views.editors import BinaryEditor, TableEditor
+    from yugioh_editor.views.editors import (
+        AudioEditor,
+        BinaryEditor,
+        ImageEditor,
+        TableEditor,
+    )
     from yugioh_editor.views.project_view import ProjectView
     from yugioh_editor.views.start_view import StartView
     from yugioh_editor.views.ui_loader import load_ui
@@ -70,6 +79,16 @@ class UiLoadingTests(unittest.TestCase):
             time.sleep(0.01)
         self.application.processEvents()
         return bool(predicate())
+
+    def isolated_start_settings(self) -> QSettings:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        settings = QSettings(
+            str(Path(directory.name) / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        settings.setFallbacksEnabled(False)
+        return settings
 
     @staticmethod
     def card_detail(
@@ -125,6 +144,7 @@ class UiLoadingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             project_service = Mock(spec=ProjectService)
+            project_service.find_registered_game_folder.return_value = None
             project_service.list_visible_resources.return_value = []
             card_service = Mock(spec=CardService)
             card_service.load_card_details.return_value = []
@@ -134,7 +154,7 @@ class UiLoadingTests(unittest.TestCase):
                 version_prefix="mai",
             )
             windows = (
-                StartView(project_service),
+                StartView(project_service, self.isolated_start_settings()),
                 ProjectView(manifest, project_service, card_service),
                 CardListView(manifest, card_service),
             )
@@ -172,7 +192,19 @@ class UiLoadingTests(unittest.TestCase):
 
     def test_controller_opens_project_window_maximized(self):
         with tempfile.TemporaryDirectory() as directory:
-            controller = ApplicationController()
+            with (
+                patch.object(
+                    StartView,
+                    "_create_default_settings",
+                    return_value=self.isolated_start_settings(),
+                ),
+                patch.object(
+                    ProjectService,
+                    "find_registered_game_folder",
+                    return_value=None,
+                ),
+            ):
+                controller = ApplicationController()
             manifest = ProjectManifest(
                 "Maximized project",
                 directory,
@@ -196,11 +228,13 @@ class UiLoadingTests(unittest.TestCase):
             controller.start_view.deleteLater()
 
     def test_start_view_preserves_designer_values(self):
-        view = StartView(ProjectService())
+        service = Mock(spec=ProjectService)
+        service.find_registered_game_folder.return_value = None
+        view = StartView(service, self.isolated_start_settings())
         view.show()
         self.application.processEvents()
-        self.assertEqual((view.width(), view.height()), (760, 200))
-        self.assertLess(view.height(), 250)
+        self.assertEqual((view.width(), view.height()), (760, 230))
+        self.assertLess(view.height(), 280)
         self.assertEqual(view.minimumSize(), view.maximumSize())
         self.assertEqual(view.centralWidget().minimumSize(), view.size())
         self.assertEqual(view.centralWidget().maximumSize(), view.size())
@@ -226,13 +260,292 @@ class UiLoadingTests(unittest.TestCase):
         )
         self.assertEqual(
             view.findChild(QLineEdit, "txtWorkspace").text(),
-            r"D:\Projects\YGOMOD\Mod_Editor_Projects",
+            "",
         )
         self.assertEqual(
             view.findChild(QLineEdit, "txtGameFolder").text(),
-            r"D:\Game\Yugioh\Yu-Gi-Oh! Power of Chaos JOEY THE PASSION",
+            "",
         )
+        self.assertEqual(view.findChild(QLineEdit, "txtIcon").text(), "")
+        self.assertEqual(view.findChild(QFormLayout, "formLayout").rowCount(), 5)
         view.close()
+        view.deleteLater()
+
+    def test_start_view_default_settings_use_stable_user_ini_location(self):
+        with patch("yugioh_editor.views.start_view.QSettings") as settings_type:
+            settings_type.Format.IniFormat = QSettings.Format.IniFormat
+            settings_type.Scope.UserScope = QSettings.Scope.UserScope
+            settings = StartView._create_default_settings()
+
+        settings_type.assert_called_once_with(
+            QSettings.Format.IniFormat,
+            QSettings.Scope.UserScope,
+            StartView.SETTINGS_ORGANIZATION,
+            StartView.SETTINGS_APPLICATION,
+        )
+        settings.setFallbacksEnabled.assert_called_once_with(False)
+
+    def test_start_view_missing_workspace_preference_is_normal(self):
+        service = Mock(spec=ProjectService)
+        service.find_registered_game_folder.return_value = None
+        with self.assertLogs(level="DEBUG") as logs:
+            view = StartView(service, self.isolated_start_settings())
+        self.assertIn(
+            "No saved Workspace folder was found",
+            "\n".join(logs.output),
+        )
+        self.assertEqual(view._txt_workspace.text(), "")
+        view.deleteLater()
+
+    def test_start_view_missing_registered_game_folder_is_silent(self):
+        service = Mock(spec=ProjectService)
+        service.find_registered_game_folder.return_value = None
+        with (
+            patch.object(QMessageBox, "critical") as critical,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            view = StartView(service, self.isolated_start_settings())
+
+        service.find_registered_game_folder.assert_called_once_with()
+        self.assertEqual(view._txt_game_folder.text(), "")
+        critical.assert_not_called()
+        warning.assert_not_called()
+        view.deleteLater()
+
+    def test_start_view_detects_game_folder_once_without_overwriting_ui_value(self):
+        registered_folder = r"C:\Games\Joey"
+        service = Mock(spec=ProjectService)
+        service.find_registered_game_folder.return_value = registered_folder
+        view = StartView(service, self.isolated_start_settings())
+
+        self.assertEqual(view._txt_game_folder.text(), registered_folder)
+        view._detect_game_folder()
+        service.find_registered_game_folder.assert_called_once_with()
+        view.deleteLater()
+
+        def load_with_current_game_folder(ui_file, parent):
+            root = load_ui(ui_file, parent)
+            root.findChild(QLineEdit, "txtGameFolder").setText("current folder")
+            return root
+
+        service = Mock(spec=ProjectService)
+        with patch(
+            "yugioh_editor.views.start_view.load_ui",
+            side_effect=load_with_current_game_folder,
+        ):
+            view = StartView(service, self.isolated_start_settings())
+
+        self.assertEqual(view._txt_game_folder.text(), "current folder")
+        service.find_registered_game_folder.assert_not_called()
+        view.deleteLater()
+
+    def test_start_view_logs_registry_detection_error_without_popup(self):
+        service = Mock(spec=ProjectService)
+        service.find_registered_game_folder.side_effect = OSError("registry denied")
+        with (
+            self.assertLogs(level="ERROR") as logs,
+            patch.object(QMessageBox, "critical") as critical,
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            view = StartView(service, self.isolated_start_settings())
+
+        self.assertIn(
+            "Unable to detect the registered Game folder",
+            "\n".join(logs.output),
+        )
+        critical.assert_not_called()
+        warning.assert_not_called()
+        self.assertEqual(view._txt_game_folder.text(), "")
+        view.deleteLater()
+
+    def test_start_view_restores_workspace_and_persists_browse_immediately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.ini"
+            first_settings = QSettings(
+                str(settings_path),
+                QSettings.Format.IniFormat,
+            )
+            service = Mock(spec=ProjectService)
+            service.find_registered_game_folder.return_value = None
+            view = StartView(service, first_settings)
+
+            with patch.object(
+                QFileDialog,
+                "getExistingDirectory",
+                return_value=directory,
+            ) as select_directory:
+                view.findChild(QPushButton, "btnBrowseWorkspace").click()
+
+            select_directory.assert_called_once_with(view, "Select folder")
+            self.assertEqual(view._txt_workspace.text(), directory)
+            self.assertEqual(
+                first_settings.value(StartView.WORKSPACE_SETTING_KEY),
+                directory,
+            )
+            self.assertEqual(
+                first_settings.allKeys(),
+                [StartView.WORKSPACE_SETTING_KEY],
+            )
+            view._txt_game_folder.setText("game folder is never persisted")
+            view.deleteLater()
+
+            restored_settings = QSettings(
+                str(settings_path),
+                QSettings.Format.IniFormat,
+            )
+            service = Mock(spec=ProjectService)
+            service.find_registered_game_folder.return_value = None
+            restored_view = StartView(service, restored_settings)
+            self.assertEqual(restored_view._txt_workspace.text(), directory)
+            self.assertEqual(
+                restored_settings.allKeys(),
+                [StartView.WORKSPACE_SETTING_KEY],
+            )
+            restored_view.deleteLater()
+
+    def test_start_view_persists_manually_entered_existing_workspace_on_create(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = self.isolated_start_settings()
+            service = Mock(spec=ProjectService)
+            service.find_registered_game_folder.return_value = None
+            view = StartView(service, settings)
+            view._txt_project_name.setText("Demo")
+            view._txt_workspace.setText(directory)
+            view._txt_game_folder.setText("game")
+            view._txt_icon.setText("   ")
+
+            with patch.object(view, "_run_task") as run_task:
+                view._create_project()
+
+            self.assertEqual(
+                settings.value(StartView.WORKSPACE_SETTING_KEY),
+                directory,
+            )
+            action = run_task.call_args.args[0]
+            action()
+            service.create_project.assert_called_once_with(
+                "Demo",
+                directory,
+                "game",
+                "mai",
+                icon_source=None,
+            )
+            view.deleteLater()
+
+    def test_start_view_ignores_corrupt_or_unreadable_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.ini"
+            settings_path.write_bytes(b"\xff\xfe\x00invalid")
+            corrupt_settings = QSettings(
+                str(settings_path),
+                QSettings.Format.IniFormat,
+            )
+            service = Mock(spec=ProjectService)
+            service.find_registered_game_folder.return_value = None
+            with self.assertLogs(level="WARNING") as logs:
+                view = StartView(service, corrupt_settings)
+            self.assertIn("settings read failed", "\n".join(logs.output))
+            self.assertEqual(view._txt_workspace.text(), "")
+            view.deleteLater()
+
+        unreadable_settings = Mock()
+        unreadable_settings.status.return_value = QSettings.Status.NoError
+        unreadable_settings.contains.side_effect = OSError("settings denied")
+        service = Mock(spec=ProjectService)
+        service.find_registered_game_folder.return_value = None
+        with self.assertLogs(level="ERROR") as logs:
+            view = StartView(service, unreadable_settings)
+        self.assertIn(
+            "Unable to restore the saved Workspace folder",
+            "\n".join(logs.output),
+        )
+        self.assertEqual(view._txt_workspace.text(), "")
+        view.deleteLater()
+
+    def test_start_view_load_project_uses_existing_workspace_as_initial_folder(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            service = Mock(spec=ProjectService)
+            service.find_registered_game_folder.return_value = None
+            view = StartView(service, self.isolated_start_settings())
+            view._txt_workspace.setText(workspace)
+
+            with (
+                patch.object(
+                    QFileDialog,
+                    "getExistingDirectory",
+                    return_value=str(Path(workspace) / "project"),
+                ) as select_directory,
+                patch.object(view, "_run_task") as run_task,
+            ):
+                view._load_project()
+
+            select_directory.assert_called_once_with(
+                view,
+                "Select project folder",
+                workspace,
+            )
+            action = run_task.call_args.args[0]
+            action()
+            service.load_project.assert_called_once_with(
+                str(Path(workspace) / "project")
+            )
+            view.deleteLater()
+
+    def test_start_view_load_project_uses_two_argument_dialog_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            invalid_workspace = str(Path(directory) / "missing")
+            for workspace in ("", invalid_workspace):
+                with self.subTest(workspace=workspace):
+                    service = Mock(spec=ProjectService)
+                    service.find_registered_game_folder.return_value = None
+                    view = StartView(service, self.isolated_start_settings())
+                    view._txt_workspace.setText(workspace)
+                    with patch.object(
+                        QFileDialog,
+                        "getExistingDirectory",
+                        return_value="",
+                    ) as select_directory:
+                        view._load_project()
+                    select_directory.assert_called_once_with(
+                        view,
+                        "Select project folder",
+                    )
+                    service.load_project.assert_not_called()
+                    view.deleteLater()
+
+    def test_start_view_browses_for_ico_file_and_passes_it_to_create(self):
+        service = Mock(spec=ProjectService)
+        service.find_registered_game_folder.return_value = None
+        view = StartView(service, self.isolated_start_settings())
+        icon_path = r"C:\icons\project.ico"
+
+        with patch.object(
+            QFileDialog,
+            "getOpenFileName",
+            return_value=(icon_path, "Icon files (*.ico)"),
+        ) as select_icon:
+            view.findChild(QPushButton, "btnBrowseIcon").click()
+
+        select_icon.assert_called_once_with(
+            view,
+            "Select icon file",
+            "",
+            "Icon files (*.ico)",
+        )
+        self.assertEqual(view._txt_icon.text(), icon_path)
+        view._txt_project_name.setText("Icon Project")
+        view._txt_workspace.setText("workspace")
+        view._txt_game_folder.setText("game")
+        with patch.object(view, "_run_task") as run_task:
+            view._create_project()
+        run_task.call_args.args[0]()
+        service.create_project.assert_called_once_with(
+            "Icon Project",
+            "workspace",
+            "game",
+            "mai",
+            icon_source=icon_path,
+        )
         view.deleteLater()
 
     def test_card_list_is_maximized_and_both_scrollbars_have_range(self):
@@ -400,11 +713,13 @@ class UiLoadingTests(unittest.TestCase):
 
     def test_start_view_passes_current_widget_prefix_to_service(self):
         service = Mock(spec=ProjectService)
+        service.find_registered_game_folder.return_value = None
         service.validate_version_prefix.return_value = "not-the-widget-value"
-        view = StartView(service)
+        view = StartView(service, self.isolated_start_settings())
         view._txt_project_name.setText("Demo")
         view._txt_workspace.setText("workspace")
         view._txt_game_folder.setText("game")
+        view._txt_icon.setText(r"C:\icons\demo.ico")
         view._version_prefix.setText("  eng  ")
 
         with patch.object(view, "_run_task") as run_task:
@@ -418,6 +733,7 @@ class UiLoadingTests(unittest.TestCase):
             "workspace",
             "game",
             "eng",
+            icon_source=r"C:\icons\demo.ico",
         )
         view.deleteLater()
 
@@ -425,7 +741,8 @@ class UiLoadingTests(unittest.TestCase):
         for value in ("", "   "):
             with self.subTest(prefix=value):
                 service = Mock(spec=ProjectService)
-                view = StartView(service)
+                service.find_registered_game_folder.return_value = None
+                view = StartView(service, self.isolated_start_settings())
                 view._version_prefix.setText(value)
                 with (
                     patch.object(view, "_run_task") as run_task,
@@ -554,6 +871,13 @@ class UiLoadingTests(unittest.TestCase):
             )
             view = ProjectView(manifest, ProjectService(), CardService())
             self.assertTrue(view.findChild(QPushButton, "btnBuildAndRun").isEnabled())
+            export_button = view.findChild(QPushButton, "btnExportFiles")
+            build_button = view.findChild(QPushButton, "btnBuild")
+            toolbar = view.findChild(QHBoxLayout, "toolbarLayout")
+            self.assertEqual(export_button.text(), "Export Files")
+            self.assertEqual(
+                toolbar.indexOf(export_button) + 1, toolbar.indexOf(build_button)
+            )
             self.assertEqual(view.findChild(QPushButton, "btnBuild").text(), "Build")
             self.assertEqual(
                 view.findChild(QPushButton, "btnBuildAndRun").text(),
@@ -565,6 +889,81 @@ class UiLoadingTests(unittest.TestCase):
             self.assertIsNone(view.findChild(QPushButton, "btnPack"))
             self.assertIsNone(view.findChild(QPushButton, "btnRun"))
             view.deleteLater()
+
+    def test_image_editor_exposes_retained_replace_mutation_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Mock(spec=ProjectService)
+            service.read_project_binary.return_value = b""
+            manifest = ProjectManifest(
+                "Image editor",
+                directory,
+                version_prefix="mai",
+            )
+            record = ProjectFileRecord(
+                source_file="Data.dat",
+                relative_path="card/example.bmp",
+                workspace_path="data/card/example.bmp",
+                file_kind="image",
+                storage_format="binary",
+            )
+            editor = ImageEditor(service, manifest, record)
+            editor._thread_pool = Mock()
+            mutation_states = []
+            editor.project_mutation_state_changed.connect(mutation_states.append)
+
+            self.assertFalse(editor.is_project_mutation_in_progress)
+            with patch.object(
+                QFileDialog,
+                "getOpenFileName",
+                return_value=(str(Path(directory) / "replacement.bmp"), ""),
+            ):
+                editor.replace_button.click()
+
+            runner = editor._thread_pool.start.call_args.args[0]
+            self.assertTrue(editor.is_project_mutation_in_progress)
+            self.assertFalse(editor.replace_button.isEnabled())
+            runner.signals.finished.emit()
+            self.assertFalse(editor.is_project_mutation_in_progress)
+            self.assertTrue(editor.replace_button.isEnabled())
+            self.assertEqual(mutation_states, [True, False])
+            editor.deleteLater()
+
+    def test_audio_editor_blocks_other_project_mutations_while_choosing_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Mock(spec=ProjectService)
+            service.project_resource_path.return_value = Path(directory) / "voice.wav"
+            manifest = ProjectManifest(
+                "Audio editor",
+                directory,
+                version_prefix="mai",
+            )
+            record = ProjectFileRecord(
+                source_file="Voice.dat",
+                relative_path="voice/example.wav",
+                workspace_path="voice/example.wav",
+                file_kind="audio",
+                storage_format="binary",
+            )
+            editor = AudioEditor(service, manifest, record)
+            mutation_states = []
+            editor.project_mutation_state_changed.connect(mutation_states.append)
+
+            def cancel_chooser(*_args):
+                self.assertTrue(editor.is_project_mutation_in_progress)
+                self.assertEqual(mutation_states, [True])
+                return "", ""
+
+            with patch.object(
+                QFileDialog,
+                "getOpenFileName",
+                side_effect=cancel_chooser,
+            ):
+                editor.replace_button.click()
+
+            service.replace_project_file.assert_not_called()
+            self.assertFalse(editor.is_project_mutation_in_progress)
+            self.assertEqual(mutation_states, [True, False])
+            editor.deleteLater()
 
     def test_project_view_run_success_has_no_dialog_and_restores_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -606,6 +1005,363 @@ class UiLoadingTests(unittest.TestCase):
             critical.assert_not_called()
             self.assertFalse(view._pgb_progress.isVisible())
             self.assertTrue(view.isVisible())
+            view.close()
+            view.deleteLater()
+
+    def test_project_view_export_runs_once_off_ui_thread_and_restores_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "export"
+            destination.mkdir()
+            service = Mock(spec=ProjectService)
+            service.list_visible_resources.return_value = []
+            started = threading.Event()
+            release = threading.Event()
+            worker_threads = []
+
+            def export(_manifest, selected_destination):
+                worker_threads.append(QThread.currentThread())
+                started.set()
+                self.assertTrue(release.wait(5))
+                return Path(selected_destination)
+
+            service.export_project_files.side_effect = export
+            manifest = ProjectManifest(
+                "Export success",
+                directory,
+                version_prefix="mai",
+                executable=ExecutableManifest(
+                    source_name="joey_pc.exe",
+                    relative_path="mai/mai_pc.exe",
+                ),
+            )
+            view = ProjectView(manifest, service, CardService())
+            view.show()
+            export_button = view.findChild(QPushButton, "btnExportFiles")
+            build_button = view.findChild(QPushButton, "btnBuild")
+            run_button = view.findChild(QPushButton, "btnBuildAndRun")
+            save_button = view.findChild(QPushButton, "btnSaveFile")
+            card_list_button = view.findChild(QPushButton, "btnCardList")
+            card_list = Mock()
+            card_list.is_project_save_in_progress = False
+            view._card_list_view = card_list
+
+            with (
+                patch.object(
+                    QFileDialog,
+                    "getExistingDirectory",
+                    return_value=str(destination),
+                ) as chooser,
+                patch.object(QMessageBox, "information") as information,
+                patch.object(QMessageBox, "critical") as critical,
+            ):
+                export_button.click()
+                self.assertTrue(self.wait_until(started.is_set))
+                export_button.click()
+                self.assertTrue(view._export_in_progress)
+                self.assertFalse(export_button.isEnabled())
+                self.assertFalse(build_button.isEnabled())
+                self.assertFalse(run_button.isEnabled())
+                self.assertFalse(save_button.isEnabled())
+                self.assertFalse(card_list_button.isEnabled())
+                self.assertFalse(view._tree.isEnabled())
+                self.assertFalse(view._editor_host.isEnabled())
+                card_list.setEnabled.assert_called_with(False)
+                self.assertTrue(view._pgb_progress.isVisible())
+                view.close()
+                self.application.processEvents()
+                self.assertTrue(view.isVisible())
+                release.set()
+                self.assertTrue(self.wait_until(lambda: not view._export_in_progress))
+
+            chooser.assert_called_once_with(view, "Select export folder")
+            service.export_project_files.assert_called_once_with(
+                manifest,
+                str(destination),
+            )
+            self.assertNotEqual(worker_threads[0], self.application.thread())
+            information.assert_any_call(
+                view,
+                "Export in Progress",
+                "Wait for file export to finish before closing the project.",
+            )
+            information.assert_any_call(
+                view,
+                "Export Files",
+                f"Reconstructed game files were exported to:\n{destination}",
+            )
+            self.assertEqual(information.call_count, 2)
+            critical.assert_not_called()
+            self.assertTrue(export_button.isEnabled())
+            self.assertTrue(build_button.isEnabled())
+            self.assertTrue(run_button.isEnabled())
+            self.assertTrue(save_button.isEnabled())
+            self.assertTrue(card_list_button.isEnabled())
+            self.assertTrue(view._tree.isEnabled())
+            self.assertTrue(view._editor_host.isEnabled())
+            card_list.setEnabled.assert_called_with(True)
+            self.assertFalse(view._pgb_progress.isVisible())
+            self.assertEqual(view._active_runners, {})
+            view.close()
+            view.deleteLater()
+
+    def test_project_view_rejects_artifacts_during_background_project_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Mock(spec=ProjectService)
+            service.list_visible_resources.return_value = []
+            manifest = ProjectManifest(
+                "Busy project",
+                directory,
+                version_prefix="mai",
+            )
+            view = ProjectView(manifest, service, CardService())
+            card_list = Mock()
+            card_list.is_project_save_in_progress = True
+            view._card_list_view = card_list
+
+            with (
+                patch.object(QFileDialog, "getExistingDirectory") as chooser,
+                patch.object(QMessageBox, "information") as information,
+            ):
+                view._export_files()
+                chooser.assert_not_called()
+                information.assert_called_once_with(
+                    view,
+                    "Export Files",
+                    "Wait for the current project update to finish before continuing.",
+                )
+
+            card_list.is_project_save_in_progress = False
+            editor = Mock()
+            editor.is_project_mutation_in_progress = True
+            view._current_editor = editor
+            with patch.object(QMessageBox, "information") as information:
+                view._pack_project()
+                information.assert_called_once_with(
+                    view,
+                    "Pack Project",
+                    "Wait for the current project update to finish before continuing.",
+                )
+
+            service.export_project_files.assert_not_called()
+            service.pack_project.assert_not_called()
+            self.assertFalse(view._export_in_progress)
+            self.assertFalse(view._pack_in_progress)
+            view._card_list_view = None
+            view._current_editor = None
+            view.deleteLater()
+
+    def test_image_replace_blocks_navigation_artifacts_and_project_close(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Mock(spec=ProjectService)
+            service.list_visible_resources.return_value = []
+            service.read_project_binary.return_value = b""
+            manifest = ProjectManifest(
+                "Retained replacement",
+                directory,
+                version_prefix="mai",
+            )
+            current_record = ProjectFileRecord(
+                source_file="Data.dat",
+                relative_path="card/current.bmp",
+                workspace_path="data/card/current.bmp",
+                file_kind="image",
+                storage_format="binary",
+            )
+            next_record = ProjectFileRecord(
+                source_file="Data.dat",
+                relative_path="card/next.bmp",
+                workspace_path="data/card/next.bmp",
+                file_kind="image",
+                storage_format="binary",
+            )
+            view = ProjectView(manifest, service, CardService())
+            view.show()
+            editor = ImageEditor(service, manifest, current_record)
+            editor._thread_pool = Mock()
+            view._set_editor(editor)
+            card_list = Mock()
+            card_list.is_project_save_in_progress = False
+            view._card_list_view = card_list
+            item = QTreeWidgetItem(view._tree, ["next.bmp"])
+            item.setData(0, Qt.UserRole, "next")
+            view._resource_items["next"] = next_record
+
+            def choose_replacement(*_args):
+                card_list.set_external_project_mutation_blocked.assert_called_with(True)
+                self.assertFalse(view.findChild(QPushButton, "btnBuild").isEnabled())
+                return str(Path(directory) / "replacement.bmp"), ""
+
+            with patch.object(
+                QFileDialog,
+                "getOpenFileName",
+                side_effect=choose_replacement,
+            ):
+                editor.replace_button.click()
+            runner = editor._thread_pool.start.call_args.args[0]
+
+            with (
+                patch("yugioh_editor.views.project_view.create_editor") as create,
+                patch.object(QFileDialog, "getExistingDirectory") as chooser,
+                patch.object(QMessageBox, "information") as information,
+            ):
+                view._open_tree_item(item)
+                view._pack_project()
+                view._export_files()
+                view.close()
+                self.application.processEvents()
+
+            self.assertIs(view._current_editor, editor)
+            create.assert_not_called()
+            chooser.assert_not_called()
+            service.pack_project.assert_not_called()
+            service.export_project_files.assert_not_called()
+            self.assertEqual(information.call_count, 3)
+            information.assert_any_call(
+                view,
+                "Project Update in Progress",
+                "Wait for the current project update to finish before closing.",
+            )
+            self.assertTrue(view.isVisible())
+
+            runner.signals.finished.emit()
+            card_list.set_external_project_mutation_blocked.assert_called_with(False)
+            view._card_list_view = None
+            view.close()
+            view.deleteLater()
+
+    def test_card_list_save_state_blocks_project_editor_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Mock(spec=ProjectService)
+            service.list_visible_resources.return_value = []
+            service.read_project_binary.return_value = b""
+            manifest = ProjectManifest(
+                "Card save serialization",
+                directory,
+                version_prefix="mai",
+            )
+            record = ProjectFileRecord(
+                source_file="Data.dat",
+                relative_path="card/current.bmp",
+                workspace_path="data/card/current.bmp",
+                file_kind="image",
+                storage_format="binary",
+            )
+            view = ProjectView(manifest, service, CardService())
+            editor = ImageEditor(service, manifest, record)
+            editor._thread_pool = Mock()
+            view._set_editor(editor)
+            card_service = Mock(spec=CardService)
+            with patch.object(CardListView, "_reload"):
+                card_list = CardListView(manifest, card_service, view)
+            view._card_list_view = card_list
+            card_list.project_save_state_changed.connect(
+                view._refresh_artifact_action_states
+            )
+
+            card_list._save_pending = True
+            card_list._notify_project_save_state()
+
+            self.assertFalse(view._editor_host.isEnabled())
+            self.assertFalse(view._tree.isEnabled())
+            self.assertFalse(view.findChild(QPushButton, "btnBuild").isEnabled())
+            with patch.object(QFileDialog, "getOpenFileName") as chooser:
+                editor.replace_button.click()
+            chooser.assert_not_called()
+
+            card_list._save_pending = False
+            card_list._notify_project_save_state()
+            self.assertTrue(view._editor_host.isEnabled())
+            self.assertTrue(view._tree.isEnabled())
+            self.assertTrue(view.findChild(QPushButton, "btnBuild").isEnabled())
+            card_list._closing = True
+            card_list.reject()
+            view._card_list_view = None
+            card_list.deleteLater()
+            view.deleteLater()
+
+    def test_project_view_serializes_run_launch_with_pack_and_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Mock(spec=ProjectService)
+            service.list_visible_resources.return_value = []
+            manifest = ProjectManifest(
+                "Run serialization",
+                directory,
+                version_prefix="mai",
+                executable=ExecutableManifest(
+                    source_name="joey_pc.exe",
+                    relative_path="mai/mai_pc.exe",
+                ),
+            )
+            view = ProjectView(manifest, service, CardService())
+            run_button = view.findChild(QPushButton, "btnBuildAndRun")
+            export_button = view.findChild(QPushButton, "btnExportFiles")
+            build_button = view.findChild(QPushButton, "btnBuild")
+
+            with patch.object(view, "_run_task") as run_task:
+                view._run_game()
+                view._run_game()
+
+            self.assertEqual(run_task.call_count, 1)
+            self.assertTrue(view._run_in_progress)
+            self.assertFalse(run_button.isEnabled())
+            self.assertFalse(export_button.isEnabled())
+            self.assertFalse(build_button.isEnabled())
+
+            view._on_run_finished()
+            self.assertFalse(view._run_in_progress)
+            self.assertTrue(run_button.isEnabled())
+            self.assertTrue(export_button.isEnabled())
+            self.assertTrue(build_button.isEnabled())
+            view.deleteLater()
+
+    def test_project_view_export_cancel_and_failure_leave_ui_usable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Mock(spec=ProjectService)
+            service.list_visible_resources.return_value = []
+            manifest = ProjectManifest(
+                "Export failure",
+                directory,
+                version_prefix="mai",
+            )
+            view = ProjectView(manifest, service, CardService())
+            view.show()
+            export_button = view.findChild(QPushButton, "btnExportFiles")
+            build_button = view.findChild(QPushButton, "btnBuild")
+
+            with patch.object(
+                QFileDialog,
+                "getExistingDirectory",
+                return_value="",
+            ):
+                export_button.click()
+            service.export_project_files.assert_not_called()
+            self.assertFalse(view._export_in_progress)
+
+            service.export_project_files.side_effect = ValueError(
+                "The export destination is invalid."
+            )
+            with (
+                patch.object(
+                    QFileDialog,
+                    "getExistingDirectory",
+                    return_value=directory,
+                ),
+                patch.object(QMessageBox, "critical") as critical,
+                self.assertLogs(level="ERROR"),
+            ):
+                export_button.click()
+                self.assertTrue(self.wait_until(lambda: not view._export_in_progress))
+
+            service.export_project_files.assert_called_once_with(manifest, directory)
+            critical.assert_called_once_with(
+                view,
+                "Export Files Failed",
+                "The export destination is invalid.",
+            )
+            self.assertTrue(export_button.isEnabled())
+            self.assertTrue(build_button.isEnabled())
+            self.assertFalse(view._pgb_progress.isVisible())
+            self.assertEqual(view._active_runners, {})
             view.close()
             view.deleteLater()
 

@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 from yugioh_editor.common.card_errors import JapaneseReadingNotFoundError
 from yugioh_editor.common.card_name_normalization import CardNameNormalizer
+from yugioh_editor.common.constants import LANGUAGE_ENCODINGS
 from yugioh_editor.repositories.game.repository import GameRepository
 from yugioh_editor.repositories.game.subfile_rule import RuleProcessingContext
 
@@ -124,20 +125,50 @@ class CardSortGenerationTests(unittest.TestCase):
             ["鎧蜥蜴", "地縛霊"],
         )
 
-    def test_japanese_missing_reading_propagates_and_never_uses_raw_name(self):
+    def test_japanese_true_not_found_uses_original_name_as_sort_key(self):
         card_reference_data_service = Mock()
-        card_reference_data_service.get_japanese_reading.side_effect = (
-            JapaneseReadingNotFoundError("未登録")
+
+        def get_reading(name):
+            if name == "既存":
+                return "ワ"
+            raise JapaneseReadingNotFoundError(name)
+
+        card_reference_data_service.get_japanese_reading.side_effect = get_reading
+        repository = GameRepository.from_root(
+            ".",
+            CardNameNormalizer(card_reference_data_service),
+        )
+        result = repository.generate_sort_indices(
+            self._records(["", "既存", "未登録"], [-1, 2, 1]),
+            context=self._context(repository, "jpn"),
+        )
+
+        self.assertEqual(result, [0, 0, 1, 0])
+        reading_calls = card_reference_data_service.get_japanese_reading.call_args_list
+        self.assertEqual(
+            [call.args[0] for call in reading_calls],
+            ["既存", "未登録"],
+        )
+
+    def test_non_japanese_sort_never_requests_japanese_readings(self):
+        card_reference_data_service = Mock()
+        card_reference_data_service.get_japanese_reading.side_effect = AssertionError(
+            "non-Japanese sort requested a Japanese reading"
         )
         repository = GameRepository.from_root(
             ".",
             CardNameNormalizer(card_reference_data_service),
         )
-        with self.assertRaises(JapaneseReadingNotFoundError):
-            repository.generate_sort_indices(
-                self._records(["", "未登録"], [-1, 2]),
-                context=self._context(repository, "jpn"),
-            )
+
+        for language in (code for code in LANGUAGE_ENCODINGS if code != "jpn"):
+            with self.subTest(language=language):
+                result = repository.generate_sort_indices(
+                    self._records(["", "Zulu", "Alpha"], [-1, 2, 1]),
+                    context=self._context(repository, language),
+                )
+                self.assertEqual(result, [0, 1, 0, 0])
+
+        card_reference_data_service.get_japanese_reading.assert_not_called()
 
 
 if __name__ == "__main__":

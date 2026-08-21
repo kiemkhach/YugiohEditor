@@ -2,6 +2,7 @@ import ast
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, call, patch
 
 import pandas as pd
 
@@ -9,6 +10,7 @@ from tests.pipeline_support import (
     decode_description_resource,
     encode_description_resources,
 )
+from yugioh_editor.common.card_errors import JapaneseReadingNotFoundError
 from yugioh_editor.common.errors import (
     InvalidFileFormatError,
     PackResourceError,
@@ -23,6 +25,9 @@ from yugioh_editor.models.entities import (
 from yugioh_editor.repositories.game.connection import GameFolderConnection
 from yugioh_editor.repositories.game.repository import GameRepository
 from yugioh_editor.repositories.project.repository import ProjectRepository
+from yugioh_editor.services.card_reference_data_service import (
+    CardReferenceDataService,
+)
 from yugioh_editor.services.project_service import ProjectService
 from yugioh_editor.services.subfile_service import SubfileService
 
@@ -132,6 +137,159 @@ class DatDiscoveryTests(unittest.TestCase):
 
 
 class VirtualResourceTests(unittest.TestCase):
+    def test_japanese_sort_pack_retries_not_found_without_csv_pollution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reading_resource = root / "card_reading_jpn.csv"
+            pd.DataFrame(
+                [("既存", "ワ")],
+                columns=["display_name_jpn", "reading_jpn"],
+            ).to_csv(
+                reading_resource,
+                index=False,
+                encoding="utf-8-sig",
+                lineterminator="\n",
+            )
+            original_reading_bytes = reading_resource.read_bytes()
+            ygocdb_client = Mock()
+            ygocdb_client.fetch_japanese_reading.side_effect = (
+                JapaneseReadingNotFoundError("未登録"),
+                JapaneseReadingNotFoundError("未登録"),
+                "ア",
+            )
+            reading_service = CardReferenceDataService(
+                japanese_reading_resource_path=reading_resource,
+                ygocdb_client=ygocdb_client,
+            )
+            service = ProjectService(reading_service)
+
+            game = GameFolderConnection(root / "game")
+            entries = [
+                ContainerEntry(
+                    "bin#/card_id.bin",
+                    data=GameRepository.encode_binary_resource(
+                        "card_id.bin",
+                        pd.DataFrame({"value": [-1, 2, 1]}),
+                    ),
+                    order=0,
+                ),
+                ContainerEntry(
+                    "bin#/card_namejpn.bin",
+                    data=GameRepository.encode_binary_resource(
+                        "card_namejpn.bin",
+                        pd.DataFrame({"value": ["", "既存", "未登録"]}),
+                        "jpn",
+                    ),
+                    order=1,
+                ),
+                ContainerEntry(
+                    "bin#/card_sortjpn.bin",
+                    data=b"\x00" * 8,
+                    order=2,
+                ),
+                ContainerEntry("misc/raw.bin", data=b"RAW", order=3),
+            ]
+            game.write_container(
+                "Data.dat",
+                ContainerArchive("Data.dat", entries=entries),
+                "never",
+            )
+            game.write_container(
+                "Voice.dat",
+                ContainerArchive("Voice.dat", entries=[]),
+                "never",
+            )
+            game.write_binary("Region.dat", b"REGION")
+            game.write_deck("deck.ydc", DeckFile())
+            manifest = service.create_project(
+                "Japanese sort",
+                root / "workspace",
+                root / "game",
+                "mai",
+            )
+
+            def pack_data():
+                output = service.pack_project(manifest)
+                container_bytes = (output / "Data.dat").read_bytes()
+                packed = GameFolderConnection(output).read_container("Data.dat")
+                payloads = {
+                    item.relative_path.replace("\\", "/"): item.data
+                    for item in packed.entries
+                }
+                return container_bytes, payloads
+
+            fallback_sort = b"".join(
+                value.to_bytes(2, "little") for value in (0, 0, 1, 0)
+            )
+            resolved_sort = b"".join(
+                value.to_bytes(2, "little") for value in (0, 1, 0, 0)
+            )
+            sort_path = "bin#/card_sortjpn.bin"
+
+            with patch.object(
+                reading_service,
+                "add_japanese_reading_mapping",
+                wraps=reading_service.add_japanese_reading_mapping,
+            ) as persist_mapping:
+                first_bytes, first_payloads = pack_data()
+                self.assertEqual(first_payloads[sort_path], fallback_sort)
+                self.assertEqual(reading_resource.read_bytes(), original_reading_bytes)
+
+                second_bytes, second_payloads = pack_data()
+                self.assertEqual(second_bytes, first_bytes)
+                self.assertEqual(second_payloads, first_payloads)
+                self.assertEqual(reading_resource.read_bytes(), original_reading_bytes)
+                self.assertEqual(
+                    ygocdb_client.fetch_japanese_reading.call_args_list,
+                    [call("未登録"), call("未登録")],
+                )
+                persist_mapping.assert_not_called()
+
+                third_bytes, third_payloads = pack_data()
+                self.assertEqual(third_payloads[sort_path], resolved_sort)
+                self.assertNotEqual(third_bytes, first_bytes)
+                self.assertEqual(
+                    {
+                        path: payload
+                        for path, payload in third_payloads.items()
+                        if path != sort_path
+                    },
+                    {
+                        path: payload
+                        for path, payload in first_payloads.items()
+                        if path != sort_path
+                    },
+                )
+                persist_mapping.assert_called_once_with("未登録", "ア")
+                persisted_reading_bytes = reading_resource.read_bytes()
+                persisted = pd.read_csv(
+                    reading_resource,
+                    dtype=str,
+                    encoding="utf-8-sig",
+                    keep_default_na=False,
+                )
+                self.assertEqual(
+                    persisted[["display_name_jpn", "reading_jpn"]].values.tolist(),
+                    [["既存", "ワ"], ["未登録", "ア"]],
+                )
+                self.assertNotIn(
+                    ["未登録", "未登録"],
+                    persisted[["display_name_jpn", "reading_jpn"]].values.tolist(),
+                )
+
+                fourth_bytes, fourth_payloads = pack_data()
+                self.assertEqual(fourth_bytes, third_bytes)
+                self.assertEqual(fourth_payloads, third_payloads)
+                self.assertEqual(
+                    reading_resource.read_bytes(),
+                    persisted_reading_bytes,
+                )
+                self.assertEqual(
+                    ygocdb_client.fetch_japanese_reading.call_args_list,
+                    [call("未登録"), call("未登録"), call("未登録")],
+                )
+                persist_mapping.assert_called_once_with("未登録", "ア")
+
     def test_virtual_sidecars_are_hidden_and_regenerated(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

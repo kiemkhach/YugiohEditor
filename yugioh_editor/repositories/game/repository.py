@@ -85,6 +85,13 @@ class GameRepository:
             self._card_name_normalizer,
         )
 
+    @property
+    def root(self) -> Path:
+        return self._connection.root
+
+    def ensure_root(self) -> Path:
+        return self._connection.ensure_root()
+
     def list_files(self, supported_only: bool = False) -> list[Path]:
         files = self._connection.list_files(recursive=False)
         if not supported_only:
@@ -343,10 +350,15 @@ class GameRepository:
         file_name: str,
         resource: ProjectResource,
     ) -> Path:
-        table = self._require_table(resource)
-        return self._connection.write_deck(
+        return self._connection.write_binary(
             file_name,
-            DeckFile(card_ids=table["card_id"].astype(int).tolist()),
+            self.encode_deck_resource(resource),
+        )
+
+    def encode_deck_resource(self, resource: ProjectResource) -> bytes:
+        table = self._require_table(resource)
+        return self._connection.encode_deck(
+            DeckFile(card_ids=table["card_id"].astype(int).tolist())
         )
 
     def read_raw_resource(
@@ -372,7 +384,14 @@ class GameRepository:
         file_name: str,
         resource: ProjectResource,
     ) -> Path:
-        return self._connection.write_binary(file_name, bytes(resource.value))
+        return self._connection.write_binary(
+            file_name,
+            self.encode_raw_resource(resource),
+        )
+
+    @staticmethod
+    def encode_raw_resource(resource: ProjectResource) -> bytes:
+        return bytes(resource.value)
 
     def read_executable_resource(
         self,
@@ -411,6 +430,7 @@ class GameRepository:
         resource: ProjectResource,
         *,
         metadata: Mapping[str, object] | None = None,
+        icon_data: bytes | None = None,
     ) -> Path:
         resources = {self._normalize(resource.record.relative_path): resource}
         operation_metadata: dict[str, object] = {
@@ -425,7 +445,18 @@ class GameRepository:
             resources,
             metadata=operation_metadata,
         )
-        return self._connection.write_executable(file_name, data)
+        path = self._connection.write_executable(file_name, data)
+        if icon_data is not None:
+            self._connection.update_executable_icon(file_name, icon_data)
+        return path
+
+    @staticmethod
+    def validate_executable_icon(icon_data: bytes) -> None:
+        from yugioh_editor.repositories.game.windows_icon_resources import (
+            validate_icon_data,
+        )
+
+        validate_icon_data(icon_data)
 
     def read_binary_resource(
         self,
@@ -2006,6 +2037,29 @@ class GameRepository:
         )
         integers = [int(item) for item in values]
         return integers + [int(pad_value)] * (capacity - len(integers))
+
+    @staticmethod
+    def pad_integer_sequence_to_power_of_two(
+        value: object,
+        *,
+        context: RuleProcessingContext,
+        minimum_capacity: int,
+        pad_value: int = 0,
+    ) -> list[int]:
+        del context
+        values = GameRepository._pipeline_sequence(
+            value,
+            method_name="pad_integer_sequence_to_power_of_two",
+        )
+        if minimum_capacity <= 0:
+            raise ValueError("Minimum integer-sequence capacity must be positive.")
+        required_count = len(values)
+        derived_capacity = max(
+            minimum_capacity,
+            GameRepository.find_next_power_of_two(required_count),
+        )
+        integers = [int(item) for item in values]
+        return integers + [int(pad_value)] * (derived_capacity - required_count)
 
     @staticmethod
     def pad_integer_sequence_to_dependency_length(

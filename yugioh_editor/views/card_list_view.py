@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, Qt, QThreadPool, Signal
+from PySide6.QtCore import QEvent, QModelIndex, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -40,6 +40,7 @@ from yugioh_editor.workers.task_runner import (
 
 class CardListView(QDialog):
     dirty_changed = Signal(bool)
+    project_save_state_changed = Signal(bool)
 
     def __init__(
         self,
@@ -53,13 +54,20 @@ class CardListView(QDialog):
         self._thread_pool = QThreadPool.globalInstance()
         self._active_runners: set[TaskRunner] = set()
         self._suggest_runner: CancellableProgressTaskRunner | None = None
+        self._add_runner: TaskRunner | None = None
+        self._save_pending = False
         self._save_runner: TaskRunner | None = None
+        self._last_project_save_state = False
+        self._external_project_mutation_blocked = False
         self._editor_dialog: CardEditorDialog | None = None
         self._dirty = False
         self._loading = False
         self._close_after_save = False
+        self._reject_after_add = False
         self._reject_after_suggest = False
         self._closing = False
+        self._maximize_policy_active = False
+        self._maximize_restore_pending = False
         self.setWindowTitle("Card List")
         root = load_ui(ui_path("card_list_window.ui"), self)
         layout = QVBoxLayout(self)
@@ -122,6 +130,59 @@ class CardListView(QDialog):
     def is_dirty(self) -> bool:
         return self._dirty
 
+    @property
+    def is_project_save_in_progress(self) -> bool:
+        """Return whether Card List is writing an atomic project transaction."""
+
+        return self._save_pending or self._save_runner is not None
+
+    def set_external_project_mutation_blocked(self, blocked: bool) -> None:
+        """Block Card List mutations owned by another project surface."""
+
+        self._external_project_mutation_blocked = blocked
+        if self._editor_dialog is not None:
+            self._editor_dialog.setEnabled(not blocked)
+        self._refresh_action_states()
+
+    def _notify_project_save_state(self) -> None:
+        busy = self.is_project_save_in_progress
+        if busy == self._last_project_save_state:
+            return
+        self._last_project_save_state = busy
+        self.project_save_state_changed.emit(busy)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() != QEvent.WindowStateChange:
+            return
+        state = self.windowState()
+        if state & Qt.WindowState.WindowMinimized:
+            return
+        if state & Qt.WindowState.WindowMaximized:
+            self._maximize_policy_active = True
+            self._maximize_restore_pending = False
+            return
+        if self._maximize_policy_active and self.isVisible() and not self._closing:
+            self._schedule_maximized_restore()
+
+    def _schedule_maximized_restore(self) -> None:
+        if self._maximize_restore_pending:
+            return
+        self._maximize_restore_pending = True
+        QTimer.singleShot(0, self._restore_maximized_state)
+
+    def _restore_maximized_state(self) -> None:
+        self._maximize_restore_pending = False
+        state = self.windowState()
+        if (
+            self._closing
+            or not self.isVisible()
+            or state & Qt.WindowState.WindowMinimized
+            or state & Qt.WindowState.WindowMaximized
+        ):
+            return
+        self.showMaximized()
+
     def _reload(self, selected_card_index: int | None = None) -> None:
         self._set_loading(True)
         self._execute(
@@ -173,8 +234,17 @@ class CardListView(QDialog):
         )
 
     def closeEvent(self, event) -> None:
-        if self._save_runner is not None:
+        if self._save_pending or self._save_runner is not None:
             self._close_after_save = True
+            event.ignore()
+            return
+        if self._add_runner is not None:
+            self._reject_after_add = True
+            if self._editor_dialog is not None:
+                self._editor_dialog.reject()
+            event.ignore()
+            return
+        if self._reject_after_add:
             event.ignore()
             return
         if not self._dirty:
@@ -217,7 +287,73 @@ class CardListView(QDialog):
     def _add_card(self) -> None:
         if self._model_mutation_blocked():
             return
-        self._open_card_detail(self._service.create_card_draft(self._manifest))
+        dialog = self._open_card_detail(None)
+        if dialog is None:
+            return
+        runner = TaskRunner(lambda: self._service.create_card_draft(self._manifest))
+        self._add_runner = runner
+        self._refresh_action_states()
+        runner.signals.succeeded.connect(
+            lambda draft: self._add_succeeded(runner, dialog, draft)
+        )
+        runner.signals.failed.connect(
+            lambda error: self._add_failed(runner, dialog, error)
+        )
+        runner.signals.finished.connect(lambda: self._add_finished(runner))
+        QTimer.singleShot(0, lambda: self._start_add_runner(runner, dialog))
+
+    def _start_add_runner(
+        self,
+        runner: TaskRunner,
+        dialog: CardEditorDialog,
+    ) -> None:
+        if self._add_runner is not runner:
+            return
+        if self._editor_dialog is not dialog:
+            self._add_runner = None
+            self._refresh_action_states()
+            self._resume_close_after_add()
+            return
+        self._thread_pool.start(runner)
+
+    def _add_succeeded(
+        self,
+        runner: TaskRunner,
+        dialog: CardEditorDialog,
+        draft: CardEditDraft,
+    ) -> None:
+        if self._add_runner is runner and self._editor_dialog is dialog:
+            dialog.initialize_draft(draft)
+
+    def _add_failed(
+        self,
+        runner: TaskRunner,
+        dialog: CardEditorDialog,
+        error: TaskError,
+    ) -> None:
+        if self._add_runner is not runner:
+            return
+        if self._editor_dialog is dialog:
+            dialog.initialization_failed()
+            dialog.reject()
+        self._task_failed(error)
+
+    def _add_finished(self, runner: TaskRunner) -> None:
+        if self._add_runner is runner:
+            self._add_runner = None
+            self._refresh_action_states()
+            self._resume_close_after_add()
+
+    def _resume_close_after_add(self) -> None:
+        if not self._reject_after_add:
+            return
+        QTimer.singleShot(0, self._continue_close_after_add)
+
+    def _continue_close_after_add(self) -> None:
+        self._reject_after_add = False
+        self.close()
+        if not self._closing:
+            self._refresh_action_states()
 
     def _update_card(self) -> None:
         if self._model_mutation_blocked():
@@ -235,12 +371,15 @@ class CardListView(QDialog):
             )
             self._open_card_detail(self._model.card_at(source_index.row()))
 
-    def _open_card_detail(self, draft: CardEditDraft) -> None:
+    def _open_card_detail(
+        self,
+        draft: CardEditDraft | None,
+    ) -> CardEditorDialog | None:
         if self._editor_dialog is not None:
             self._editor_dialog.show()
             self._editor_dialog.raise_()
             self._editor_dialog.activateWindow()
-            return
+            return None
         dialog = CardEditorDialog(
             self._manifest,
             self._service,
@@ -254,6 +393,7 @@ class CardListView(QDialog):
         dialog.finished.connect(self._editor_finished)
         self._editor_dialog = dialog
         dialog.open()
+        return dialog
 
     def _card_saved(self, card: CardEditDraft) -> None:
         if self._model.card_by_index(card.card_index) is None:
@@ -424,28 +564,63 @@ class CardListView(QDialog):
     def _save(self) -> None:
         if self._model_mutation_blocked():
             return
-        changes = list(self._model.dirty_cards())
-        if not changes:
-            if self._close_after_save:
-                self._close_after_save = False
-                self._closing = True
-                self.accept()
-            return
-        selected = self._selected_card_index()
-        runner = TaskRunner(
-            lambda: self._service.save_card_changes(self._manifest, changes)
-        )
-        self._save_runner = runner
-        self._active_runners.add(runner)
+        self._save_pending = True
+        self._notify_project_save_state()
         self._refresh_action_states()
         self._pgb_progress.setRange(0, 0)
+        self._pgb_progress.setValue(0)
         self._pgb_progress.show()
-        runner.signals.succeeded.connect(
-            lambda _result: self._save_succeeded(changes, selected)
-        )
-        runner.signals.failed.connect(self._save_failed)
-        runner.signals.finished.connect(lambda: self._save_finished(runner))
-        self._thread_pool.start(runner)
+        QTimer.singleShot(0, self._prepare_save)
+
+    def _prepare_save(self) -> None:
+        if not self._save_pending:
+            return
+        if self._closing:
+            self._save_pending = False
+            self._close_after_save = False
+            self._notify_project_save_state()
+            self._refresh_action_states()
+            self._pgb_progress.hide()
+            return
+        runner: TaskRunner | None = None
+        try:
+            changes = list(self._model.dirty_cards())
+            if not changes:
+                self._save_pending = False
+                self._notify_project_save_state()
+                self._refresh_action_states()
+                self._pgb_progress.hide()
+                if self._close_after_save:
+                    self._close_after_save = False
+                    self._closing = True
+                    self.accept()
+                return
+            selected = self._selected_card_index()
+            runner = TaskRunner(
+                lambda: self._service.save_card_changes(self._manifest, changes)
+            )
+            self._save_pending = False
+            self._save_runner = runner
+            self._notify_project_save_state()
+            self._active_runners.add(runner)
+            runner.signals.succeeded.connect(
+                lambda _result: self._save_succeeded(changes, selected)
+            )
+            runner.signals.failed.connect(self._save_failed)
+            runner.signals.finished.connect(lambda: self._save_finished(runner))
+            self._thread_pool.start(runner)
+        except Exception as error:
+            logging.exception("Preparing the Card List save failed.")
+            if runner is not None:
+                self._active_runners.discard(runner)
+                if self._save_runner is runner:
+                    self._save_runner = None
+            self._save_pending = False
+            self._close_after_save = False
+            self._notify_project_save_state()
+            self._refresh_action_states()
+            self._pgb_progress.hide()
+            QMessageBox.critical(self, "Card List Error", str(error))
 
     def _save_succeeded(
         self,
@@ -475,6 +650,7 @@ class CardListView(QDialog):
         self._active_runners.discard(runner)
         if self._save_runner is runner:
             self._save_runner = None
+        self._notify_project_save_state()
         self._refresh_action_states()
         if not self._closing:
             self._pgb_progress.hide()
@@ -527,7 +703,11 @@ class CardListView(QDialog):
     def _model_mutation_blocked(self) -> bool:
         return (
             self._loading
+            or self._external_project_mutation_blocked
             or self._suggest_runner is not None
+            or self._add_runner is not None
+            or self._reject_after_add
+            or self._save_pending
             or self._save_runner is not None
             or self._closing
         )
@@ -563,7 +743,12 @@ class CardListView(QDialog):
         self._thread_pool.start(runner)
 
     def _task_failed(self, error: TaskError) -> None:
-        if self._closing or self._close_after_save or self._reject_after_suggest:
+        if (
+            self._closing
+            or self._close_after_save
+            or self._reject_after_add
+            or self._reject_after_suggest
+        ):
             return
         self._set_loading(False)
         QMessageBox.critical(self, "Card List Error", str(error))

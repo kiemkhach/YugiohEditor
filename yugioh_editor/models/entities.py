@@ -87,9 +87,13 @@ class ProjectManifest:
     version: int = CURRENT_PROJECT_VERSION
     executable: ExecutableManifest | None = None
     game_files: dict[str, str] = field(default_factory=dict)
+    icon_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        if self.icon_path is None:
+            value.pop("icon_path")
+        return value
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> ProjectManifest:
@@ -121,6 +125,9 @@ class ProjectManifest:
             game_files={
                 str(key): str(item) for key, item in value.get("game_files", {}).items()
             },
+            icon_path=(
+                None if value.get("icon_path") is None else str(value["icon_path"])
+            ),
         )
         manifest.validate()
         return manifest
@@ -139,6 +146,8 @@ class ProjectManifest:
             )
         if not self.name.strip():
             raise ValueError("Project name must not be empty.")
+        if self.icon_path is not None:
+            self._validate_relative_path(self.icon_path, "project icon")
 
         normalized_logical_names: set[str] = set()
         normalized_game_files: set[str] = set()
@@ -281,7 +290,12 @@ class ProjectManifest:
         text = str(value).replace("\\", "/")
         if not text.strip():
             raise ValueError(f"{label.title()} path must not be empty.")
-        if PurePosixPath(text).is_absolute() or PureWindowsPath(text).is_absolute():
+        windows_path = PureWindowsPath(text)
+        if (
+            PurePosixPath(text).is_absolute()
+            or windows_path.is_absolute()
+            or bool(windows_path.drive)
+        ):
             raise ValueError(f"{label.title()} path must be relative: {value}")
         parts = [part for part in text.split("/") if part not in {"", "."}]
         if not parts or ".." in parts:

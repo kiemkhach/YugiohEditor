@@ -11,7 +11,10 @@ from tests.pipeline_support import (
     encode_dialog_resources,
     indexed_text_table,
 )
-from yugioh_editor.common.constants import validate_language_resource_path
+from yugioh_editor.common.constants import (
+    LANGUAGE_PREFIXES,
+    validate_language_resource_path,
+)
 from yugioh_editor.common.errors import PackResourceError, RulePipelineError
 from yugioh_editor.models.entities import (
     ContainerArchive,
@@ -137,6 +140,128 @@ class IndexedTextResourceTests(unittest.TestCase):
         self.assertEqual(rebuilt_blob, raw_blob)
         self.assertEqual(rebuilt_index[:8], raw_index)
         self.assertEqual(rebuilt_index[8:], b"\x00" * (2048 * 4 - 8))
+
+    def test_card_index_legacy_capacity_is_byte_exact_at_2048_rows(self):
+        row_count = 2048
+        texts = [""] * row_count
+        texts[-1] = "A"
+        table = indexed_text_table(texts, reserved=set(range(1, row_count - 1)))
+
+        _, index_bytes = encode_description_resources(table, "eng")
+
+        expected_offsets = [0] * row_count
+        expected_offsets[-1] = 2
+        self.assertEqual(index_bytes, uint32_table(*expected_offsets))
+        self.assertEqual(len(index_bytes), 8192)
+
+    def test_card_index_legacy_card_count_boundaries_remain_8192_bytes(self):
+        for row_count in (1115, 1116):
+            with self.subTest(row_count=row_count):
+                table = indexed_text_table(
+                    [""] * row_count,
+                    reserved=set(range(1, row_count)),
+                )
+                _, index_bytes = encode_description_resources(table, "eng")
+                self.assertEqual(index_bytes, b"\x00" * 8192)
+
+    def test_card_index_expands_at_2049_and_preserves_indexed_text_semantics(self):
+        row_count = 2049
+        texts = [""] * row_count
+        texts[-1] = "STEP8 SLOT2048"
+        reserved = set(range(1, row_count))
+        reserved.remove(2)
+        reserved.remove(row_count - 1)
+        table = indexed_text_table(texts, reserved=reserved)
+
+        blob, index_bytes = encode_description_resources(table, "eng")
+        offsets = [
+            int.from_bytes(index_bytes[start : start + 4], "little")
+            for start in range(0, len(index_bytes), 4)
+        ]
+
+        self.assertEqual(len(index_bytes), 16384)
+        self.assertEqual(offsets[:3], [0, 0, 2])
+        self.assertFalse(any(offsets[3 : row_count - 1]))
+        self.assertEqual(offsets[row_count - 1], 4)
+        self.assertFalse(any(offsets[row_count:]))
+        self.assertEqual(blob, b"\x00\x00\x00\x00STEP8 SLOT2048\x00\x00")
+
+        rebuilt = decode_description_resource(blob, index_bytes, "eng")
+        pd.testing.assert_frame_equal(
+            rebuilt.iloc[:row_count].reset_index(drop=True),
+            table,
+        )
+        self.assertTrue(rebuilt.iloc[row_count:]["is_reserved"].all())
+        self.assertEqual(set(rebuilt.iloc[row_count:]["text"]), {""})
+
+    def test_card_index_expansion_applies_to_all_six_languages(self):
+        localized_tail = {
+            "eng": "Tail",
+            "fra": "Fin é",
+            "jpn": "\u65e5\u672c",
+            "spa": "Fin ñ",
+            "ita": "Fine à",
+            "ger": "Ende Ö",
+        }
+        self.assertEqual(tuple(localized_tail), LANGUAGE_PREFIXES)
+        row_count = 2049
+        for language, tail in localized_tail.items():
+            with self.subTest(language=language):
+                texts = [""] * row_count
+                texts[-1] = tail
+                table = indexed_text_table(
+                    texts,
+                    reserved=set(range(1, row_count - 1)),
+                )
+                blob, index_bytes = encode_description_resources(table, language)
+                rebuilt = decode_description_resource(
+                    blob,
+                    index_bytes[: row_count * 4],
+                    language,
+                )
+
+                self.assertEqual(len(index_bytes), 16384)
+                self.assertEqual(rebuilt.iloc[-1]["text"], tail)
+                self.assertFalse(rebuilt.iloc[-1]["is_reserved"])
+
+    def test_card_index_expands_beyond_4096_and_round_trips_slot_4096(self):
+        accepted_count = 4096
+        accepted = indexed_text_table(
+            [""] * accepted_count,
+            reserved=set(range(1, accepted_count)),
+        )
+        _, accepted_index = encode_description_resources(accepted, "eng")
+        self.assertEqual(len(accepted_index), 16384)
+        self.assertFalse(any(accepted_index))
+
+        expanded_count = 4097
+        texts = [""] * expanded_count
+        texts[-1] = "SLOT 4096"
+        expanded = indexed_text_table(
+            texts,
+            reserved=set(range(1, expanded_count - 1)),
+        )
+        blob, expanded_index = encode_description_resources(expanded, "eng")
+        offsets = [
+            int.from_bytes(expanded_index[start : start + 4], "little")
+            for start in range(0, len(expanded_index), 4)
+        ]
+
+        self.assertEqual(len(expanded_index), 32768)
+        self.assertEqual(len(offsets), 8192)
+        self.assertEqual(offsets[0], 0)
+        self.assertFalse(any(offsets[1 : expanded_count - 1]))
+        self.assertEqual(offsets[expanded_count - 1], 2)
+        self.assertFalse(any(offsets[expanded_count:]))
+
+        rebuilt = decode_description_resource(
+            blob,
+            expanded_index[: expanded_count * 4],
+            "eng",
+        )
+        pd.testing.assert_frame_equal(rebuilt.reset_index(drop=True), expanded)
+        self.assertEqual(rebuilt.iloc[4096]["text"], "SLOT 4096")
+        self.assertFalse(rebuilt.iloc[4096]["is_reserved"])
 
     def test_dialog_raw_vectors_use_the_same_padding_and_offsets(self):
         raw_blob = bytes.fromhex("00 00 41 42 43 00")

@@ -33,6 +33,7 @@ ALLOWED_RULE_METHODS = frozenset(
         "generate_sort_indices",
         "generate_string_offsets",
         "pad_integer_sequence",
+        "pad_integer_sequence_to_power_of_two",
         "pad_integer_sequence_to_dependency_length",
         "records_to_dataframe",
         "sequence_to_dataframe",

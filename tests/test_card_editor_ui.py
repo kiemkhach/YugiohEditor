@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -639,6 +640,126 @@ class CardEditorUiTests(unittest.TestCase):
         root = dialog.findChild(QWidget, "CardEditorDialog")
         self.assertIn('QLineEdit[readOnly="true"]', root.styleSheet())
         dialog.deleteLater()
+
+    def test_add_card_initializes_in_retained_worker_after_dialog_is_visible(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        initialized = self.detail(2).to_draft(is_new=True)
+        initialized.card_id = 42
+        worker_threads = []
+
+        def create_draft(_manifest):
+            worker_threads.append(QThread.currentThread())
+            return initialized
+
+        self.service.create_card_draft.side_effect = create_draft
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        view.show()
+
+        view._add_button.click()
+
+        dialog = view._editor_dialog
+        self.assertIsNotNone(dialog)
+        self.assertTrue(dialog.isVisible())
+        self.assertTrue(dialog.is_initializing)
+        self.assertFalse(dialog._initialization_progress.isHidden())
+        self.assertFalse(dialog._name.isEnabled())
+        self.assertFalse(dialog._save_button.isEnabled())
+        self.assertTrue(dialog._close_button.isEnabled())
+        self.service.create_card_draft.assert_not_called()
+        self.assertIsNotNone(view._add_runner)
+
+        self.assertTrue(self.wait_until(lambda: view._add_runner is None))
+
+        self.service.create_card_draft.assert_called_once_with(self.manifest)
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], self.application.thread())
+        self.assertFalse(dialog.is_initializing)
+        self.assertTrue(dialog._initialization_progress.isHidden())
+        self.assertTrue(dialog._name.isEnabled())
+        self.assertTrue(dialog._save_button.isEnabled())
+        self.assertEqual(dialog.draft.card_index, 2)
+        self.assertEqual(dialog.draft.card_id, 42)
+        self.assertEqual(view._model.rowCount(), 1)
+        self.assertFalse(view.is_dirty)
+        dialog._discarding = True
+        dialog.close()
+        view.close()
+        view.deleteLater()
+
+    def test_add_card_initialization_failure_closes_dialog_and_restores_list(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        self.service.create_card_draft.side_effect = OSError("controlled add failure")
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        view.show()
+
+        with patch.object(QMessageBox, "critical") as critical:
+            view._add_button.click()
+            dialog = view._editor_dialog
+            self.assertIsNotNone(dialog)
+            self.assertTrue(dialog.is_initializing)
+            with patch.object(dialog, "deleteLater"):
+                self.assertTrue(
+                    self.wait_until(
+                        lambda: view._add_runner is None and view._editor_dialog is None
+                    )
+                )
+                self.assertTrue(dialog._initialization_progress.isHidden())
+                self.assertFalse(dialog.isVisible())
+
+        self.assertEqual(critical.call_count, 1)
+        self.assertEqual(critical.call_args.args[1], "Card List Error")
+        self.assertIn("controlled add failure", critical.call_args.args[2])
+        self.assertTrue(view._add_button.isEnabled())
+        self.assertTrue(view._import_button.isEnabled())
+        self.assertEqual(view._model.rowCount(), 1)
+        self.assertFalse(view.is_dirty)
+        dialog.deleteLater()
+        view.close()
+        view.deleteLater()
+
+    def test_closing_card_list_waits_for_running_add_initialization(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        initialized = self.detail(2).to_draft(is_new=True)
+        started = threading.Event()
+        release = threading.Event()
+
+        def create_draft(_manifest):
+            started.set()
+            self.assertTrue(release.wait(5))
+            return initialized
+
+        self.service.create_card_draft.side_effect = create_draft
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        view.show()
+        view._add_button.click()
+        self.assertTrue(self.wait_until(started.is_set))
+        dialog = view._editor_dialog
+        self.assertIsNotNone(dialog)
+
+        with (
+            patch.object(view, "reject") as reject,
+            patch.object(QMessageBox, "critical") as critical,
+        ):
+            event = Mock()
+            view.closeEvent(event)
+            event.ignore.assert_called_once_with()
+            reject.assert_not_called()
+            self.assertTrue(view._reject_after_add)
+            self.assertIsNone(view._editor_dialog)
+
+            release.set()
+            self.assertTrue(
+                self.wait_until(
+                    lambda: view._add_runner is None and reject.call_count == 1
+                )
+            )
+
+        self.assertFalse(view._reject_after_add)
+        critical.assert_not_called()
+        view.deleteLater()
 
     def test_unused_filter_maps_rows_and_export_uses_visible_order(self):
         used = replace(self.detail(2), pack="yugi")
@@ -1284,16 +1405,30 @@ class CardEditorUiTests(unittest.TestCase):
         view._model.update_card(draft)
         view._table.selectRow(0)
         view._set_dirty(True)
+        save_states = []
+        view.project_save_state_changed.connect(save_states.append)
 
         with (
+            patch(
+                "yugioh_editor.views.card_list_view.QTimer.singleShot"
+            ) as single_shot,
             patch.object(view._thread_pool, "start") as start,
             patch.object(QMessageBox, "information"),
+            patch.object(
+                view._model,
+                "dirty_cards",
+                wraps=view._model.dirty_cards,
+            ) as dirty_cards,
         ):
             view._save_button.click()
             view._save_button.click()
-            start.assert_called_once()
+            single_shot.assert_called_once()
+            start.assert_not_called()
+            dirty_cards.assert_not_called()
             self.service.save_card_changes.assert_not_called()
-            self.assertIsNotNone(view._save_runner)
+            self.assertTrue(view._save_pending)
+            self.assertIsNone(view._save_runner)
+            self.assertFalse(view._pgb_progress.isHidden())
             self.assertFalse(view._save_button.isEnabled())
             self.assertFalse(view._add_button.isEnabled())
             self.assertFalse(view._update_button.isEnabled())
@@ -1301,6 +1436,11 @@ class CardEditorUiTests(unittest.TestCase):
             self.assertFalse(view._enable_all_button.isEnabled())
             self.assertFalse(view._suggest_button.isEnabled())
 
+            single_shot.call_args.args[1]()
+            dirty_cards.assert_called_once_with()
+            start.assert_called_once()
+            self.assertFalse(view._save_pending)
+            self.assertIsNotNone(view._save_runner)
             start.call_args.args[0].run()
             self.application.processEvents()
 
@@ -1313,6 +1453,114 @@ class CardEditorUiTests(unittest.TestCase):
         self.assertTrue(view._import_button.isEnabled())
         self.assertTrue(view._enable_all_button.isEnabled())
         self.assertTrue(view._suggest_button.isEnabled())
+        self.assertEqual(save_states, [True, False])
+        view.deleteLater()
+
+    def test_close_during_pending_and_running_save_reuses_one_transaction(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        draft = view._model.card_at(0)
+        draft.pack = "joey"
+        draft.dirty = True
+        draft.touched_fields.add("pack")
+        view._model.update_card(draft)
+        view._set_dirty(True)
+
+        with (
+            patch(
+                "yugioh_editor.views.card_list_view.QTimer.singleShot"
+            ) as single_shot,
+            patch.object(view._thread_pool, "start") as start,
+            patch.object(QMessageBox, "information"),
+            patch.object(view, "accept") as accept,
+        ):
+            view._save_button.click()
+            pending_close = Mock()
+            view.closeEvent(pending_close)
+            pending_close.ignore.assert_called_once_with()
+            self.assertTrue(view._close_after_save)
+
+            single_shot.call_args.args[1]()
+            start.assert_called_once()
+            running_close = Mock()
+            view.closeEvent(running_close)
+            running_close.ignore.assert_called_once_with()
+
+            start.call_args.args[0].run()
+            self.application.processEvents()
+
+        self.service.save_card_changes.assert_called_once()
+        accept.assert_called_once_with()
+        self.assertFalse(view._save_pending)
+        self.assertIsNone(view._save_runner)
+        view.deleteLater()
+
+    def test_save_preparation_failure_restores_controls_and_reports_error(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        draft = view._model.card_at(0)
+        draft.pack = "joey"
+        draft.dirty = True
+        draft.touched_fields.add("pack")
+        view._model.update_card(draft)
+        view._set_dirty(True)
+
+        with (
+            patch(
+                "yugioh_editor.views.card_list_view.QTimer.singleShot"
+            ) as single_shot,
+            patch.object(
+                view._model,
+                "dirty_cards",
+                side_effect=RuntimeError("controlled snapshot failure"),
+            ),
+            patch.object(QMessageBox, "critical") as critical,
+            self.assertLogs(level="ERROR"),
+        ):
+            view._save_button.click()
+            self.assertTrue(view._save_pending)
+            single_shot.call_args.args[1]()
+
+        critical.assert_called_once_with(
+            view,
+            "Card List Error",
+            "controlled snapshot failure",
+        )
+        self.assertFalse(view._save_pending)
+        self.assertIsNone(view._save_runner)
+        self.assertTrue(view.is_dirty)
+        self.assertTrue(view._save_button.isEnabled())
+        self.assertTrue(view._add_button.isEnabled())
+        self.assertTrue(view._import_button.isEnabled())
+        self.assertTrue(view._pgb_progress.isHidden())
+        self.service.save_card_changes.assert_not_called()
+        view.deleteLater()
+
+    def test_card_list_restores_maximized_state_but_permits_minimize(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        view.showMaximized()
+        self.assertTrue(self.wait_until(view.isMaximized))
+
+        view.showMinimized()
+        self.application.processEvents()
+        self.assertTrue(view.isMinimized())
+
+        view.showNormal()
+        self.assertTrue(self.wait_until(view.isMaximized))
+
+        view._open_card_detail(view._model.card_at(0))
+        self.application.processEvents()
+        dialog = view._editor_dialog
+        self.assertIsNotNone(dialog)
+        self.assertFalse(dialog.isMaximized())
+        dialog.close()
+        self.application.processEvents()
+        self.assertTrue(view.isMaximized())
+        view.close()
         view.deleteLater()
 
     def test_closing_card_list_requests_active_bulk_suggest_cancellation(self):

@@ -30,6 +30,7 @@ from yugioh_editor.common.constants import (
     DEFAULT_LANGUAGE,
     LANGUAGE_PREFIXES,
     PROJECT_BIN_DIRECTORY,
+    PROJECT_ICON_FILE_NAME,
     normalize_language_code,
 )
 from yugioh_editor.common.subfile_rules_config import SUBFILE_RULE_CONFIGS
@@ -61,6 +62,12 @@ def normalize_project_path(value: str | Path) -> PurePosixPath:
     if not parts:
         raise ValueError("Project resource paths must not be empty.")
     return PurePosixPath(*parts)
+
+
+def container_entry_order_key(value: str | Path) -> str:
+    """Return the original container's full-path lexical comparison key."""
+
+    return "\\".join(normalize_project_path(value).parts).casefold()
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +187,7 @@ class ProjectRepository:
         self._manifest.executable = updated_manifest.executable
         self._manifest.game_files.clear()
         self._manifest.game_files.update(updated_manifest.game_files)
+        self._manifest.icon_path = updated_manifest.icon_path
 
     def commit_pack(self, staging: ProjectRepository) -> Path:
         return self._connection.replace_directory(
@@ -274,6 +282,21 @@ class ProjectRepository:
         self._validate_physical_workspace_files(manifest)
         self._manifest = manifest
         return self._connection.write_manifest(manifest)
+
+    def import_project_icon(self, source: str | Path) -> str:
+        self._connection.copy_file(source, PROJECT_ICON_FILE_NAME)
+        return PROJECT_ICON_FILE_NAME
+
+    def read_project_icon(self) -> bytes | None:
+        manifest = self._require_manifest()
+        if manifest.icon_path is None:
+            return None
+        if not self._connection.exists(manifest.icon_path):
+            raise FileNotFoundError(
+                "Configured project icon is missing from the project: "
+                f"{manifest.icon_path}"
+            )
+        return self._connection.read_bytes(manifest.icon_path)
 
     def import_resources(
         self,
@@ -1774,10 +1797,19 @@ class ProjectRepository:
                 existing_catalog = self._get_card_catalog(
                     image_variant=image_variant,
                 )
+            catalog_names = english_names.fillna("").reset_index(drop=True)
+            existing_names = pd.Series(
+                self._fit_column(existing_catalog, "name", len(frame)),
+                dtype=object,
+            )
+            catalog_names = catalog_names.where(
+                frame["card_id"].astype(int).ge(0),
+                existing_names,
+            )
             self._save_card_catalog(
                 pd.DataFrame(
                     {
-                        "name": english_names.fillna(""),
+                        "name": catalog_names,
                         "index": frame["card_index"].astype(int),
                         "card_id": frame["card_id"]
                         .astype(int)
@@ -1949,9 +1981,7 @@ class ProjectRepository:
     ) -> list[ProjectFileRecord]:
         return sorted(
             (*source_records, *large_records, *mini_records),
-            key=lambda record: (
-                normalize_project_path(record.relative_path).as_posix().casefold()
-            ),
+            key=lambda record: container_entry_order_key(record.relative_path),
         )
 
     @staticmethod

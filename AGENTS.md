@@ -3,6 +3,39 @@
 This is a Python 3 and PySide6 desktop application for analyzing and editing
 Yu-Gi-Oh! Power of Chaos: Joey the Passion game files.
 
+# Codex task orchestration
+
+- For every non-trivial new user task, use
+  `.codex/skills/ygo-task-orchestrator/SKILL.md` as the mandatory first planning
+  step before production edits. The user should normally only need to describe
+  the task; do not require them to choose skills manually.
+- The orchestrator must classify complexity and affected domains, select the
+  relevant YugiohEditor skills, decide whether investigation is required,
+  choose single-agent versus multi-agent execution, order dependencies, and
+  define verification/review before implementation begins.
+- Use `ygo-investigate-change` before implementation whenever root cause,
+  binary semantics, executable behavior, ordering, performance bottlenecks,
+  concurrency/rollback behavior, or cross-layer contracts are not already
+  established by current code and verified project knowledge.
+- Every production implementation uses `ygo-implement-change` plus the relevant
+  domain skills. Medium/high-risk changes and all binary, executable, container,
+  transaction, concurrency, or card-capacity changes must end with an
+  independent `ygo-review-change` pass.
+- Split agents by responsibility/ownership, not arbitrary file count. Parallel
+  agents are allowed only after their contracts and dependencies are explicit
+  and their edit ownership is sufficiently independent. Prefer one coherent
+  implementation agent when parallelism would create overlapping changes.
+- If investigation or tests disprove an initial assumption, stop and re-plan:
+  revise the selected skills, agent split, execution order, and acceptance tests
+  instead of forcing the original plan. Mark rejected hypotheses as rejected.
+- For Medium/High tasks, surface a concise plan before editing that includes
+  complexity, selected skills in order, agent roles/dependencies, phases,
+  verification, and unresolved assumptions. Trivial/Small tasks may use a
+  compact plan and should not be over-orchestrated.
+- See `.codex/ORCHESTRATION.md` for the repository workflow and
+  `.codex/skills/ygo-task-orchestrator/SKILL.md` for the complete routing and
+  handoff rules.
+
 # Architecture
 
 - Use a simple Python-style architecture.

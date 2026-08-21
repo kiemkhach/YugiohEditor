@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QVBoxLayout,
 )
@@ -82,7 +83,7 @@ class CardEditorDialog(QDialog):
         self,
         manifest: ProjectManifest,
         card_service: CardService,
-        draft: CardEditDraft,
+        draft: CardEditDraft | None,
         parent=None,
         *,
         card_lookup: Callable[[int], CardEditDraft | None] | None = None,
@@ -91,11 +92,12 @@ class CardEditorDialog(QDialog):
         super().__init__(parent)
         self._manifest = manifest
         self._service = card_service
-        self._draft = draft.clone()
+        self._draft: CardEditDraft | None = None
         self._card_lookup = card_lookup
         self._card_bounds = card_bounds
         self._current_language = DEFAULT_LANGUAGE
         self._loading = True
+        self._initializing = draft is None
         self._discarding = False
         self._thread_pool = QThreadPool.globalInstance()
         self._suggest_runner: TaskRunner | None = None
@@ -106,7 +108,9 @@ class CardEditorDialog(QDialog):
         self._image_cache: dict[str, tuple[bytes, bytes]] = {}
         self._original_image_pixmaps: dict[bool, QPixmap] = {}
 
-        self.setWindowTitle("Add Card" if draft.is_new else "Card Detail")
+        self.setWindowTitle(
+            "Add Card" if draft is None or draft.is_new else "Card Detail"
+        )
         root = load_ui(ui_path("card_editor_dialog.ui"), self)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -137,10 +141,16 @@ class CardEditorDialog(QDialog):
             self._small_image,
             Qt.AlignCenter,
         )
+        self._initialization_progress = self.findChild(
+            QProgressBar,
+            "pgbInitialization",
+        )
         self._status = self.findChild(QLabel, "lblStatus")
         self._suggest_button = self.findChild(QPushButton, "btnSuggest")
         self._previous_button = self.findChild(QPushButton, "btnPrevious")
         self._next_button = self.findChild(QPushButton, "btnNext")
+        self._save_button = self.findChild(QPushButton, "btnSave")
+        self._close_button = self.findChild(QPushButton, "btnClose")
         self._numeric_fields = {
             "level": self._level,
             "attack": self._attack,
@@ -153,17 +163,10 @@ class CardEditorDialog(QDialog):
             "pack": self._pack,
         }
 
-        self._card_index.setText(str(self._draft.card_index))
-        self._card_id.setText(str(self._draft.card_id))
         self._language.addItems(LANGUAGE_PREFIXES)
         self._populate_combo(self._attribute, ATTRIBUTE_LABELS.values())
         self._populate_combo(self._card_type, MONSTER_TYPE_LABELS.values())
         self._populate_combo(self._pack, PACK_NAMES.values())
-        self._set_combo_value(self._attribute, self._draft.attribute)
-        self._set_combo_value(self._card_type, self._draft.card_type)
-        self._populate_card_categories(self._draft.card_category)
-        self._set_combo_value(self._card_category, self._draft.card_category)
-        self._set_combo_value(self._pack, self._draft.pack)
         self._password.setMaxLength(CARD_PASSWORD_HEX_WIDTH)
         self._password.setValidator(
             QRegularExpressionValidator(
@@ -171,16 +174,9 @@ class CardEditorDialog(QDialog):
                 self,
             )
         )
-        self._password.setText(self._display_password(self._draft.password))
-        self._level.setText(self._display_optional(self._draft.level))
-        self._attack.setText(self._display_optional(self._draft.attack))
-        self._defense.setText(self._display_optional(self._draft.defense))
         self._level.setValidator(QIntValidator(CARD_LEVEL_MIN, CARD_LEVEL_MAX, self))
         self._attack.setValidator(QIntValidator(CARD_STAT_MIN, CARD_STAT_MAX, self))
         self._defense.setValidator(QIntValidator(CARD_STAT_MIN, CARD_STAT_MAX, self))
-        self._image_name.setText(self._draft.image_name)
-        self._load_localized_text(DEFAULT_LANGUAGE)
-        self._refresh_image_previews()
 
         self._language.currentTextChanged.connect(self._change_language)
         self._card_type.currentIndexChanged.connect(self._card_type_changed)
@@ -209,16 +205,74 @@ class CardEditorDialog(QDialog):
         self._suggest_button.clicked.connect(self._suggest)
         self._previous_button.clicked.connect(lambda: self._navigate(-1))
         self._next_button.clicked.connect(lambda: self._navigate(1))
-        self._save_button = self.findChild(QPushButton, "btnSave")
         self._save_button.clicked.connect(self._save_and_close)
-        self.findChild(QPushButton, "btnClose").clicked.connect(self.close)
-        self._loading = False
-        self._update_navigation_buttons()
+        self._close_button.clicked.connect(self.close)
+        if draft is None:
+            self._populate_combo(self._card_category, ("",))
+            self._set_initializing(True)
+        else:
+            self.initialize_draft(draft)
 
     @property
     def draft(self) -> CardEditDraft:
+        if self._draft is None:
+            raise RuntimeError("Card initialization has not completed.")
         self._flush_controls()
         return self._draft.clone()
+
+    @property
+    def is_initializing(self) -> bool:
+        return self._initializing
+
+    def initialize_draft(self, draft: CardEditDraft) -> None:
+        self._draft = draft.clone()
+        self._current_language = DEFAULT_LANGUAGE
+        self._card_index.setText(str(self._draft.card_index))
+        self._card_id.setText(str(self._draft.card_id))
+        self._language.setCurrentText(DEFAULT_LANGUAGE)
+        self.setWindowTitle("Add Card" if self._draft.is_new else "Card Detail")
+        self._original_image_pixmaps.clear()
+        self._set_initializing(False)
+        self._reload_from_draft()
+
+    def initialization_failed(self) -> None:
+        if not self._initializing:
+            return
+        self._initialization_progress.hide()
+        self._status.setText("Card initialization failed.")
+
+    def _set_initializing(self, initializing: bool) -> None:
+        self._initializing = initializing
+        controls = (
+            self._card_index,
+            self._card_id,
+            self._language,
+            self._name,
+            self._description,
+            self._password,
+            self._level,
+            self._attack,
+            self._defense,
+            self._attribute,
+            self._card_type,
+            self._card_category,
+            self._pack,
+            self._image_name,
+            self._large_image_frame,
+            self._small_image_frame,
+            self._suggest_button,
+            self._previous_button,
+            self._next_button,
+            self._save_button,
+        )
+        for control in controls:
+            control.setEnabled(not initializing)
+        self._initialization_progress.setVisible(initializing)
+        self._status.setText("Initializing card..." if initializing else "")
+        if initializing:
+            self._previous_button.hide()
+            self._next_button.hide()
+        self._loading = initializing
 
     def eventFilter(self, watched, event) -> bool:
         if event.type() == QEvent.Resize and watched in {
@@ -226,7 +280,7 @@ class CardEditorDialog(QDialog):
             self._small_image_frame,
         }:
             self._scale_image_previews()
-        if event.type() == QEvent.MouseButtonDblClick:
+        if not self._initializing and event.type() == QEvent.MouseButtonDblClick:
             if watched in {self._large_image_frame, self._large_image}:
                 self._choose_image(mini=False)
                 return True
@@ -240,6 +294,10 @@ class CardEditorDialog(QDialog):
         self._scale_image_previews()
 
     def closeEvent(self, event) -> None:
+        if self._initializing or self._draft is None:
+            event.ignore()
+            self.reject()
+            return
         if self._discarding or not self._draft.dirty:
             event.ignore()
             self.reject()
@@ -262,19 +320,23 @@ class CardEditorDialog(QDialog):
             event.ignore()
 
     def _change_language(self, language: str) -> None:
-        if self._loading or language == self._current_language:
+        if self._loading or self._draft is None or language == self._current_language:
             return
         self._flush_localized_text()
         self._current_language = language
         self._load_localized_text(language)
 
     def _flush_localized_text(self) -> None:
+        if self._draft is None:
+            return
         self._draft.localized_text.names[self._current_language] = self._name.text()
         self._draft.localized_text.descriptions[self._current_language] = (
             self._description.toPlainText()
         )
 
     def _load_localized_text(self, language: str) -> None:
+        if self._draft is None:
+            return
         previous = self._loading
         self._loading = True
         self._name.setText(self._draft.localized_text.names[language])
@@ -284,6 +346,8 @@ class CardEditorDialog(QDialog):
         self._loading = previous
 
     def _flush_controls(self) -> None:
+        if self._draft is None:
+            return
         self._flush_localized_text()
         password = self._password.text().strip().upper()
         self._draft.password = password
@@ -295,14 +359,14 @@ class CardEditorDialog(QDialog):
             setattr(self._draft, field_name, str(widget.currentData()))
 
     def _mark_touched(self, field_name: str) -> None:
-        if not self._loading:
+        if not self._loading and self._draft is not None:
             self._draft.mark_touched(field_name)
 
     def _save_and_close(self) -> None:
         self._start_commit(self.accept)
 
     def _start_commit(self, after_success: Callable[[], None]) -> bool:
-        if self._save_runner is not None:
+        if self._initializing or self._draft is None or self._save_runner is not None:
             return False
         self._flush_controls()
         errors = self._service.validate_card_draft(self._draft)
@@ -350,6 +414,8 @@ class CardEditorDialog(QDialog):
             self._save_button.setEnabled(True)
 
     def _commit(self) -> bool:
+        if self._initializing or self._draft is None:
+            return False
         self._flush_controls()
         errors = self._service.validate_card_draft(self._draft)
         if errors:
@@ -380,6 +446,8 @@ class CardEditorDialog(QDialog):
         return True
 
     def _suggest(self) -> None:
+        if self._initializing or self._draft is None:
+            return
         self._flush_controls()
         query = CardService.select_suggestion_query(
             self._draft,
@@ -452,6 +520,8 @@ class CardEditorDialog(QDialog):
         self._suggest_runner = None
 
     def _reload_from_draft(self) -> None:
+        if self._draft is None:
+            return
         self._loading = True
         self._password.setText(self._display_password(self._draft.password))
         self._level.setText(self._display_optional(self._draft.level))
@@ -469,6 +539,10 @@ class CardEditorDialog(QDialog):
         self._update_navigation_buttons()
 
     def _update_navigation_buttons(self) -> None:
+        if self._draft is None:
+            self._previous_button.hide()
+            self._next_button.hide()
+            return
         if self._draft.is_new:
             self._previous_button.hide()
             self._next_button.hide()
@@ -487,6 +561,8 @@ class CardEditorDialog(QDialog):
         self._next_button.setEnabled(self._draft.card_index < maximum)
 
     def _navigate(self, offset: int) -> None:
+        if self._initializing or self._draft is None:
+            return
         if self._draft.is_new or offset not in {-1, 1}:
             return
         target_index = self._draft.card_index + offset
@@ -532,6 +608,8 @@ class CardEditorDialog(QDialog):
         self._reload_from_draft()
 
     def _choose_image(self, *, mini: bool) -> None:
+        if self._initializing or self._draft is None:
+            return
         first = self._pick_image("small" if mini else "large")
         if first is None:
             return
@@ -591,6 +669,8 @@ class CardEditorDialog(QDialog):
         return Path(path) if path else None
 
     def _refresh_image_previews(self) -> None:
+        if self._draft is None:
+            return
         self._original_image_pixmaps.clear()
         self._set_preview_message(self._large_image, "Loading large image...")
         self._set_preview_message(self._small_image, "Loading mini image...")
@@ -754,7 +834,7 @@ class CardEditorDialog(QDialog):
         try:
             class_code = (
                 int(self._draft.monster_type_code)
-                if self._draft.monster_type_code is not None
+                if self._draft is not None and self._draft.monster_type_code is not None
                 else code_for_property_label(
                     self._card_type.currentData(),
                     MONSTER_TYPE_LABELS,
@@ -777,7 +857,7 @@ class CardEditorDialog(QDialog):
         self._loading = previous
 
     def _card_type_changed(self, _index: int) -> None:
-        if self._loading:
+        if self._loading or self._draft is None:
             return
         self._draft.card_type = str(self._card_type.currentData())
         self._draft.monster_type_code = None

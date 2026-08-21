@@ -148,6 +148,10 @@ Yu-Gi-Oh! Power of Chaos: Joey the Passion game files.
   splitter widths and horizontal margins.
 - Resolve card image catalogs by semantic variant and complete path:
   `large` is `card/list_card.txt`; `mini` is `mini/list_card.txt`.
+- When the logical `cards` table is saved, normal catalog rows take the editable
+  English card name, while rows with a negative Card ID retain the existing
+  per-variant `list_card.txt` name. This preserves source sentinel/card-back
+  labels without freezing normal card names.
 - Treat indexed-text behavior as Confirmed, current `card_sort` mechanics as
   Audited, NFKD/case-fold intent as Inferred, and exact Japanese, punctuation,
   and accent collation as Unresolved.
@@ -173,6 +177,11 @@ Yu-Gi-Oh! Power of Chaos: Joey the Passion game files.
   worker. Navigation and selection use its in-memory index map, image pairs use
   stale-result tokens plus a bounded cache, and a bound `CardService` reuses the
   same project repository instance.
+- Card List Save enters its busy state and yields to the Qt event loop before
+  creating the dirty-card snapshot. Add Card opens a disabled, indeterminate
+  Card Detail first and initializes its draft in a retained worker. Card List's
+  normal visible state is maximized; minimizing is allowed, but restore returns
+  to maximized without maximizing child dialogs.
 - Card List uses the exact toggle labels `filter empty` and `un-filter empty`,
   plus `enable all`. Enable All changes only `disabled` eligible rows to
   `joey`; it protects non-game cards, the three canonical English Egyptian God
@@ -231,9 +240,10 @@ Yu-Gi-Oh! Power of Chaos: Joey the Passion game files.
   compression state; replacement alone does not replan container order. After
   adding one or more new physical files, sort every record belonging to the
   actual `Data.dat` source lexicographically by
-  `normalize_project_path(record.relative_path).as_posix().casefold()`. This is
-  a case-insensitive comparison of the complete normalized relative path;
-  preserve the stored path spelling and casing. Renumber only that source
+  `"\\".join(normalize_project_path(record.relative_path).parts).casefold()`.
+  This is a global comparison of the complete normalized relative path using a
+  Windows backslash key, not recursive file-first traversal. Preserve the
+  stored path spelling and casing. Renumber only that source
   contiguously from zero and leave every other source unchanged. Catalog order
   is independent and is not alphabetized by this rule. The manifest order is
   the packed-container entry order, and rollback restores the prior orders.
@@ -259,6 +269,12 @@ Yu-Gi-Oh! Power of Chaos: Joey the Passion game files.
   metadata, and writes transformed bytes only beneath Pack staging. Do not
   persist the derived count in the manifest or derive it from external Card
   IDs, `cards`, `card_intid.bin`, or `card_sort`.
+- An optional Create Project icon is copied to `project.ico` and recorded as a
+  project-relative `icon_path`; an absent property remains backward compatible,
+  and existing manifests may retain an authoritative `project.icon` path. Pack
+  validates the configured file and updates icon groups only on the staged
+  executable after its binary pre-encode pipeline, preserving unrelated PE
+  resources and the source/workspace executable bytes.
 - The Joey executable profile identifies its supported source with the whole-
   file SHA-256, validates every complete original instruction before mutation,
   and declares all integer immediates plus the conditional trailing `MOVSW`.
@@ -279,13 +295,28 @@ Yu-Gi-Oh! Power of Chaos: Joey the Passion game files.
 - The application title-bar icon is `yugioh_editor/resources/app.icon`.
 - Project creation and project packing must use staging directories and atomic
   directory replacement.
+- Export Files reconstructs physical and virtual project resources with the
+  same encode stage as Pack, but writes each container entry's final
+  decompressed bytes beneath `data/` and `voice/`, plus encoded files beneath
+  `deck/` and `region/`. It must not extract the original containers or delete
+  the selected destination tree. While Pack or Export is reading the project,
+  disable project mutations, Card List access, and Run; do not begin either
+  artifact operation while a retained project mutation is still running.
+  Card List Save and Project editor replacements are mutually exclusive across
+  their modeless windows; their retained busy signals disable the other
+  surface's mutation controls until completion.
 - Pack must run through a retained background task; disable duplicate Pack
   requests and restore UI state after both success and failure.
 - The Project window's `Run` button only launches the executable already packed
-  under `bin`; it never invokes Build or Pack. Launch remains a retained
+  under `bin` with exact arguments `-full -speedy`; it never invokes Build or
+  Pack. Launch remains a retained
   background task. Successful launch shows no modal dialog, while launch
   failure still uses the existing error reporting and always cleans up the busy
   state and retained runner.
+- Start restores only the last valid Workspace through user-scope application
+  settings. Load Project uses that existing directory as its chooser start.
+  Game-folder discovery reads `InstallDirJ` from the logical Konami registry key
+  with the 32-bit HKLM view and never overwrites a nonempty UI value.
 - Do not create a new architecture layer unless it has a clear responsibility.
 
 # Generated files

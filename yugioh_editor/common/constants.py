@@ -63,6 +63,7 @@ PACK_NAMES = {
 }
 PROJECT_FILE_NAME = "project.json"
 PROJECT_BIN_DIRECTORY = "bin"
+PROJECT_ICON_FILE_NAME = "project.ico"
 
 IMAGE_EXTENSIONS = {".bmp", ".png", ".jpg", ".jpeg", ".gif"}
 AUDIO_EXTENSIONS = {".wav"}

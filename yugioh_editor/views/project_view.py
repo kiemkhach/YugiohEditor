@@ -4,6 +4,7 @@ import logging
 
 from PySide6.QtCore import Qt, QThreadPool, Signal
 from PySide6.QtWidgets import (
+    QFileDialog,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -43,6 +44,8 @@ class ProjectView(QMainWindow):
         self._card_list_view: CardListView | None = None
         self._active_runners: dict[TaskSignals, TaskRunner] = {}
         self._pack_in_progress = False
+        self._export_in_progress = False
+        self._run_in_progress = False
 
         self.setWindowTitle(f"{APPLICATION_NAME} - {manifest.name}")
         self.setCentralWidget(load_ui(ui_path("project_window.ui"), self))
@@ -53,17 +56,19 @@ class ProjectView(QMainWindow):
         self._editor_host = self.findChild(QWidget, "editorHost")
         self._editor_layout = self._editor_host.layout()
         self._pgb_progress = self.findChild(QProgressBar, "pgbProgress")
+        self._export_button = self.findChild(QPushButton, "btnExportFiles")
         self._build_button = self.findChild(QPushButton, "btnBuild")
         self._build_and_run_button = self.findChild(QPushButton, "btnBuildAndRun")
+        self._save_file_button = self.findChild(QPushButton, "btnSaveFile")
+        self._card_list_button = self.findChild(QPushButton, "btnCardList")
         self._splitter.setSizes([280, 1000])
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
 
         self._tree.itemClicked.connect(self._open_tree_item)
-        self.findChild(QPushButton, "btnSaveFile").clicked.connect(
-            self._save_current_file
-        )
-        self.findChild(QPushButton, "btnCardList").clicked.connect(self._open_card_list)
+        self._save_file_button.clicked.connect(self._save_current_file)
+        self._card_list_button.clicked.connect(self._open_card_list)
+        self._export_button.clicked.connect(self._export_files)
         self._build_button.clicked.connect(self._pack_project)
         self._build_and_run_button.clicked.connect(self._run_game)
         self.findChild(QPushButton, "btnCloseProject").clicked.connect(self.close)
@@ -71,15 +76,28 @@ class ProjectView(QMainWindow):
         self._populate_tree()
 
     def closeEvent(self, event) -> None:
-        if self._pack_in_progress:
+        if self._pack_in_progress or self._export_in_progress:
+            if self._pack_in_progress:
+                status = "Packing is still in progress. Wait for it to finish."
+                title = "Packing in Progress"
+                message = "Wait for packing to finish before closing the project."
+            else:
+                status = "File export is still in progress. Wait for it to finish."
+                title = "Export in Progress"
+                message = "Wait for file export to finish before closing the project."
+            event.ignore()
+            self.statusBar().showMessage(status)
+            QMessageBox.information(self, title, message)
+            return
+        if self._project_mutation_in_progress():
             event.ignore()
             self.statusBar().showMessage(
-                "Packing is still in progress. Wait for it to finish."
+                "A project update is still in progress. Wait for it to finish."
             )
             QMessageBox.information(
                 self,
-                "Packing in Progress",
-                "Wait for packing to finish before closing the project.",
+                "Project Update in Progress",
+                "Wait for the current project update to finish before closing.",
             )
             return
         self.project_closed.emit()
@@ -129,6 +147,14 @@ class ProjectView(QMainWindow):
         )
 
     def _open_tree_item(self, item: QTreeWidgetItem) -> None:
+        if (
+            self._artifact_generation_in_progress()
+            or self._project_mutation_in_progress()
+        ):
+            self.statusBar().showMessage(
+                "Wait for the current project operation before changing files."
+            )
+            return
         resource_id = item.data(0, Qt.UserRole)
         if resource_id is None:
             return
@@ -148,6 +174,9 @@ class ProjectView(QMainWindow):
             self._editor_layout.removeWidget(self._current_editor)
             self._current_editor.deleteLater()
         self._current_editor = editor
+        editor.project_mutation_state_changed.connect(
+            self._refresh_artifact_action_states
+        )
         editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._editor_layout.addWidget(editor, 1)
         editor_layout = editor.layout()
@@ -159,8 +188,14 @@ class ProjectView(QMainWindow):
                 margins.right(),
                 0,
             )
+        self._refresh_artifact_action_states()
 
     def _save_current_file(self) -> None:
+        if (
+            self._artifact_generation_in_progress()
+            or self._project_mutation_in_progress()
+        ):
+            return
         if self._current_editor is None:
             QMessageBox.information(self, "Save File", "Select a project file first.")
             return
@@ -174,6 +209,11 @@ class ProjectView(QMainWindow):
             QMessageBox.critical(self, "Save File Error", str(error))
 
     def _open_card_list(self) -> None:
+        if (
+            self._artifact_generation_in_progress()
+            or self._project_mutation_in_progress()
+        ):
+            return
         if self._card_list_view is not None:
             self._card_list_view.showMaximized()
             self._card_list_view.raise_()
@@ -182,6 +222,7 @@ class ProjectView(QMainWindow):
         dialog = CardListView(self._manifest, self._card_service, self)
         self._card_list_view = dialog
         dialog.dirty_changed.connect(self._card_list_dirty_changed)
+        dialog.project_save_state_changed.connect(self._refresh_artifact_action_states)
         dialog.finished.connect(self._on_card_list_closed)
         dialog.showMaximized()
 
@@ -193,16 +234,21 @@ class ProjectView(QMainWindow):
             self._card_list_view = None
         if isinstance(dialog, CardListView):
             dialog.deleteLater()
+        self._refresh_artifact_action_states()
 
     def _card_list_dirty_changed(self, dirty: bool) -> None:
         suffix = " *" if dirty else ""
         self.setWindowTitle(f"{APPLICATION_NAME} - {self._manifest.name}{suffix}")
 
     def _pack_project(self) -> None:
-        if self._pack_in_progress:
+        if (
+            self._artifact_generation_in_progress()
+            or self._run_in_progress
+            or not self._workspace_is_stable_for_artifact("Pack Project")
+        ):
             return
         self._pack_in_progress = True
-        self._build_button.setEnabled(False)
+        self._refresh_artifact_action_states()
         self.statusBar().showMessage("Packing project...")
         self._run_task(
             lambda: self._project_service.pack_project(self._manifest),
@@ -237,9 +283,115 @@ class ProjectView(QMainWindow):
 
     def _on_pack_finished(self) -> None:
         self._pack_in_progress = False
-        self._build_button.setEnabled(True)
+        self._refresh_artifact_action_states()
+
+    def _export_files(self) -> None:
+        if (
+            self._artifact_generation_in_progress()
+            or self._run_in_progress
+            or not self._workspace_is_stable_for_artifact("Export Files")
+        ):
+            return
+        destination = QFileDialog.getExistingDirectory(
+            self,
+            "Select export folder",
+        )
+        if not destination:
+            return
+        self._export_in_progress = True
+        self._refresh_artifact_action_states()
+        self.statusBar().showMessage("Exporting project files...")
+        self._run_task(
+            lambda: self._project_service.export_project_files(
+                self._manifest,
+                destination,
+            ),
+            self._on_export_succeeded,
+            failure=self._on_export_failed,
+            finished=self._on_export_finished,
+        )
+
+    def _on_export_succeeded(self, path) -> None:
+        self.statusBar().showMessage("File export completed successfully.", 5000)
+        QMessageBox.information(
+            self,
+            "Export Files",
+            f"Reconstructed game files were exported to:\n{path}",
+        )
+
+    def _on_export_failed(self, error: TaskError) -> None:
+        self.statusBar().showMessage("File export failed.", 5000)
+        QMessageBox.critical(self, "Export Files Failed", str(error))
+
+    def _on_export_finished(self) -> None:
+        self._export_in_progress = False
+        self._refresh_artifact_action_states()
+
+    def _refresh_artifact_action_states(self, *_args) -> None:
+        artifact_busy = self._artifact_generation_in_progress()
+        card_save_busy = (
+            self._card_list_view is not None
+            and self._card_list_view.is_project_save_in_progress
+        )
+        editor_mutation_busy = (
+            self._current_editor is not None
+            and self._current_editor.is_project_mutation_in_progress
+        )
+        project_mutation_busy = card_save_busy or editor_mutation_busy
+        artifact_actions_enabled = (
+            not artifact_busy
+            and not self._run_in_progress
+            and not project_mutation_busy
+        )
+        self._export_button.setEnabled(artifact_actions_enabled)
+        self._build_button.setEnabled(artifact_actions_enabled)
+        self._build_and_run_button.setEnabled(
+            self._manifest.executable is not None
+            and not artifact_busy
+            and not self._run_in_progress
+        )
+        self._save_file_button.setEnabled(
+            not artifact_busy and not project_mutation_busy
+        )
+        self._card_list_button.setEnabled(
+            not artifact_busy and not project_mutation_busy
+        )
+        self._tree.setEnabled(not artifact_busy and not project_mutation_busy)
+        self._editor_host.setEnabled(not artifact_busy and not card_save_busy)
+        if self._card_list_view is not None:
+            self._card_list_view.setEnabled(not artifact_busy)
+            self._card_list_view.set_external_project_mutation_blocked(
+                editor_mutation_busy
+            )
+
+    def _artifact_generation_in_progress(self) -> bool:
+        return self._pack_in_progress or self._export_in_progress
+
+    def _workspace_is_stable_for_artifact(self, title: str) -> bool:
+        if not self._project_mutation_in_progress():
+            return True
+        QMessageBox.information(
+            self,
+            title,
+            "Wait for the current project update to finish before continuing.",
+        )
+        return False
+
+    def _project_mutation_in_progress(self) -> bool:
+        return bool(
+            (
+                self._card_list_view is not None
+                and self._card_list_view.is_project_save_in_progress
+            )
+            or (
+                self._current_editor is not None
+                and self._current_editor.is_project_mutation_in_progress
+            )
+        )
 
     def _run_game(self) -> None:
+        if self._artifact_generation_in_progress() or self._run_in_progress:
+            return
         if self._manifest.executable is None:
             QMessageBox.information(
                 self,
@@ -247,10 +399,17 @@ class ProjectView(QMainWindow):
                 "This project does not contain an executable.",
             )
             return
+        self._run_in_progress = True
+        self._refresh_artifact_action_states()
         self._run_task(
             lambda: self._project_service.run_packed_game(self._manifest),
             lambda _process: None,
+            finished=self._on_run_finished,
         )
+
+    def _on_run_finished(self) -> None:
+        self._run_in_progress = False
+        self._refresh_artifact_action_states()
 
     def _run_task(
         self,
@@ -274,7 +433,8 @@ class ProjectView(QMainWindow):
         QMessageBox.critical(self, "Operation Failed", str(error))
 
     def _on_task_finished(self) -> None:
-        self._pgb_progress.hide()
         signals = self.sender()
         if isinstance(signals, TaskSignals):
             self._active_runners.pop(signals, None)
+        if not self._active_runners:
+            self._pgb_progress.hide()

@@ -14,9 +14,11 @@ from yugioh_editor.common.constants import (
 )
 from yugioh_editor.common.errors import ProjectValidationError
 from yugioh_editor.models.entities import (
+    ContainerArchive,
     ExecutableManifest,
     ProjectFileRecord,
     ProjectManifest,
+    ProjectResource,
 )
 from yugioh_editor.repositories.game.repository import GameRepository
 from yugioh_editor.repositories.project.repository import (
@@ -50,6 +52,7 @@ class ProjectService:
         workspace_root: str | Path,
         game_root: str | Path,
         version_prefix: str,
+        icon_source: str | Path | None = None,
     ) -> ProjectManifest:
         name = project_name.strip()
         if not name:
@@ -120,6 +123,16 @@ class ProjectService:
                     source_name=executable.name,
                     relative_path=workspace_path,
                 )
+
+            selected_icon = "" if icon_source is None else str(icon_source).strip()
+            if selected_icon:
+                manifest.icon_path = staging.import_project_icon(selected_icon)
+                icon_data = staging.read_project_icon()
+                if icon_data is None:
+                    raise ProjectValidationError(
+                        "The selected project icon could not be imported."
+                    )
+                game.validate_executable_icon(icon_data)
 
             staging.save(manifest)
             destination.commit_create(staging)
@@ -277,21 +290,17 @@ class ProjectService:
         try:
             manifest.validate()
             project = ProjectRepository(manifest)
+            icon_data = project.read_project_icon()
+            if icon_data is not None and manifest.executable is None:
+                raise ProjectValidationError(
+                    "The project has a configured icon but no executable to update."
+                )
             staging = project.begin_pack()
             output = GameRepository.from_root(
                 staging.root,
                 self._card_name_normalizer,
             )
-            grouped: dict[str, list[ProjectFileRecord]] = {}
-            resources_to_pack = tuple(
-                ProjectRepository.list_resources(
-                    manifest,
-                    include_virtual=True,
-                )
-            )
-            for record in resources_to_pack:
-                key = record.source_file.casefold()
-                grouped.setdefault(key, []).append(record)
+            resources_to_pack, grouped = self._group_project_resources(manifest)
             physical_count = sum(not record.virtual for record in resources_to_pack)
             virtual_count = len(resources_to_pack) - physical_count
             logging.info(
@@ -335,11 +344,13 @@ class ProjectService:
                 )
 
             for logical_name in ("data.dat", "voice.dat"):
-                source_file = project.get_game_file_name(logical_name)
+                source_file, archive = self._reconstruct_container(
+                    project,
+                    output,
+                    grouped,
+                    logical_name,
+                )
                 log_source(source_file)
-                records = grouped.get(source_file.casefold(), [])
-                resources = project.export_resources(records)
-                archive = output.encode_archive(source_file, resources)
                 output.write_container(
                     source_file,
                     archive,
@@ -347,28 +358,28 @@ class ProjectService:
                 )
                 output.read_container(source_file)
 
-            deck_name = project.get_game_file_name("deck.ydc")
+            deck_name, deck_resource = self._reconstruct_single_resource(
+                project,
+                grouped,
+                "deck.ydc",
+                "deck.ydc project data",
+            )
             log_source(deck_name)
-            deck_records = grouped.get(deck_name.casefold(), [])
-            if len(deck_records) != 1:
-                raise ProjectValidationError(
-                    "deck.ydc project data is missing or duplicated."
-                )
-            output.write_deck_resource(
+            output.write_binary(
                 deck_name,
-                project.export_resources(deck_records)[0],
+                output.encode_deck_resource(deck_resource),
             )
 
-            region_name = project.get_game_file_name("region.dat")
+            region_name, region_resource = self._reconstruct_single_resource(
+                project,
+                grouped,
+                "region.dat",
+                "Region project data",
+            )
             log_source(region_name)
-            region_records = grouped.get(region_name.casefold(), [])
-            if len(region_records) != 1:
-                raise ProjectValidationError(
-                    "Region project data is missing or duplicated."
-                )
-            output.write_raw_resource(
+            output.write_binary(
                 region_name,
-                project.export_resources(region_records)[0],
+                output.encode_raw_resource(region_resource),
             )
 
             if manifest.executable is not None:
@@ -386,6 +397,7 @@ class ProjectService:
                     Path(manifest.executable.relative_path).name,
                     project.export_resources(executable_records)[0],
                     metadata={"card_record_count": card_record_count},
+                    icon_data=icon_data,
                 )
             result = project.commit_pack(staging)
             logging.info(
@@ -404,6 +416,111 @@ class ProjectService:
             if staging is not None:
                 staging.discard()
             raise
+
+    def export_project_files(
+        self,
+        manifest: ProjectManifest,
+        destination_root: str | Path,
+    ) -> Path:
+        manifest.validate()
+        project = ProjectRepository(manifest)
+        destination = Path(destination_root).expanduser().resolve()
+        if destination == project.root.resolve():
+            raise ProjectValidationError(
+                "Export destination must not be the editable project root."
+            )
+
+        _, grouped = self._group_project_resources(manifest)
+        encoder = GameRepository.from_root(
+            destination,
+            self._card_name_normalizer,
+        )
+
+        for logical_name in ("data.dat", "voice.dat"):
+            _source_file, archive = self._reconstruct_container(
+                project,
+                encoder,
+                grouped,
+                logical_name,
+            )
+            export_root = encoder.use_root(
+                destination / CONTAINER_LOGICAL_NAMES[logical_name]
+            )
+            export_root.ensure_root()
+            for entry in sorted(archive.entries, key=lambda item: item.order):
+                export_root.write_binary(
+                    normalize_project_path(entry.relative_path).as_posix(),
+                    entry.data,
+                )
+
+        deck_name, deck_resource = self._reconstruct_single_resource(
+            project,
+            grouped,
+            "deck.ydc",
+            "deck.ydc project data",
+        )
+        deck_root = encoder.use_root(destination / "deck")
+        deck_root.ensure_root()
+        deck_root.write_binary(
+            deck_name,
+            encoder.encode_deck_resource(deck_resource),
+        )
+
+        region_name, region_resource = self._reconstruct_single_resource(
+            project,
+            grouped,
+            "region.dat",
+            "Region project data",
+        )
+        region_root = encoder.use_root(destination / "region")
+        region_root.ensure_root()
+        region_root.write_binary(
+            region_name,
+            encoder.encode_raw_resource(region_resource),
+        )
+        return destination
+
+    @staticmethod
+    def _group_project_resources(
+        manifest: ProjectManifest,
+    ) -> tuple[
+        tuple[ProjectFileRecord, ...],
+        dict[str, list[ProjectFileRecord]],
+    ]:
+        resources = tuple(
+            ProjectRepository.list_resources(
+                manifest,
+                include_virtual=True,
+            )
+        )
+        grouped: dict[str, list[ProjectFileRecord]] = {}
+        for record in resources:
+            grouped.setdefault(record.source_file.casefold(), []).append(record)
+        return resources, grouped
+
+    @staticmethod
+    def _reconstruct_container(
+        project: ProjectRepository,
+        encoder: GameRepository,
+        grouped: dict[str, list[ProjectFileRecord]],
+        logical_name: str,
+    ) -> tuple[str, ContainerArchive]:
+        source_file = project.get_game_file_name(logical_name)
+        resources = project.export_resources(grouped.get(source_file.casefold(), ()))
+        return source_file, encoder.encode_archive(source_file, resources)
+
+    @staticmethod
+    def _reconstruct_single_resource(
+        project: ProjectRepository,
+        grouped: dict[str, list[ProjectFileRecord]],
+        logical_name: str,
+        label: str,
+    ) -> tuple[str, ProjectResource]:
+        source_file = project.get_game_file_name(logical_name)
+        records = grouped.get(source_file.casefold(), ())
+        if len(records) != 1:
+            raise ProjectValidationError(f"{label} is missing or duplicated.")
+        return source_file, project.export_resources(records)[0]
 
     @staticmethod
     def validate_version_prefix(value: str) -> str:
@@ -432,6 +549,14 @@ class ProjectService:
             Path(manifest.executable.relative_path).name
         )
         return subprocess.Popen(
-            [str(executable)],
+            [str(executable), "-full", "-speedy"],
             cwd=str(executable.parent),
         )
+
+    @staticmethod
+    def find_registered_game_folder() -> str | None:
+        from yugioh_editor.infrastructure.windows_game_install_locator import (
+            WindowsGameInstallLocator,
+        )
+
+        return WindowsGameInstallLocator.find_game_folder()

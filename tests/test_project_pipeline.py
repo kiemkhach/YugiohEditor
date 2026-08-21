@@ -135,8 +135,151 @@ class ProjectPipelineTests(unittest.TestCase):
                 reloaded.executable.relative_path,
                 "mai/mai_pc.exe",
             )
-            output = service.pack_project(reloaded)
+            with patch.object(
+                GameFolderConnection,
+                "update_executable_icon",
+                autospec=True,
+            ) as update_icon:
+                output = service.pack_project(reloaded)
+            update_icon.assert_not_called()
             self.assertEqual((output / "mai_pc.exe").read_bytes(), b"MZ-demo")
+
+    def test_project_icon_is_copied_and_only_updates_pack_staging(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            source_executable = b"MZ-icon-demo"
+            game.write_executable("joey_pc.exe", source_executable)
+            external_icon = root_path / "selected.ico"
+            Image.new("RGBA", (32, 32), "red").save(external_icon, format="ICO")
+            selected_icon_bytes = external_icon.read_bytes()
+
+            service = ProjectService()
+            manifest = service.create_project(
+                "Icon project",
+                root_path / "workspace",
+                game_path,
+                "mai",
+                external_icon,
+            )
+            self.assertEqual(manifest.icon_path, "project.ico")
+            project_icon = manifest.root / "project.ico"
+            self.assertEqual(project_icon.read_bytes(), selected_icon_bytes)
+            external_icon.unlink()
+
+            workspace_executable = manifest.root / "mai" / "mai_pc.exe"
+            observed_updates = []
+
+            def observe_update(connection, relative_path, icon_data):
+                staged_path = connection.resolve(relative_path)
+                observed_updates.append(
+                    (staged_path, bytes(icon_data), staged_path.read_bytes())
+                )
+                return staged_path
+
+            with patch.object(
+                GameFolderConnection,
+                "update_executable_icon",
+                autospec=True,
+                side_effect=observe_update,
+            ):
+                output = service.pack_project(manifest)
+
+            self.assertEqual(len(observed_updates), 1)
+            staged_path, observed_icon, staged_executable = observed_updates[0]
+            self.assertIn(".pack.", staged_path.parent.name)
+            self.assertTrue(staged_path.parent.name.endswith(".tmp"))
+            self.assertEqual(observed_icon, selected_icon_bytes)
+            self.assertEqual(staged_executable, source_executable)
+            self.assertEqual(workspace_executable.read_bytes(), source_executable)
+            self.assertEqual(
+                (game_path / "joey_pc.exe").read_bytes(),
+                source_executable,
+            )
+            self.assertEqual((output / "mai_pc.exe").read_bytes(), source_executable)
+
+            previous_output = {
+                path.relative_to(output).as_posix(): path.read_bytes()
+                for path in output.rglob("*")
+                if path.is_file()
+            }
+            with (
+                patch.object(
+                    GameFolderConnection,
+                    "update_executable_icon",
+                    autospec=True,
+                    side_effect=OSError("controlled icon update failure"),
+                ),
+                self.assertRaisesRegex(OSError, "icon update failure"),
+            ):
+                service.pack_project(manifest)
+            self.assertEqual(
+                {
+                    path.relative_to(output).as_posix(): path.read_bytes()
+                    for path in output.rglob("*")
+                    if path.is_file()
+                },
+                previous_output,
+            )
+            self.assertEqual(
+                list(manifest.root.parent.glob(f".{manifest.root.name}.pack.*.tmp")),
+                [],
+            )
+
+            legacy_project_icon = manifest.root / "project.icon"
+            project_icon.rename(legacy_project_icon)
+            manifest.icon_path = "project.icon"
+            ProjectRepository(manifest).save(manifest)
+            observed_updates.clear()
+            with patch.object(
+                GameFolderConnection,
+                "update_executable_icon",
+                autospec=True,
+                side_effect=observe_update,
+            ):
+                service.pack_project(manifest)
+            self.assertEqual(len(observed_updates), 1)
+            self.assertEqual(observed_updates[0][1], selected_icon_bytes)
+
+            legacy_project_icon.unlink()
+            with self.assertRaisesRegex(
+                FileNotFoundError,
+                "(?i)configured project icon",
+            ):
+                service.pack_project(manifest)
+            self.assertEqual(
+                {
+                    path.relative_to(output).as_posix(): path.read_bytes()
+                    for path in output.rglob("*")
+                    if path.is_file()
+                },
+                previous_output,
+            )
+
+    def test_create_project_rejects_invalid_icon_without_partial_project(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            game.write_executable("joey_pc.exe", b"MZ-icon-demo")
+            invalid_icon = root_path / "invalid.ico"
+            invalid_icon.write_bytes(b"not-an-icon")
+            workspace = root_path / "workspace"
+
+            with self.assertRaisesRegex(ValueError, "ICO"):
+                ProjectService().create_project(
+                    "Invalid icon project",
+                    workspace,
+                    game_path,
+                    "mai",
+                    invalid_icon,
+                )
+
+            self.assertFalse((workspace / "Invalid icon project").exists())
+            self.assertEqual(list(workspace.glob(".*.create.*.tmp")), [])
 
     def test_pack_patches_executable_from_dynamic_card_id_count_only(self):
         source, profile, configs = self._synthetic_executable_rule_config()
@@ -792,7 +935,11 @@ class ProjectPipelineTests(unittest.TestCase):
             (bin_root / "mai_pc.exe").write_bytes(b"MZ")
             with patch("subprocess.Popen") as popen:
                 service.run_packed_game(manifest)
-                popen.assert_called_once()
+                resolved_bin = bin_root.resolve()
+                popen.assert_called_once_with(
+                    [str(resolved_bin / "mai_pc.exe"), "-full", "-speedy"],
+                    cwd=str(resolved_bin),
+                )
 
     def test_generic_cp932_text_preserves_newlines_through_project_pipeline(self):
         fixtures = {
@@ -959,15 +1106,30 @@ class ProjectPipelineTests(unittest.TestCase):
                     data=existing_image_bytes,
                     order=13,
                 ),
+                ContainerEntry(
+                    "misc/repeated.bin",
+                    data=b"A" * 4096,
+                    compressed=True,
+                    order=14,
+                ),
             ]
             game.write_container(
                 "Data.dat",
                 ContainerArchive("Data.dat", entries=entries),
-                "never",
+                "preserve",
             )
             game.write_container(
                 "Voice.dat",
-                ContainerArchive("Voice.dat", entries=[]),
+                ContainerArchive(
+                    "Voice.dat",
+                    entries=[
+                        ContainerEntry(
+                            "sound/voice.wav",
+                            data=b"ORIGINAL VOICE",
+                            order=0,
+                        )
+                    ],
+                ),
                 "never",
             )
             game.write_binary("Region.dat", b"REGION")
@@ -998,6 +1160,17 @@ class ProjectPipelineTests(unittest.TestCase):
             edited.small_image_source = jpeg
             cards.update_card(manifest, edited)
 
+            voice_record = next(
+                record
+                for record in manifest.files
+                if record.source_file.casefold() == "voice.dat"
+            )
+            project_service.write_project_binary(
+                manifest,
+                voice_record,
+                b"EDITED VOICE",
+            )
+
             reloaded = project_service.load_project(manifest.root)
             data_records = sorted(
                 (
@@ -1014,14 +1187,42 @@ class ProjectPipelineTests(unittest.TestCase):
                 [record.order for record in data_records],
                 list(range(len(data_records))),
             )
-            self.assertEqual(data_paths, sorted(data_paths, key=str.casefold))
+            self.assertEqual(
+                data_paths,
+                sorted(
+                    data_paths,
+                    key=lambda path: path.replace("/", "\\").casefold(),
+                ),
+            )
+
+            export_root = root_path / "export"
+            export_root.mkdir()
+            unrelated = export_root / "keep.txt"
+            unrelated.write_text("keep", encoding="utf-8")
+            with self.assertRaisesRegex(
+                ProjectValidationError,
+                "editable project root",
+            ):
+                project_service.export_project_files(reloaded, reloaded.root)
+            exported = project_service.export_project_files(
+                reloaded,
+                export_root,
+            )
+            self.assertEqual(exported, export_root.resolve())
+            self.assertEqual(unrelated.read_text(encoding="utf-8"), "keep")
 
             output = project_service.pack_project(reloaded)
             packed = GameFolderConnection(output).read_container("Data.dat")
             packed_paths = [
                 item.relative_path.replace("\\", "/") for item in packed.entries
             ]
-            self.assertEqual(packed_paths, sorted(packed_paths, key=str.casefold))
+            self.assertEqual(
+                packed_paths,
+                sorted(
+                    packed_paths,
+                    key=lambda path: path.replace("/", "\\").casefold(),
+                ),
+            )
             expected_image_paths = [
                 "card/tp4013.bmp",
                 "card/usr000.bmp",
@@ -1043,6 +1244,43 @@ class ProjectPipelineTests(unittest.TestCase):
                 item.relative_path.replace("\\", "/"): item.data
                 for item in packed.entries
             }
+            packed_entries = {
+                item.relative_path.replace("\\", "/"): item for item in packed.entries
+            }
+            self.assertEqual(
+                {
+                    path.relative_to(export_root / "data").as_posix(): (
+                        path.read_bytes()
+                    )
+                    for path in (export_root / "data").rglob("*")
+                    if path.is_file()
+                },
+                payloads,
+            )
+            packed_voice = GameFolderConnection(output).read_container("Voice.dat")
+            voice_payloads = {
+                item.relative_path.replace("\\", "/"): item.data
+                for item in packed_voice.entries
+            }
+            self.assertEqual(
+                {
+                    path.relative_to(export_root / "voice").as_posix(): (
+                        path.read_bytes()
+                    )
+                    for path in (export_root / "voice").rglob("*")
+                    if path.is_file()
+                },
+                voice_payloads,
+            )
+            self.assertEqual(voice_payloads, {"sound/voice.wav": b"EDITED VOICE"})
+            self.assertEqual(
+                (export_root / "deck" / "deck.ydc").read_bytes(),
+                (output / "deck.ydc").read_bytes(),
+            )
+            self.assertEqual(
+                (export_root / "region" / "Region.dat").read_bytes(),
+                (output / "Region.dat").read_bytes(),
+            )
             self.assertEqual(
                 payloads["bin#/card_id.bin"],
                 b"\xff\xff\x02\x00\x00\x00",
@@ -1056,6 +1294,15 @@ class ProjectPipelineTests(unittest.TestCase):
             )
             self.assertIn(f"card/{image_name}", payloads)
             self.assertIn(f"mini/{image_name}", payloads)
+            self.assertIn("bin#/card_intid.bin", payloads)
+            self.assertIn("bin#/card_sorteng.bin", payloads)
+            self.assertIn("bin#/card_indxeng.bin", payloads)
+            self.assertEqual(payloads["misc/repeated.bin"], b"A" * 4096)
+            self.assertTrue(packed_entries["misc/repeated.bin"].compressed)
+            self.assertLess(
+                packed_entries["misc/repeated.bin"].stored_size,
+                packed_entries["misc/repeated.bin"].full_size,
+            )
             self.assertTrue(payloads[f"card/{image_name}"].startswith(b"BM"))
             self.assertTrue(payloads[f"mini/{image_name}"].startswith(b"BM"))
             output_names = {path.name for path in output.iterdir()}

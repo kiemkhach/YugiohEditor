@@ -111,7 +111,8 @@ case-insensitive; newly named derived resources use canonical lowercase.
 2. Enter the required version prefix, such as `mai`.
 3. Select a workspace directory.
 4. Select the original game directory.
-5. Start project creation.
+5. Optionally select an `.ico` file.
+6. Start project creation.
 
 The project is created at:
 
@@ -124,6 +125,15 @@ one manifest named `project.json` and one analyzed workspace tree. Matching
 executables are sorted case-insensitively and the first match is copied to
 `<project>/<prefix>/<prefix>_pc.exe`. The prefix is read from the current UI
 field, trimmed, validated, and stored without any application-level fallback.
+The optional icon is validated and copied to `project.ico`; `project.json`
+stores only that relative path, so the project does not depend on the original
+icon file. Existing manifests that point to an older `project.icon` copy remain
+valid because the manifest path is authoritative. The Start screen remembers
+the last valid Workspace with user-scope INI `QSettings`, using organization and
+application `YugiohEditor` and key `workspace/last_folder`. This writable user
+preference is not stored in `project.json` or the installation resources. The
+screen also attempts read-only Game Folder discovery through the 32-bit Konami
+registry view, without overwriting a nonempty field.
 
 ### Edit project files
 
@@ -183,11 +193,14 @@ payloads. Mini images use the dimensions of an existing mini image when one is
 available. Custom image names are checked case-insensitively against both the
 manifest and workspace files. When new physical images are added, all records
 for the actual `Data.dat` source are sorted lexicographically by normalized,
-case-insensitive complete relative path and renumbered contiguously. Stored path
-casing is preserved, other source files are unchanged, and new image records
-remain raw with `compressed=false`. The manifest order is the order written to
-the packed container; a failed staged Save restores the previous project and
-record order.
+case-insensitive complete relative path using a Windows-backslash comparison
+key and renumbered contiguously. This is a global path sort, not recursive
+files-first traversal. Stored path casing is preserved, other source files are
+unchanged, and new image records remain raw with `compressed=false`. The
+manifest order is the order written to the packed container; a failed staged
+Save restores the previous project and record order. Negative-ID card-back rows
+retain their original per-catalog name, while ordinary rows still follow edited
+English card names.
 
 ### Pack and run
 
@@ -208,7 +221,9 @@ actual row count of the logical `card_ids` table. The count is not hard-coded to
 project's workspace executable remain byte-identical source files; only the
 copy written into Pack staging passes through the physical `*_pc.exe` rule,
 which uses the existing generic binary codec and a declarative pre-encode
-profile.
+profile. If an icon is configured, its PE icon groups are updated only after
+that staged encode; unrelated PE resources and both source executable copies
+remain untouched.
 
 The current Joey profile preserves bytes for counts through 1115, supports
 formula-driven encoding for counts 1116 through its statically inferred safe
@@ -227,9 +242,18 @@ known global address rather than being a general editor limit.
 
 The Project window's **Run** button only launches this already-packed
 executable; it never starts Pack or Build implicitly. A successful launch does
-not show a modal dialog. A missing or unlaunchable executable is still reported
-through the existing error dialog, and both outcomes clean up the background
-task state without waiting for the game process to exit.
+not show a modal dialog. It passes exactly `-full -speedy` and uses the packed
+executable's directory as cwd. A missing or unlaunchable executable is still
+reported through the existing error dialog, and both outcomes clean up the
+background task state without waiting for the game process to exit.
+
+**Export Files**, immediately left of Build, reconstructs the current project
+into `data/`, `voice/`, `deck/`, and `region/`. Data and Voice outputs are final
+decompressed/re-encoded entry bytes from the same pre-compression stage used by
+Pack, including virtual resources; they are not CSV files or extracts from the
+original archives. Export overwrites only files it owns and does not clear the
+selected destination. Pack and Export temporarily lock project mutations and
+Run so reconstruction sees one stable saved workspace state.
 
 Project creation and packing use staging directories. Successful work is
 committed with an atomic directory rename; a failure removes staging data and

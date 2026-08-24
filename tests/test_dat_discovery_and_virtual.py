@@ -16,6 +16,7 @@ from yugioh_editor.common.errors import (
     PackResourceError,
     ProjectValidationError,
 )
+from yugioh_editor.common.joey_card_capacity import validate_joey_edit_topology
 from yugioh_editor.models.entities import (
     ContainerArchive,
     ContainerEntry,
@@ -43,7 +44,19 @@ class DatDiscoveryTests(unittest.TestCase):
         game = GameFolderConnection(root)
         game.write_container(
             data_name,
-            ContainerArchive(data_name, entries=[]),
+            ContainerArchive(
+                data_name,
+                entries=[
+                    ContainerEntry(
+                        "bin#/card_id.bin",
+                        data=GameRepository.encode_binary_resource(
+                            "card_id.bin",
+                            pd.DataFrame({"value": [-1, *range(1114)]}),
+                        ),
+                        order=0,
+                    )
+                ],
+            ),
             "never",
         )
         game.write_container(
@@ -209,7 +222,13 @@ class VirtualResourceTests(unittest.TestCase):
             )
 
             def pack_data():
-                output = service.pack_project(manifest)
+                # Keep this fixture at three rows so it isolates sort/provider
+                # behavior; strict production Pack bounds are covered separately.
+                with patch(
+                    "yugioh_editor.services.project_service.analyze_joey_card_ids",
+                    side_effect=validate_joey_edit_topology,
+                ):
+                    output = service.pack_project(manifest)
                 container_bytes = (output / "Data.dat").read_bytes()
                 packed = GameFolderConnection(output).read_container("Data.dat")
                 payloads = {
@@ -400,7 +419,12 @@ class VirtualResourceTests(unittest.TestCase):
             updated.loc[1, "text"] = "Updated Zulu"
             repository.write_table(description_record.workspace_path, updated)
 
-            output = service.pack_project(manifest)
+            # This fixture intentionally proves three-row virtual sidecar bytes.
+            with patch(
+                "yugioh_editor.services.project_service.analyze_joey_card_ids",
+                side_effect=validate_joey_edit_topology,
+            ):
+                output = service.pack_project(manifest)
             packed = GameFolderConnection(output).read_container("Data.dat")
             payloads = {
                 item.relative_path.replace("\\", "/").casefold(): item.data

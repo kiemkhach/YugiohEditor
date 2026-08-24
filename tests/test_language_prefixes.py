@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -13,6 +14,7 @@ from yugioh_editor.common.constants import (
     LANGUAGE_ENCODINGS,
     LANGUAGE_PREFIXES,
 )
+from yugioh_editor.common.joey_card_capacity import validate_joey_edit_topology
 from yugioh_editor.models.card_editing import CARD_CSV_COLUMNS
 from yugioh_editor.models.entities import (
     ContainerArchive,
@@ -276,7 +278,13 @@ class LanguagePrefixTests(unittest.TestCase):
                 description_table,
             )
 
-            output = service.pack_project(manifest)
+            # Keep the localized sidecar fixture at three rows; Pack capacity
+            # enforcement has dedicated integration coverage.
+            with patch(
+                "yugioh_editor.services.project_service.analyze_joey_card_ids",
+                side_effect=validate_joey_edit_topology,
+            ):
+                output = service.pack_project(manifest)
             packed = GameFolderConnection(output).read_container("Data.dat")
             payloads = {
                 item.relative_path.replace("\\", "/").casefold(): item.data

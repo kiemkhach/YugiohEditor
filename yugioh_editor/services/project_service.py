@@ -12,7 +12,12 @@ from yugioh_editor.common.constants import (
     LOGICAL_DAT_FILES,
     VERSION_PREFIX_PATTERN,
 )
-from yugioh_editor.common.errors import ProjectValidationError
+from yugioh_editor.common.errors import ProjectValidationError, RulePipelineError
+from yugioh_editor.common.joey_card_capacity import (
+    JOEY_STOCK_RECORD_COUNT,
+    JoeyCardCapacityError,
+    analyze_joey_card_ids,
+)
 from yugioh_editor.models.entities import (
     ContainerArchive,
     ExecutableManifest,
@@ -295,12 +300,74 @@ class ProjectService:
                 raise ProjectValidationError(
                     "The project has a configured icon but no executable to update."
                 )
+            if icon_data is not None:
+                GameRepository.validate_executable_icon(icon_data)
+
+            resources_to_pack, grouped = self._group_project_resources(manifest)
+            try:
+                if not project.has_table("card_ids"):
+                    raise KeyError("The card_ids table handler is not registered.")
+                card_ids = project.get_table("card_ids")
+            except (KeyError, OSError, TypeError, ValueError) as error:
+                raise ProjectValidationError(
+                    "The project is missing or has an invalid physical card_ids "
+                    "table required for Pack."
+                ) from error
+            if "value" not in card_ids.columns:
+                raise ProjectValidationError(
+                    "The physical card_ids table must contain a value column."
+                )
+            try:
+                capacity_plan = analyze_joey_card_ids(card_ids["value"].tolist())
+            except JoeyCardCapacityError as error:
+                raise ProjectValidationError(str(error)) from error
+
+            capacity_metadata: dict[str, object] = {
+                "card_record_count": capacity_plan.record_count,
+                "card_capacity_plan": {
+                    "maximum_active_slot": capacity_plan.maximum_active_slot,
+                    "exclusive_upper_bound": capacity_plan.exclusive_upper_bound,
+                    "active_state_end_address": (
+                        capacity_plan.active_state_end_address
+                    ),
+                },
+            }
+            executable_resource: ProjectResource | None = None
+            if manifest.executable is None:
+                if capacity_plan.record_count > JOEY_STOCK_RECORD_COUNT:
+                    raise ProjectValidationError(
+                        "Projects with more than 1115 card records require the "
+                        "supported Joey executable."
+                    )
+            else:
+                executable_records = grouped.get(
+                    manifest.executable.source_name.casefold(),
+                    [],
+                )
+                if len(executable_records) != 1:
+                    raise ProjectValidationError(
+                        "Executable project data is missing or duplicated."
+                    )
+                executable_resource = project.export_resources(executable_records)[0]
+                preflight = GameRepository.from_root(
+                    project.root,
+                    self._card_name_normalizer,
+                )
+                try:
+                    preflight.preflight_executable_resource(
+                        executable_resource,
+                        metadata=capacity_metadata,
+                    )
+                except (RulePipelineError, TypeError, ValueError) as error:
+                    raise ProjectValidationError(
+                        f"Executable capacity preflight failed: {error}"
+                    ) from error
+
             staging = project.begin_pack()
             output = GameRepository.from_root(
                 staging.root,
                 self._card_name_normalizer,
             )
-            resources_to_pack, grouped = self._group_project_resources(manifest)
             physical_count = sum(not record.virtual for record in resources_to_pack)
             virtual_count = len(resources_to_pack) - physical_count
             logging.info(
@@ -384,19 +451,11 @@ class ProjectService:
 
             if manifest.executable is not None:
                 log_source(manifest.executable.source_name)
-                executable_records = grouped.get(
-                    manifest.executable.source_name.casefold(),
-                    [],
-                )
-                if len(executable_records) != 1:
-                    raise ProjectValidationError(
-                        "Executable project data is missing or duplicated."
-                    )
-                card_record_count = len(project.get_table("card_ids"))
+                assert executable_resource is not None
                 output.write_executable_resource(
                     Path(manifest.executable.relative_path).name,
-                    project.export_resources(executable_records)[0],
-                    metadata={"card_record_count": card_record_count},
+                    executable_resource,
+                    metadata=capacity_metadata,
                     icon_data=icon_data,
                 )
             result = project.commit_pack(staging)

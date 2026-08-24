@@ -12,12 +12,14 @@ from concurrent.futures import (
     wait,
 )
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from time import perf_counter
 
 import pandas as pd
 
 from yugioh_editor.common.card_errors import (
+    CardCapacityError,
     CardError,
     CardImageError,
     CardImportError,
@@ -53,6 +55,15 @@ from yugioh_editor.common.constants import (
     PACK_NAMES,
     language_encoding,
     normalize_language_code,
+)
+from yugioh_editor.common.joey_card_capacity import (
+    JOEY_CARD_ID_MAX,
+    JOEY_INVALID_CARD_ID,
+    JOEY_MAX_ACTIVE_SLOT,
+    JOEY_PROTECTED_LEGACY_ALIAS_IDS,
+    JoeyCardCapacityError,
+    allocate_safe_joey_card_id,
+    validate_joey_edit_topology,
 )
 from yugioh_editor.common.worker_limits import (
     estimate_available_memory_bytes,
@@ -180,11 +191,20 @@ class CardService:
         manifest: ProjectManifest | None = None,
     ) -> CardEditDraft:
         cards = self.load_card_details(manifest)
-        next_index = max((card.card_index for card in cards), default=-1) + 1
-        existing_ids = {card.card_id for card in cards}
-        next_id = 0
-        while next_id in existing_ids:
-            next_id += 1
+        existing_ids = [card.card_id for card in cards]
+        try:
+            validate_joey_edit_topology(existing_ids)
+        except JoeyCardCapacityError as error:
+            raise CardCapacityError(str(error)) from error
+        next_index = max((card.card_index for card in cards), default=0) + 1
+        if next_index > JOEY_MAX_ACTIVE_SLOT:
+            raise CardCapacityError(
+                "Maximum Joey card capacity reached: 4094 active cards."
+            )
+        try:
+            next_id = allocate_safe_joey_card_id(existing_ids)
+        except JoeyCardCapacityError as error:
+            raise CardCapacityError(str(error)) from error
         return CardEditDraft(
             card_index=next_index,
             card_id=next_id,
@@ -241,6 +261,10 @@ class CardService:
         repository = self._project(manifest)
         current = repository.get_table("cards", language=DEFAULT_LANGUAGE)
         updated = current.reset_index(drop=True).copy()
+        try:
+            validate_joey_edit_topology(updated["card_id"].tolist())
+        except JoeyCardCapacityError as error:
+            raise CardCapacityError(str(error)) from error
         existing_indexes = set(updated["card_index"].astype(int).tolist())
         existing_ids = set(updated["card_id"].astype(int).tolist())
         row_by_index = {
@@ -296,7 +320,15 @@ class CardService:
                 [updated, pd.DataFrame.from_records(new_rows)],
                 ignore_index=True,
             )
+        topology_error: JoeyCardCapacityError | None = None
+        try:
+            validate_joey_edit_topology(updated["card_id"].tolist())
+        except JoeyCardCapacityError as error:
+            topology_error = error
+            validation_errors.append(str(error))
         if validation_errors:
+            if len(validation_errors) == 1 and topology_error is not None:
+                raise CardCapacityError(str(topology_error)) from topology_error
             raise CardValidationError(validation_errors)
 
         staging_started = perf_counter()
@@ -381,13 +413,39 @@ class CardService:
 
     def _validate_normalized_card_draft(self, draft: CardEditDraft) -> list[str]:
         errors: list[str] = []
-        if not 0 <= draft.card_index <= 9999:
-            errors.append(f"card_index {draft.card_index} must be between 0 and 9999.")
-        minimum_id = 0 if draft.is_new else -1
-        if not minimum_id <= draft.card_id <= 9999:
-            errors.append(
-                f"card_id {draft.card_id} must be between {minimum_id} and 9999."
-            )
+        card_index = self._validate_card_identity_integer(
+            draft.card_index,
+            "card_index",
+            errors,
+        )
+        card_id = self._validate_card_identity_integer(
+            draft.card_id,
+            "card_id",
+            errors,
+        )
+        if card_index is not None:
+            minimum_index = 1 if draft.is_new else 0
+            if not minimum_index <= card_index <= JOEY_MAX_ACTIVE_SLOT:
+                errors.append(
+                    f"card_index {card_index} must be between {minimum_index} "
+                    f"and {JOEY_MAX_ACTIVE_SLOT}."
+                )
+        if card_id is not None:
+            if card_id == JOEY_INVALID_CARD_ID:
+                errors.append("Card ID 4095 is reserved by the 12-bit runtime.")
+            elif draft.is_new or card_index != 0:
+                if not 0 <= card_id <= JOEY_CARD_ID_MAX:
+                    errors.append(
+                        f"Card ID {card_id} is outside the supported Joey range "
+                        f"0..{JOEY_CARD_ID_MAX}."
+                    )
+            elif card_id != -1:
+                errors.append("Dummy card at index 0 must retain Card ID -1.")
+            if draft.is_new and card_id in JOEY_PROTECTED_LEGACY_ALIAS_IDS:
+                errors.append(
+                    f"Card ID {card_id} is a protected legacy alias and cannot "
+                    "be assigned to a new unrelated card."
+                )
         self._validate_password(draft.password, errors)
         self._validate_optional_integer(
             draft.level,
@@ -446,6 +504,17 @@ class CardService:
                     )
                 )
         return errors
+
+    @staticmethod
+    def _validate_card_identity_integer(
+        value: object,
+        field_name: str,
+        errors: list[str],
+    ) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            errors.append(f"{field_name} must be an integer, got {value!r}.")
+            return None
+        return int(value)
 
     @staticmethod
     def _format_card_text_encoding_error(

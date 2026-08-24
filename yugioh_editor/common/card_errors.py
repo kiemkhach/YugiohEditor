@@ -8,6 +8,11 @@ class CardValidationError(CardError):
         super().__init__("Card validation failed:\n- " + "\n- ".join(self.errors))
 
 
+class CardCapacityError(CardValidationError):
+    def __init__(self, message: str) -> None:
+        super().__init__([message])
+
+
 class CardPersistenceError(CardError):
     pass
 

@@ -262,31 +262,54 @@ Yu-Gi-Oh! Power of Chaos: Joey the Passion game files.
   a longer table does not prove that the original game executable supports
   additional cards. Executable compatibility is controlled independently by
   the explicit Pack-time executable profile below.
+- Joey slot zero is the dummy. Active slots are `1..4094`, so the maximum is
+  4094 active cards / 4095 physical `card_id` records. Active Card IDs are
+  unique integers `0..4094`; `4095`/`0xFFF` is reserved and must never be an
+  active slot or Card ID. ID 4093 is ordinary and must not be reserved.
+- Centralize these limits in `common/joey_card_capacity.py`. Add Card selects
+  the next slot only through 4094 and the lowest safe free Card ID below
+  `0xFFF`. Protect currently free legacy alias IDs `2000`, `2014`, `2034`,
+  `2037`, `2040`, `2063`, `2068`, `2387`, and `2389` from unrelated new
+  allocation while accepting legitimate existing rows. Card Save reloads and
+  revalidates the resulting topology so stale drafts cannot cross capacity or
+  introduce duplicate IDs.
 - Executables matching `*_pc.exe` use the generic `binary` codec and the
   `patch_executable_card_capacity` `pre_encode` rule. Create Project and card
-  Save never patch an executable. Pack derives `card_record_count` from
-  `len(ProjectRepository.get_table("card_ids"))`, passes it only as operation
-  metadata, and writes transformed bytes only beneath Pack staging. Do not
-  persist the derived count in the manifest or derive it from external Card
-  IDs, `cards`, `card_intid.bin`, or `card_sort`.
+  Save never patch an executable. Pack validates physical `card_ids` and
+  preflights the executable before creating output staging or rebuilding large
+  containers. It derives `card_record_count` from
+  `len(ProjectRepository.get_table("card_ids"))`, passes the validated plan only
+  as operation metadata, and writes transformed bytes only beneath Pack
+  staging. Do not persist the count/plan or derive it from maximum Card ID,
+  `cards`, `card_intid.bin`, `card_sort`, the UI, or images.
 - An optional Create Project icon is copied to `project.ico` and recorded as a
   project-relative `icon_path`; an absent property remains backward compatible,
   and existing manifests may retain an authoritative `project.icon` path. Pack
   validates the configured file and updates icon groups only on the staged
   executable after its binary pre-encode pipeline, preserving unrelated PE
-  resources and the source/workspace executable bytes.
+  resources and the source/workspace executable bytes. After native Windows
+  icon mutation, re-open the staged executable and verify `.ygst`, `.ygsx`,
+  helper fragments, masks, hooks, aliases, and all 17 dynamic sites; a
+  post-icon whole-file hash is not stable.
 - The Joey executable profile identifies its supported source with the whole-
-  file SHA-256, validates every complete original instruction before mutation,
-  and declares all integer immediates plus the conditional trailing `MOVSW`.
-  Counts at or below 1115 preserve the executable byte-for-byte without a hash
-  requirement. Counts 1116 through 2166 use formula-driven bounds, state end,
-  snapshot size, DWORD count, and odd/even trailing-WORD behavior. Counts above
-  2166 fail Pack; this is a profile safety limit inferred from the next known
-  global address, not an editor or card-format limit. The known count-1116
-  output hash is a regression check, not a supported-count allowlist.
-- Executable patch formulas and the one-card binary output are statically
-  verified. One-card Windows runtime behavior is not yet dynamically verified;
-  counts above 1116 are formula-driven but not runtime verified.
+  file SHA-256 and exact PE32 baseline and validates every complete stock
+  instruction/window before mutation. Counts below 1115 fail; count 1115 alone
+  preserves source bytes without requiring the input hash; counts 1116..4095
+  install the structural Step 8 runtime; counts above 4095 fail.
+- The extended executable adds `.ygst` for 4096 state WORDs at `0x00C24000`
+  plus the 4096-byte snapshot at `0x00C26000`, and `.ygsx` for helpers at
+  `0x00C27000`. Apply only the declarative 69 direct state relocations, two
+  complete snapshot rewrites, fixed 12-bit masks/hooks/helpers, 11 audited
+  alias-consumer patches, and exactly 17 count-dependent sites. Never scan for
+  address-shaped values or globally patch literal 2000.
+- Preserve the lower-2048 save/load bridge: copy relocated slots `0..2047` to
+  the legacy block before its checksum/write call and copy them back on load.
+  Slots `2048..4094` are not persistent. Do not ship autocollect behavior.
+- Historical experimental builds runtime-verified the Step 8 bridge, lookup,
+  and high-slot architecture semantics. Production helper bytes are newly
+  assembled against complete stock instructions and statically verified; do
+  not claim byte identity to a removed experiment or actual production game
+  runtime. Native icon-resource verification is also separate from gameplay.
 - `card_sort[lang].bin` is virtual. Index zero is a dummy with rank zero; all
   real rows `1..N-1` participate and receive inverse ranks `0..N-2`. Sort keys
   use the localized card name and Card ID. Size the output to

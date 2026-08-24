@@ -58,92 +58,110 @@ them as `bin/<prefix>_pc.exe`. The original game file and editable workspace
 file always retain the source bytes. Only Pack staging receives the result of
 the physical `*_pc.exe` rule's generic-binary `pre_encode` pipeline.
 
-#### Dynamic card-capacity profile
+#### Step 8 card-capacity profile
 
-Pack reads the logical physical `card_ids` table and sets:
+Pack validates the physical `card_ids` table and derives one immutable capacity
+plan before rebuilding containers:
 
 ```text
-card_record_count = len(card_id.bin records)
-maximum_internal_id = card_record_count - 1
-exclusive_upper_bound = card_record_count
-state_base_address = 0x00A53CCC
-state_record_size = 2
-state_byte_count = card_record_count * state_record_size
-state_end_address = state_base_address + state_byte_count
-snapshot_dword_count = state_byte_count // 4
-snapshot_has_tail_word = state_byte_count % 4 == 2
-snapshot_stack_size = state_byte_count + 0x10
+card_record_count       = len(card_id.bin records)
+active_count            = card_record_count - 1
+maximum_active_slot     = card_record_count - 1
+exclusive_upper_bound   = card_record_count
+active_state_end        = 0x00C24000 + card_record_count * 2
 ```
 
-Index zero remains the dummy, so real internal IDs occupy
-`1..card_record_count-1`. The formula is not specialized for count 1116 and
-does not use the maximum external Card ID, `card_intid.bin`, or `card_sort`.
-The count is operation metadata derived at Pack time and is not stored in the
-manifest.
+Slot zero is the dummy. The row count, maximum active slot, and Card ID are
+separate values; no bound is derived from the maximum Card ID,
+`card_intid.bin`, `card_sort`, the Cards UI, or image count. The plan is
+operation metadata and is never persisted in the manifest.
 
-The supported Joey profile declares:
+The supported count contract is exact:
+
+| Physical records | Result |
+|---:|---|
+| Below 1115 | Reject as an unsupported Joey topology |
+| 1115 | Preserve the executable byte-for-byte |
+| 1116..4095 | Install the Step 8 extended runtime |
+| Above 4095 | Reject without truncating card data |
+
+At most 4094 cards occupy active slots `1..4094`. Card IDs are `0..4094`
+(`0x000..0xFFE`); `4095`/`0xFFF` remains the all-ones 12-bit invalid value and
+is never an active slot or Card ID. At the maximum, the exclusive bound is
+`0xFFF` and the active state ends at `0x00C25FFE`.
+
+Extended counts require the exact supported stock executable:
 
 | Field | Value |
 |---|---:|
-| Legacy record count | 1115 |
-| First patched record count | 1116 |
-| Maximum safe record count | 2166 |
-| State base | `0x00A53CCC` |
-| First known following data | `0x00A54DB8` |
-| State record size | 2 bytes |
-| Snapshot stack overhead | `0x10` bytes |
+| Source size | 3,919,872 bytes / `0x3BD000` |
+| ImageBase | `0x00400000` |
+| Source sections | 8 |
 | Source SHA-256 | `c5749eb934a1cf68d9236e44ff81e98b8aaee486b4f8ebd417440505d44ac1ea` |
 
-The maximum follows from
-`(0x00A54DB8 - 0x00A53CCC) / 2 = 2166`. This is a static
-safe limit of this executable profile, not an editor or card-data format limit.
-Counts at or below 1115 return the source bytes unchanged and do not require the
-Joey hash. Counts from 1116 through 2166 require the exact source hash and all
-original instruction bytes. Count 2167 or greater fails before mutation and
-does not truncate any card table.
+The patch validates the DOS/PE32 headers, complete stock section layout, header
+slack, alignments, whole-file hash, and every complete source instruction or
+rewrite window before mutation. It installs two sections:
 
-The profile declares 21 integer sites and one conditional site:
+| Section | RVA | Virtual size | Raw data | Purpose |
+|---|---:|---:|---:|---|
+| `.ygst` | `0x824000` | `0x3000` | none | live state plus snapshot |
+| `.ygsx` | `0x827000` | `0x1000` | `0x1000` NOP-filled bytes appended at `0x3BD000` | helper code and alias table |
 
-| Derived value | File offsets |
+With ImageBase applied, `.ygst` maps 4096 two-byte state slots at
+`0x00C24000..0x00C25FFF` and a 4096-byte high-byte snapshot at
+`0x00C26000..0x00C26FFF`. `.ygsx` begins at `0x00C27000`. Before an optional
+icon update, the output has ten sections, `SizeOfImage=0x828000`, and size
+`0x3BE000`.
+
+The structural patch has these audited layers:
+
+- 69 direct state-reference relocations: 59 state-base, four high-byte-base,
+  five slot-1-base, and one structural-end reference;
+- two complete fixed snapshot-loop rewrites, independent of active count;
+- the `CARD_Prop` mask at `0x0040262E` changed from `0x7FF` to `0xFFF`;
+- save/load bridge hooks, direct 12-bit Card ID lookup, declarative helper
+  fragments, and 11 audited legacy-alias consumer patches;
+- exactly 17 count-dependent sites.
+
+The supported stock snapshot windows are complete instruction ranges. Copy is
+rewritten at `0x0047DCEA..0x0047DCFF`, with the successor at `0x0047DD00`;
+restore is rewritten at `0x0047DD71..0x0047DD8F`, with the successor at
+`0x0047DD90`.
+
+The 17 dynamic sites are:
+
+| Derived value | Virtual addresses |
 |---|---|
-| `maximum_internal_id` | `0x2315`, `0x6E5C7`, `0x6E5CE`, `0x76339`, `0x76340` |
-| `exclusive_upper_bound` | `0x3A9B2`, `0x3AA9D`, `0x45703`, `0x6E5B3`, `0x76327`, `0x7DBFD` |
-| `state_end_address` | `0x63F18`, `0x63F8B`, `0x7DA75`, `0x7DC7D`, `0x1BED0D`, `0x1BEE16` |
-| `snapshot_stack_size` | `0x7DCE0`, `0x7DDAB` |
-| `snapshot_dword_count` | `0x7DCEA` |
-| `state_byte_count` | `0x7DD89` |
-| conditional final WORD | `0x7DCFE` |
+| `maximum_active_slot` | `0x00402315`, `0x0046E5C7`, `0x0046E5CE`, `0x00476339`, `0x00476340` |
+| `exclusive_upper_bound` | `0x0043A9B2`, `0x0043AA9D`, `0x00445703`, `0x0047DBFD`, `0x0046E5B3`, `0x00476327` |
+| `active_state_end` | `0x00463F18`, `0x00463F8B`, `0x0047DA75`, `0x0047DC7D`, `0x005BED0D`, `0x005BEE16` |
 
-Each integer entry stores the full expected original instruction, immediate
-offset and width, derived-value name, and description. Pack validates the full
-instruction, then replaces only its unsigned little-endian immediate. The
-conditional site is original `66 A5` (`MOVSW`): odd record counts retain it,
-while even record counts use `90 90` so the DWORD copy does not copy two extra
-bytes. Snapshot stack prologue and epilogue always use the same generated size.
-
-For the current one-card regression:
+The direct lookup accepts IDs through `0xFFE`, rejects `0xFFF` and above, and
+indexes `CARD_IntID` directly. Only these stock aliases canonicalize at the 11
+audited consumers:
 
 ```text
-card_record_count = 1116
-maximum_internal_id = 1115
-state_byte_count = 0x8B8
-state_end_address = 0x00A54584
-snapshot_dword_count = 0x22E
-snapshot_has_tail_word = false
-snapshot_stack_size = 0x8C8
+2000->0  2014->14  2034->34  2037->37  2040->40
+2063->63  2068->68  2387->387  2389->389
 ```
 
-The known output SHA-256 is
-`cd04132ea2915e186fa7c4d67f7db73fe9fdb784fc0c95c7ab5b96733d3da699`,
-with 20 changed bytes. A declared patch site may legitimately produce bytes
-identical to the original; for count 1116 this occurs at the getter and both
-stack-size sites, which are still validated. Known hashes are regression checks
-for selected counts, not the list of supported counts.
+These nine IDs remain valid existing Card IDs, but a currently free alias is
+not assigned to an unrelated new card. ID 4093 is ordinary and is not reserved.
+Other occurrences of the literal 2000 are not capacity patches.
 
-Patch formulas and the one-card binary output are **Statically verified**.
-One-card Windows runtime behavior is **Not yet dynamically verified**. Counts
-above 1116 are **Formula-driven but not runtime verified**. The maximum 2166 is
-**Inferred from the next known global address**.
+The compatibility bridge copies relocated slots `0..2047` to the original
+legacy state block before the checksum/write routine and copies them back after
+load. Slots `2048..4094` are intentionally not persisted by `system.dat`.
+
+Historical experimental builds runtime-verified the Step 8 bridge, lookup, and
+4094-card architecture semantics. The production helper fragments were newly
+assembled against complete stock instructions and are covered by static byte,
+disassembly, PE-layout, and invariant tests; they are not claimed to be a
+byte-identical retained experimental artifact. Native Windows icon updates are
+followed by the same structural verifier because an icon changes the whole-file
+hash. Actual gameplay/runtime verification of the production-packed executable
+remains manual.
 
 ## `KCEJYUGI` container
 
@@ -550,10 +568,12 @@ dlg_indx<language>[index] = dialog byte offset
 card_sort<language>[index] = localized name rank
 ```
 
-The active card count is the number of two-byte records in `card_id.bin`.
-`card_intid.bin` has the complete dynamically generated power-of-two length.
-`card_sort<language>.bin` instead uses the next power of two containing the
-active card count. Their physical lengths do not define the active card count.
+The physical card record count is the number of two-byte records in
+`card_id.bin`. Slot zero is the dummy, so a valid Joey project's active card
+count is one less than that row count. `card_intid.bin` has the complete
+dynamically generated power-of-two length. `card_sort<language>.bin` instead
+uses the next power of two containing the physical Card ID row count. Their
+physical lengths do not define the source record count.
 
 ## Structured card subfiles
 
@@ -573,6 +593,11 @@ size must be divisible by two. `FF FF` represents `-1`, the card-back ID:
 FF FF -> -1
 -1 -> FF FF
 ```
+
+The signed-16-bit file format is generic. The supported Joey Pack policy is
+narrower: row zero must be `-1`; rows `1..N-1` must contain unique integer Card
+IDs in `0..4094`; and no active row may be negative or use the reserved value
+`4095`/`0xFFF`.
 
 ### `card_intid.bin`
 
@@ -604,6 +629,10 @@ Generating a longer `card_intid.bin` establishes only the editor's data output
 behavior. The supported Joey executable uses the independent, SHA-identified
 Pack profile above; this does not imply compatibility for other executables and
 does not change the `card_intid.bin` format.
+
+For the Step 8 boundary, Card ID `4094` produces a 4096-record reverse lookup,
+and `card_intid[4094]` contains that card's high slot. This is a Joey runtime
+namespace check, not a new fixed cap in the reusable generator.
 
 ### `card_pack.bin`
 
@@ -794,9 +823,9 @@ continues to validate every generated offset value.
 
 The 2048-record band preserves the complete legacy sequence and its 8192-byte
 encoding. Larger power-of-two bands describe DATA-side representability only.
-They do not change the separate executable capacity profile: the supported Joey
-profile still rejects card counts above 2166, and generated DATA alone does not
-establish Windows runtime compatibility for expanded card counts.
+They do not change the separate executable policy: the Step 8 profile permits
+at most 4095 physical card records and Card IDs through `0xFFE`, and generated
+DATA alone does not establish Windows runtime compatibility.
 
 The dependency is:
 
@@ -1201,9 +1230,14 @@ Packing applies these checks:
 - `card_sort<language>.bin` count equals the next power of two containing the
   `card_id.bin` row count;
 - card property values are representable;
-- a project executable has a `card_ids` logical table; its Pack metadata count
-  is within the selected profile, and any required source/output hashes and all
-  declared original instruction regions match;
+- the physical `card_ids` table passes Joey topology checks before large
+  container reconstruction: 1115..4095 rows, dummy `-1` at row zero, unique
+  active integer IDs in `0..4094`, and no other negative value;
+- an extended project has exactly one supported executable resource, whose
+  preflight validates the stock hash, PE layout, complete source regions, and
+  derived capacity plan before Pack staging begins;
+- the staged extended executable passes section, helper, fixed-patch, and all
+  17 dynamic-site checks both before and after any native Windows icon update;
 - output entry order and paths follow manifest metadata;
 - output offsets and sizes are recalculated;
 - container compression follows the requested policy.

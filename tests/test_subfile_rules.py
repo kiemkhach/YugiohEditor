@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import inspect
 import multiprocessing
 import queue
@@ -454,222 +455,496 @@ class SubfileRuleConfigTests(unittest.TestCase):
 
         profile = step["params"]["profile"]
         self.assertEqual(
+            set(profile),
             {
-                key: profile[key]
-                for key in (
-                    "legacy_card_record_count",
-                    "minimum_patched_record_count",
-                    "maximum_card_record_count",
-                    "state_base_address",
-                    "state_limit_address",
-                    "state_record_size",
-                    "snapshot_stack_overhead",
-                )
-            },
-            {
-                "legacy_card_record_count": 1115,
-                "minimum_patched_record_count": 1116,
-                "maximum_card_record_count": 2166,
-                "state_base_address": 0x00A53CCC,
-                "state_limit_address": 0x00A54DB8,
-                "state_record_size": 2,
-                "snapshot_stack_overhead": 0x10,
+                "source",
+                "record_counts",
+                "runtime_layout",
+                "pe_sections",
+                "pe_header_updates",
+                "state_relocation_groups",
+                "snapshot_patches",
+                "fixed_patch_sites",
+                "hooks",
+                "helper_fragments",
+                "helper_section_sha256",
+                "alias_consumer_patches",
+                "dynamic_patch_sites",
+                "legacy_aliases",
+                "invariant_sites",
+                "known_false_matches",
             },
         )
         self.assertEqual(
-            profile["source_sha256"],
+            profile["record_counts"],
+            {
+                "legacy": 1115,
+                "minimum_extended": 1116,
+                "maximum": 0x0FFF,
+            },
+        )
+        self.assertEqual(
+            profile["source"]["sha256"],
             "c5749eb934a1cf68d9236e44ff81e98b8aaee486b4f8ebd417440505d44ac1ea",
         )
+        self.assertEqual(profile["source"]["size"], 0x3BD000)
+        self.assertNotIn("known_output_sha256", profile)
+        serialized = str(profile)
+        self.assertNotIn("maximum_card_record_count", serialized)
+        self.assertNotIn("state_limit_address", serialized)
+        self.assertNotIn("snapshot_stack", serialized)
+        self.assertNotIn("snapshot_dword_count", serialized)
+        self.assertNotIn("conditional_patch_sites", serialized)
         self.assertEqual(
-            profile["known_output_sha256"],
+            profile["runtime_layout"],
             {
-                1116: (
-                    "cd04132ea2915e186fa7c4d67f7db73fe9fdb784fc0c95c7ab5b96733d3da699"
-                )
+                "state_base": 0x00C24000,
+                "state_record_size": 2,
+                "state_word_capacity": 0x1000,
+                "state_structural_end": 0x00C26000,
+                "snapshot_base": 0x00C26000,
+                "snapshot_byte_capacity": 0x1000,
+                "snapshot_end": 0x00C27000,
+                "helper_base": 0x00C27000,
+                "helper_size": 0x1000,
+                "legacy_persistent_slot_count": 0x800,
+                "legacy_bridge_byte_count": 0x1000,
+                "maximum_active_slot": 0x0FFE,
+                "invalid_slot": 0x0FFF,
+                "maximum_card_id": 0x0FFE,
+                "invalid_card_id": 0x0FFF,
             },
         )
-        integer_sites = profile["integer_patch_sites"]
-        conditional_sites = profile["conditional_patch_sites"]
-        self.assertEqual(len(integer_sites), 21)
-        self.assertEqual(len(conditional_sites), 1)
+
+        pe = profile["source"]["pe"]
         self.assertEqual(
-            Counter(site["value_name"] for site in integer_sites),
             {
-                "maximum_internal_id": 5,
+                key: pe[key]
+                for key in (
+                    "pe_offset",
+                    "machine",
+                    "optional_header_size",
+                    "optional_header_magic",
+                    "image_base",
+                    "section_alignment",
+                    "file_alignment",
+                    "number_of_sections",
+                    "size_of_code",
+                    "size_of_initialized_data",
+                    "size_of_uninitialized_data",
+                    "size_of_image",
+                    "size_of_headers",
+                    "section_table_offset",
+                    "section_table_end",
+                    "zero_header_slack_size",
+                )
+            },
+            {
+                "pe_offset": 0x900,
+                "machine": 0x014C,
+                "optional_header_size": 0xE0,
+                "optional_header_magic": 0x010B,
+                "image_base": 0x00400000,
+                "section_alignment": 0x1000,
+                "file_alignment": 0x1000,
+                "number_of_sections": 8,
+                "size_of_code": 0x29D000,
+                "size_of_initialized_data": 0x11E000,
+                "size_of_uninitialized_data": 0,
+                "size_of_image": 0x824000,
+                "size_of_headers": 0x1000,
+                "section_table_offset": 0x9F8,
+                "section_table_end": 0xB38,
+                "zero_header_slack_size": 0x4C8,
+            },
+        )
+        self.assertEqual(pe["dos_magic"], b"MZ")
+        self.assertEqual(pe["signature"], b"PE\x00\x00")
+        self.assertEqual(
+            [
+                (
+                    section["name"],
+                    section["virtual_size"],
+                    section["virtual_address"],
+                    section["raw_size"],
+                    section["raw_pointer"],
+                    section["characteristics"],
+                )
+                for section in pe["sections"]
+            ],
+            [
+                (".text", 0x1D9000, 0x1000, 0x1D9000, 0x1000, 0x60000020),
+                (".rdata", 0x102DC, 0x1DA000, 0x11000, 0x1DA000, 0xC0000040),
+                (".data", 0x46E950, 0x1EB000, 0x8000, 0x1EB000, 0xC0000040),
+                (".ksss", 0xC4000, 0x65A000, 0xC4000, 0x1F3000, 0x60000020),
+                (".ycnett", 0xFE04C, 0x71E000, 0xFF000, 0x2B7000, 0xC0000040),
+                (".idata", 0x1BDA, 0x81D000, 0x2000, 0x3B6000, 0x40000040),
+                (".rsrc", 0x3660, 0x81F000, 0x4000, 0x3B8000, 0x40000040),
+                (".$$$", 0x1000, 0x823000, 0x1000, 0x3BC000, 0xE0000060),
+            ],
+        )
+        self.assertEqual(
+            profile["pe_sections"],
+            (
+                {
+                    "name": ".ygst",
+                    "virtual_size": 0x3000,
+                    "virtual_address": 0x824000,
+                    "raw_size": 0,
+                    "raw_pointer": 0,
+                    "characteristics": 0xC0000080,
+                },
+                {
+                    "name": ".ygsx",
+                    "virtual_size": 0x1000,
+                    "virtual_address": 0x827000,
+                    "raw_size": 0x1000,
+                    "raw_pointer": 0x3BD000,
+                    "characteristics": 0x60000020,
+                    "fill_byte": 0x90,
+                },
+            ),
+        )
+        self.assertEqual(
+            profile["pe_header_updates"],
+            {
+                "number_of_sections": 10,
+                "size_of_code": 0x29E000,
+                "size_of_uninitialized_data": 0x3000,
+                "size_of_image": 0x828000,
+                "output_size_before_icon": 0x3BE000,
+            },
+        )
+
+        relocation_groups = profile["state_relocation_groups"]
+        self.assertEqual(
+            Counter(group["value_name"] for group in relocation_groups),
+            {
+                "state_base": 1,
+                "state_high_byte_base": 1,
+                "state_slot1_base": 1,
+                "state_structural_end": 1,
+            },
+        )
+        self.assertEqual(
+            {group["value_name"]: len(group["sites"]) for group in relocation_groups},
+            {
+                "state_base": 59,
+                "state_high_byte_base": 4,
+                "state_slot1_base": 5,
+                "state_structural_end": 1,
+            },
+        )
+        self.assertEqual(
+            sum(len(group["sites"]) for group in relocation_groups),
+            69,
+        )
+        for group in relocation_groups:
+            source_bytes = group["source_value"].to_bytes(
+                group["value_width"],
+                "little",
+            )
+            for site in group["sites"]:
+                start = site["value_offset"]
+                self.assertEqual(
+                    site["expected"][start : start + group["value_width"]],
+                    source_bytes,
+                )
+        relocation_digest = hashlib.sha256()
+        for group in relocation_groups:
+            relocation_digest.update(group["value_name"].encode("ascii"))
+            relocation_digest.update(group["source_value"].to_bytes(4, "little"))
+            relocation_digest.update(group["replacement"].to_bytes(4, "little"))
+            for site in group["sites"]:
+                relocation_digest.update(site["va"].to_bytes(4, "little"))
+                relocation_digest.update(bytes((site["value_offset"],)))
+                relocation_digest.update(bytes((len(site["expected"]),)))
+                relocation_digest.update(site["expected"])
+        self.assertEqual(
+            relocation_digest.hexdigest(),
+            "8eef01a73a912cd9d55724df3ab7bb7cfabbeedff75e32d0971e7ab9fa94d511",
+        )
+        state_base_sites = relocation_groups[0]["sites"]
+        self.assertEqual(
+            next(site for site in state_base_sites if site["va"] == 0x00469F43)[
+                "expected"
+            ],
+            bytes.fromhex("66 85 1C 4D CC 3C A5 00"),
+        )
+        self.assertEqual(
+            next(site for site in state_base_sites if site["va"] == 0x005BE202)[
+                "expected"
+            ],
+            bytes.fromhex("66 8B 04 4D CC 3C A5 00"),
+        )
+        high_byte_sites = relocation_groups[1]["sites"]
+        self.assertEqual(
+            next(site for site in high_byte_sites if site["va"] == 0x004693D1)[
+                "expected"
+            ],
+            bytes.fromhex("80 0C 45 CD 3C A5 00 40"),
+        )
+        self.assertEqual(
+            next(site for site in high_byte_sites if site["va"] == 0x0047EB07)[
+                "expected"
+            ],
+            bytes.fromhex("F6 04 4D CD 3C A5 00 40"),
+        )
+
+        snapshot_patches = profile["snapshot_patches"]
+        self.assertEqual(
+            [
+                (site["va"], len(site["expected"]), site["successor_va"])
+                for site in snapshot_patches
+            ],
+            [
+                (0x0047DCEA, 22, 0x0047DD00),
+                (0x0047DD71, 31, 0x0047DD90),
+            ],
+        )
+        self.assertTrue(
+            all(
+                len(site["expected"]) == len(site["replacement"])
+                for site in snapshot_patches
+            )
+        )
+
+        self.assertEqual(
+            profile["fixed_patch_sites"],
+            (
+                {
+                    "name": "card_prop_slot_mask",
+                    "va": 0x0040262E,
+                    "expected": bytes.fromhex("81 E1 FF 07 00 00"),
+                    "replacement": bytes.fromhex("81 E1 FF 0F 00 00"),
+                },
+            ),
+        )
+
+        hooks = profile["hooks"]
+        self.assertEqual(
+            [
+                (
+                    hook["name"],
+                    hook["va"],
+                    len(hook["expected"]),
+                    hook["helper_va"],
+                    hook.get("return_va"),
+                )
+                for hook in hooks
+            ],
+            [
+                (
+                    "legacy_save_bridge",
+                    0x00483150,
+                    7,
+                    0x00C27000,
+                    0x00483157,
+                ),
+                (
+                    "legacy_load_bridge",
+                    0x004833CF,
+                    6,
+                    0x00C27030,
+                    0x004833D5,
+                ),
+                (
+                    "direct_card_id_lookup",
+                    0x00402490,
+                    5,
+                    0x00C27100,
+                    None,
+                ),
+            ],
+        )
+        for hook in hooks:
+            self.assertEqual(len(hook["expected"]), len(hook["replacement"]))
+            self.assertEqual(hook["replacement"][0], 0xE9)
+            relative = int.from_bytes(
+                hook["replacement"][1:5],
+                "little",
+                signed=True,
+            )
+            self.assertEqual(hook["va"] + 5 + relative, hook["helper_va"])
+
+        helper_fragments = profile["helper_fragments"]
+        self.assertEqual(
+            [
+                (fragment["name"], fragment["offset"], len(fragment["bytes"]))
+                for fragment in helper_fragments
+            ],
+            [
+                ("legacy_save_bridge", 0x000, 39),
+                ("legacy_load_bridge", 0x030, 33),
+                ("direct_card_id_lookup", 0x100, 41),
+                ("canonicalize_legacy_alias", 0x129, 39),
+                ("canonicalize_esi_wrapper", 0x150, 13),
+                ("canonicalize_edi_wrapper", 0x15D, 13),
+                ("canonicalize_ecx_wrapper", 0x16A, 14),
+                ("legacy_alias_table", 0x178, 18),
+            ],
+        )
+        helper_data = bytearray([0x90]) * profile["runtime_layout"]["helper_size"]
+        previous_end = 0
+        for fragment in helper_fragments:
+            start = fragment["offset"]
+            end = start + len(fragment["bytes"])
+            self.assertGreaterEqual(start, previous_end)
+            self.assertLessEqual(end, len(helper_data))
+            self.assertEqual(
+                fragment["va"],
+                profile["runtime_layout"]["helper_base"] + start,
+            )
+            helper_data[start:end] = fragment["bytes"]
+            previous_end = end
+        self.assertEqual(
+            hashlib.sha256(helper_data).hexdigest(),
+            profile["helper_section_sha256"],
+        )
+
+        alias_consumers = profile["alias_consumer_patches"]
+        self.assertEqual(
+            [(site["va"], len(site["expected"])) for site in alias_consumers],
+            [
+                (0x005674FA, 13),
+                (0x00567507, 11),
+                (0x005918CD, 11),
+                (0x005919BD, 11),
+                (0x00591A8A, 41),
+                (0x00591B37, 41),
+                (0x00591D48, 13),
+                (0x00592083, 12),
+                (0x0059208F, 14),
+                (0x00592113, 12),
+                (0x0059211F, 14),
+            ],
+        )
+        self.assertTrue(
+            all(
+                len(site["expected"]) == len(site["replacement"])
+                for site in alias_consumers
+            )
+        )
+        for site in alias_consumers:
+            call_offsets = (0, 9) if len(site["call_targets"]) == 2 else (0,)
+            self.assertEqual(len(call_offsets), len(site["call_targets"]))
+            for call_offset, target in zip(
+                call_offsets,
+                site["call_targets"],
+                strict=True,
+            ):
+                self.assertEqual(site["replacement"][call_offset], 0xE8)
+                relative = int.from_bytes(
+                    site["replacement"][call_offset + 1 : call_offset + 5],
+                    "little",
+                    signed=True,
+                )
+                self.assertEqual(
+                    site["va"] + call_offset + 5 + relative,
+                    target,
+                )
+        self.assertEqual(
+            [
+                (site["equal_target_va"], site["unequal_target_va"])
+                for site in alias_consumers
+                if site["name"].startswith("relation_block_")
+            ],
+            [
+                (0x00591AB3, 0x00591ACB),
+                (0x00591B60, 0x00591B78),
+            ],
+        )
+        dynamic_sites = profile["dynamic_patch_sites"]
+        self.assertEqual(len(dynamic_sites), 17)
+        self.assertEqual(
+            Counter(site["value_name"] for site in dynamic_sites),
+            {
+                "maximum_active_slot": 5,
                 "exclusive_upper_bound": 6,
-                "state_end_address": 6,
-                "snapshot_stack_size": 2,
-                "snapshot_dword_count": 1,
-                "state_byte_count": 1,
+                "active_state_end_address": 6,
             },
         )
         self.assertEqual(
+            {
+                value_name: {
+                    site["va"]
+                    for site in dynamic_sites
+                    if site["value_name"] == value_name
+                }
+                for value_name in {
+                    "maximum_active_slot",
+                    "exclusive_upper_bound",
+                    "active_state_end_address",
+                }
+            },
+            {
+                "maximum_active_slot": {
+                    0x00402315,
+                    0x0046E5C7,
+                    0x0046E5CE,
+                    0x00476339,
+                    0x00476340,
+                },
+                "exclusive_upper_bound": {
+                    0x0043A9B2,
+                    0x0043AA9D,
+                    0x00445703,
+                    0x0047DBFD,
+                    0x0046E5B3,
+                    0x00476327,
+                },
+                "active_state_end_address": {
+                    0x00463F18,
+                    0x00463F8B,
+                    0x0047DA75,
+                    0x0047DC7D,
+                    0x005BED0D,
+                    0x005BEE16,
+                },
+            },
+        )
+        for site in dynamic_sites:
+            self.assertLessEqual(
+                site["value_offset"] + site["value_width"],
+                len(site["expected"]),
+            )
+        self.assertEqual(
+            profile["legacy_aliases"],
+            {
+                2000: 0,
+                2014: 14,
+                2034: 34,
+                2037: 37,
+                2040: 40,
+                2063: 63,
+                2068: 68,
+                2387: 387,
+                2389: 389,
+            },
+        )
+        alias_table = next(
+            fragment["bytes"]
+            for fragment in helper_fragments
+            if fragment["name"] == "legacy_alias_table"
+        )
+        self.assertEqual(
+            tuple(
+                int.from_bytes(alias_table[offset : offset + 2], "little")
+                for offset in range(0, len(alias_table), 2)
+            ),
+            tuple(profile["legacy_aliases"]),
+        )
+        self.assertEqual(
+            [(site["va"], site["expected"]) for site in profile["invariant_sites"]],
             [
-                (
-                    site["offset"],
-                    site["expected"],
-                    site["value_offset"],
-                    site["value_width"],
-                    site["value_name"],
-                )
-                for site in integer_sites
-            ],
-            [
-                (
-                    0x2315,
-                    b"\x66\x81\xfe\x5b\x04",
-                    3,
-                    2,
-                    "maximum_internal_id",
-                ),
-                (
-                    0x3A9B2,
-                    b"\x81\xfe\x5b\x04\x00\x00",
-                    2,
-                    4,
-                    "exclusive_upper_bound",
-                ),
-                (
-                    0x3AA9D,
-                    b"\x81\xfb\x5b\x04\x00\x00",
-                    2,
-                    4,
-                    "exclusive_upper_bound",
-                ),
-                (
-                    0x45703,
-                    b"\x81\xfe\x5b\x04\x00\x00",
-                    2,
-                    4,
-                    "exclusive_upper_bound",
-                ),
-                (
-                    0x6E5B3,
-                    b"\x3d\x5b\x04\x00\x00",
-                    1,
-                    4,
-                    "exclusive_upper_bound",
-                ),
-                (
-                    0x76327,
-                    b"\x3d\x5b\x04\x00\x00",
-                    1,
-                    4,
-                    "exclusive_upper_bound",
-                ),
-                (
-                    0x7DBFD,
-                    b"\x81\xff\x5b\x04\x00\x00",
-                    2,
-                    4,
-                    "exclusive_upper_bound",
-                ),
-                (
-                    0x6E5C7,
-                    b"\x3d\x5a\x04\x00\x00",
-                    1,
-                    4,
-                    "maximum_internal_id",
-                ),
-                (
-                    0x6E5CE,
-                    b"\xb8\x5a\x04\x00\x00",
-                    1,
-                    4,
-                    "maximum_internal_id",
-                ),
-                (
-                    0x76339,
-                    b"\x3d\x5a\x04\x00\x00",
-                    1,
-                    4,
-                    "maximum_internal_id",
-                ),
-                (
-                    0x76340,
-                    b"\xb8\x5a\x04\x00\x00",
-                    1,
-                    4,
-                    "maximum_internal_id",
-                ),
-                (
-                    0x63F18,
-                    b"\x3d\x82\x45\xa5\x00",
-                    1,
-                    4,
-                    "state_end_address",
-                ),
-                (
-                    0x63F8B,
-                    b"\x81\xfe\x82\x45\xa5\x00",
-                    2,
-                    4,
-                    "state_end_address",
-                ),
-                (
-                    0x7DA75,
-                    b"\x81\xfe\x82\x45\xa5\x00",
-                    2,
-                    4,
-                    "state_end_address",
-                ),
-                (
-                    0x7DC7D,
-                    b"\x81\xff\x82\x45\xa5\x00",
-                    2,
-                    4,
-                    "state_end_address",
-                ),
-                (
-                    0x1BED0D,
-                    b"\x3d\x82\x45\xa5\x00",
-                    1,
-                    4,
-                    "state_end_address",
-                ),
-                (
-                    0x1BEE16,
-                    b"\x81\xfe\x82\x45\xa5\x00",
-                    2,
-                    4,
-                    "state_end_address",
-                ),
-                (
-                    0x7DCE0,
-                    b"\x81\xec\xc8\x08\x00\x00",
-                    2,
-                    4,
-                    "snapshot_stack_size",
-                ),
-                (
-                    0x7DDAB,
-                    b"\x81\xc4\xc8\x08\x00\x00",
-                    2,
-                    4,
-                    "snapshot_stack_size",
-                ),
-                (
-                    0x7DCEA,
-                    b"\xb9\x2d\x02\x00\x00",
-                    1,
-                    4,
-                    "snapshot_dword_count",
-                ),
-                (
-                    0x7DD89,
-                    b"\x3d\xb6\x08\x00\x00",
-                    1,
-                    4,
-                    "state_byte_count",
-                ),
+                (0x005B91D7, bytes.fromhex("25 FF 0F 00 00")),
+                (0x005B9214, bytes.fromhex("25 FF 0F 00 00")),
             ],
         )
-        self.assertEqual(conditional_sites[0]["offset"], 0x7DCFE)
-        self.assertEqual(conditional_sites[0]["expected"], b"\x66\xa5")
-        self.assertEqual(conditional_sites[0]["odd_record_bytes"], b"\x66\xa5")
-        self.assertEqual(conditional_sites[0]["even_record_bytes"], b"\x90\x90")
-        self.assertTrue(all(site["description"].strip() for site in integer_sites))
-        self.assertTrue(all(site["description"].strip() for site in conditional_sites))
+        self.assertEqual(
+            {site["va"] for site in profile["known_false_matches"]},
+            {0x00AF17E1, 0x00AF317E, 0x00AFF1E7, 0x00B037CC},
+        )
 
         repository = GameRepository.from_root(".")
         for name in (
@@ -691,9 +966,9 @@ class SubfileRuleConfigTests(unittest.TestCase):
         rule = repository.find_rule("mai_pc.exe")
         frozen_profile = rule.pre_encode[0].params["profile"]
         with self.assertRaises(TypeError):
-            frozen_profile["maximum_card_record_count"] = 9999
+            frozen_profile["record_counts"]["maximum"] = 9999
         with self.assertRaises(TypeError):
-            frozen_profile["integer_patch_sites"][0]["offset"] = -1
+            frozen_profile["dynamic_patch_sites"][0]["va"] = -1
 
         observed_profiles = []
         observed_offsets_before_mutation = []
@@ -701,12 +976,12 @@ class SubfileRuleConfigTests(unittest.TestCase):
 
         def probe(value, *, context, profile):
             observed_profiles.append(profile)
-            self.assertIsInstance(profile["integer_patch_sites"], list)
+            self.assertIsInstance(profile["dynamic_patch_sites"], list)
             observed_offsets_before_mutation.append(
-                profile["integer_patch_sites"][0]["offset"]
+                profile["dynamic_patch_sites"][0]["va"]
             )
             observed_context_states.append(context.metadata.get("mutated"))
-            profile["integer_patch_sites"][0]["offset"] = -1
+            profile["dynamic_patch_sites"][0]["va"] = -1
             context.metadata["mutated"] = True
             return value
 
@@ -734,13 +1009,13 @@ class SubfileRuleConfigTests(unittest.TestCase):
 
         self.assertIsNot(observed_profiles[0], observed_profiles[1])
         self.assertIsNot(
-            observed_profiles[0]["integer_patch_sites"],
-            observed_profiles[1]["integer_patch_sites"],
+            observed_profiles[0]["dynamic_patch_sites"],
+            observed_profiles[1]["dynamic_patch_sites"],
         )
-        self.assertEqual(observed_offsets_before_mutation, [0x2315, 0x2315])
+        self.assertEqual(observed_offsets_before_mutation, [0x00402315, 0x00402315])
         self.assertEqual(observed_context_states, [None, None])
         self.assertNotEqual(
-            frozen_profile["integer_patch_sites"][0]["offset"],
+            frozen_profile["dynamic_patch_sites"][0]["va"],
             -1,
         )
         self.assertIsNot(contexts[0].metadata, contexts[1].metadata)
@@ -1190,6 +1465,26 @@ class RulePipelineTests(unittest.TestCase):
         duplicate = repository.generate_reverse_lookup([0, 5, 0], context=context)
         self.assertEqual(duplicate[0], 2)
         self.assertEqual(duplicate[5], 1)
+
+    def test_reverse_lookup_maps_maximum_joey_id_without_policy_capping(self):
+        repository = GameRepository.from_root(".")
+        rule = repository.find_rule("card_intid.bin")
+        context = RuleProcessingContext(
+            repository=repository,
+            rule=rule,
+            relative_path="bin#/card_intid.bin",
+            language=None,
+            decode_params=dict(rule.decode_params),
+            encode_params=dict(rule.encode_params),
+            metadata={},
+        )
+        card_ids = [-1, *range(4093), 4094]
+
+        reverse = repository.generate_reverse_lookup(card_ids, context=context)
+
+        self.assertEqual(len(reverse), 4096)
+        self.assertEqual(reverse[4094], 4094)
+        self.assertEqual(reverse[4093], 0)
 
     def test_sort_indices_preserve_dummy_and_real_row_permutation(self):
         repository = GameRepository.from_root(".")

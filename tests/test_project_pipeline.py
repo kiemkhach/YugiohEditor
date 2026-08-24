@@ -4,7 +4,6 @@ import queue
 import tempfile
 import unittest
 from copy import deepcopy
-from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,8 +11,10 @@ import pandas as pd
 from PIL import Image
 
 from tests.pipeline_support import encode_description_resources
+from tests.step8_executable_support import controlled_stock
 from yugioh_editor.common import subfile_rules_config
-from yugioh_editor.common.errors import ProjectValidationError, RulePipelineError
+from yugioh_editor.common.errors import ProjectValidationError
+from yugioh_editor.common.joey_card_capacity import validate_joey_edit_topology
 from yugioh_editor.models.entities import (
     ContainerArchive,
     ContainerEntry,
@@ -43,22 +44,7 @@ def _pack_project_process(project_root: str, result_queue) -> None:
 class ProjectPipelineTests(unittest.TestCase):
     @staticmethod
     def _synthetic_executable_rule_config() -> tuple[bytes, dict, tuple[dict, ...]]:
-        profile = deepcopy(subfile_rules_config.EXECUTABLE_CARD_CAPACITY_PROFILE)
-        sites = (
-            *profile["integer_patch_sites"],
-            *profile["conditional_patch_sites"],
-        )
-        source_size = max(site["offset"] + len(site["expected"]) for site in sites)
-        source = bytearray(b"\xcc" * (source_size + 16))
-        for site in sites:
-            offset = site["offset"]
-            expected = site["expected"]
-            source[offset : offset + len(expected)] = expected
-        for site in profile["conditional_patch_sites"]:
-            source[site["offset"] - 2 : site["offset"]] = b"\xf3\xa5"
-        source_bytes = bytes(source)
-        profile["source_sha256"] = sha256(source_bytes).hexdigest()
-        profile["known_output_sha256"] = {}
+        source_bytes, profile = controlled_stock()
 
         configs = deepcopy(subfile_rules_config.SUBFILE_RULE_CONFIGS)
         executable_rule = next(
@@ -83,7 +69,7 @@ class ProjectPipelineTests(unittest.TestCase):
                         "bin#/card_id.bin",
                         data=GameRepository.encode_binary_resource(
                             "card_id.bin",
-                            pd.DataFrame({"value": [-1]}),
+                            pd.DataFrame({"value": [-1, *range(1114)]}),
                         ),
                         order=0,
                     ),
@@ -309,13 +295,15 @@ class ProjectPipelineTests(unittest.TestCase):
             project = ProjectRepository(manifest)
             project.save_table(
                 "card_ids",
-                pd.DataFrame({"value": [-1, *range(1115)]}),
+                pd.DataFrame({"value": [-1, *range(1114), 4094]}),
             )
             observed_counts: list[int] = []
+            observed_plans: list[dict[str, int]] = []
             original_patch = GameRepository.patch_executable_card_capacity
 
             def observe_patch(value, *, context, profile):
                 observed_counts.append(context.metadata["card_record_count"])
+                observed_plans.append(dict(context.metadata["card_capacity_plan"]))
                 return original_patch(value, context=context, profile=profile)
 
             with patch.object(
@@ -327,42 +315,456 @@ class ProjectPipelineTests(unittest.TestCase):
                 first_packed = (first_output / "mai_pc.exe").read_bytes()
                 second_output = service.pack_project(manifest)
                 second_packed = (second_output / "mai_pc.exe").read_bytes()
+                project.save_table(
+                    "card_ids",
+                    pd.DataFrame({"value": [-1, *range(4093), 4094]}),
+                )
+                maximum_output = service.pack_project(manifest)
+                maximum_packed = (maximum_output / "mai_pc.exe").read_bytes()
 
-            self.assertEqual(observed_counts, [1116, 1116])
-            self.assertNotEqual(first_packed, source)
+            self.assertEqual(observed_counts, [1116] * 4 + [4095] * 2)
             self.assertEqual(
-                sum(before != after for before, after in zip(source, first_packed)),
-                20,
+                observed_plans,
+                [
+                    {
+                        "maximum_active_slot": 1115,
+                        "exclusive_upper_bound": 1116,
+                        "active_state_end_address": 0x00C248B8,
+                    }
+                ]
+                * 4
+                + [
+                    {
+                        "maximum_active_slot": 0x0FFE,
+                        "exclusive_upper_bound": 0x0FFF,
+                        "active_state_end_address": 0x00C25FFE,
+                    }
+                ]
+                * 2,
             )
+            self.assertNotEqual(first_packed, source)
             self.assertEqual(second_packed, first_packed)
+            self.assertNotEqual(maximum_packed, first_packed)
             self.assertEqual(workspace_executable.read_bytes(), source)
             self.assertEqual((game_path / "joey_pc.exe").read_bytes(), source)
-
-            derived = GameRepository._calculate_executable_card_capacity_values(
-                1116,
-                profile,
+            GameRepository.verify_executable_card_capacity(
+                first_packed,
+                card_record_count=1116,
+                profile=profile,
             )
-            for site in profile["integer_patch_sites"]:
-                expected = bytearray(site["expected"])
-                start = site["value_offset"]
-                width = site["value_width"]
-                expected[start : start + width] = int(
-                    derived[site["value_name"]]
-                ).to_bytes(width, "little")
-                offset = site["offset"]
+            GameRepository.verify_executable_card_capacity(
+                maximum_packed,
+                card_record_count=4095,
+                profile=profile,
+            )
+
+    def test_pack_preflight_rejects_invalid_card_topology_before_staging(self):
+        invalid_cases = (
+            (
+                "under stock count",
+                [-1, *range(1113)],
+                "fewer than 1115",
+            ),
+            (
+                "over maximum count",
+                [-1, *range(4095)],
+                "4095 total records",
+            ),
+            (
+                "invalid dummy",
+                [0, *range(1114)],
+                "dummy slot 0",
+            ),
+            (
+                "negative active ID",
+                [-1, -2, *range(1113)],
+                "outside the supported Joey range",
+            ),
+            (
+                "duplicate active ID",
+                [-1, 0, 0, *range(1, 1113)],
+                "duplicate active Card ID 0",
+            ),
+            (
+                "reserved active ID",
+                [-1, 4095, *range(1113)],
+                "4095 is reserved",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            service = ProjectService()
+            manifest = service.create_project(
+                "Invalid capacity",
+                root_path / "workspace",
+                game_path,
+                "mai",
+            )
+            bin_root = manifest.root / "bin"
+            bin_root.mkdir()
+            sentinel = bin_root / "previous.bin"
+            sentinel.write_bytes(b"PREVIOUS")
+            project = ProjectRepository(manifest)
+
+            for label, values, message in invalid_cases:
+                project.save_table("card_ids", pd.DataFrame({"value": values}))
+                with (
+                    self.subTest(case=label),
+                    patch.object(
+                        ProjectRepository,
+                        "begin_pack",
+                        autospec=True,
+                    ) as begin_pack,
+                    patch.object(
+                        ProjectService,
+                        "_reconstruct_container",
+                        autospec=True,
+                    ) as reconstruct,
+                    self.assertLogs(level="ERROR"),
+                    self.assertRaisesRegex(ProjectValidationError, message),
+                ):
+                    service.pack_project(manifest)
+                begin_pack.assert_not_called()
+                reconstruct.assert_not_called()
+                self.assertEqual(sentinel.read_bytes(), b"PREVIOUS")
                 self.assertEqual(
-                    first_packed[offset : offset + len(expected)],
-                    bytes(expected),
-                    site["description"],
+                    list(
+                        manifest.root.parent.glob(f".{manifest.root.name}.pack.*.tmp")
+                    ),
+                    [],
                 )
-            for site in profile["conditional_patch_sites"]:
-                offset = site["offset"]
-                self.assertEqual(first_packed[offset - 2 : offset], b"\xf3\xa5")
-                self.assertEqual(
-                    first_packed[offset : offset + len(site["expected"])],
-                    site["even_record_bytes"],
-                    site["description"],
+
+    def test_pack_preflight_rejects_extended_data_without_executable(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            service = ProjectService()
+            manifest = service.create_project(
+                "Missing executable",
+                root_path / "workspace",
+                game_path,
+                "mai",
+            )
+            ProjectRepository(manifest).save_table(
+                "card_ids",
+                pd.DataFrame({"value": [-1, *range(1115)]}),
+            )
+
+            with (
+                patch.object(
+                    ProjectRepository,
+                    "begin_pack",
+                    autospec=True,
+                ) as begin_pack,
+                patch.object(
+                    ProjectService,
+                    "_reconstruct_container",
+                    autospec=True,
+                ) as reconstruct,
+                self.assertLogs(level="ERROR"),
+                self.assertRaisesRegex(
+                    ProjectValidationError,
+                    "more than 1115.*supported Joey executable",
+                ),
+            ):
+                service.pack_project(manifest)
+
+            begin_pack.assert_not_called()
+            reconstruct.assert_not_called()
+
+    def test_pack_preflight_requires_exactly_one_manifest_executable_resource(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            game.write_executable("joey_pc.exe", b"MZ-stock")
+            service = ProjectService()
+            manifest = service.create_project(
+                "Missing executable resource",
+                root_path / "workspace",
+                game_path,
+                "mai",
+            )
+            manifest.files = [
+                record for record in manifest.files if record.file_kind != "exe"
+            ]
+
+            with (
+                patch.object(
+                    ProjectRepository,
+                    "begin_pack",
+                    autospec=True,
+                ) as begin_pack,
+                patch.object(
+                    ProjectService,
+                    "_reconstruct_container",
+                    autospec=True,
+                ) as reconstruct,
+                self.assertLogs(level="ERROR"),
+                self.assertRaisesRegex(
+                    ProjectValidationError,
+                    "Executable project data is missing or duplicated",
+                ),
+            ):
+                service.pack_project(manifest)
+
+            begin_pack.assert_not_called()
+            reconstruct.assert_not_called()
+
+    def test_pack_preflight_rejects_duplicate_manifest_executable_resources(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            game.write_executable("joey_pc.exe", b"MZ-stock")
+            service = ProjectService()
+            manifest = service.create_project(
+                "Duplicate executable resource",
+                root_path / "workspace",
+                game_path,
+                "mai",
+            )
+            executable_record = next(
+                record for record in manifest.files if record.file_kind == "exe"
+            )
+            duplicate_record = deepcopy(executable_record)
+            duplicate_record.relative_path = "duplicate_pc.exe"
+            duplicate_record.workspace_path = "mai/duplicate_pc.exe"
+            duplicate_record.order = 1
+            manifest.files.append(duplicate_record)
+
+            with (
+                patch.object(
+                    ProjectRepository,
+                    "begin_pack",
+                    autospec=True,
+                ) as begin_pack,
+                patch.object(
+                    ProjectService,
+                    "_reconstruct_container",
+                    autospec=True,
+                ) as reconstruct,
+                self.assertLogs(level="ERROR"),
+                self.assertRaisesRegex(
+                    ProjectValidationError,
+                    "Executable project data is missing or duplicated",
+                ),
+            ):
+                service.pack_project(manifest)
+
+            begin_pack.assert_not_called()
+            reconstruct.assert_not_called()
+
+    def test_pack_preflight_normalizes_missing_physical_card_ids(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            service = ProjectService()
+            manifest = service.create_project(
+                "Missing physical card IDs",
+                root_path / "workspace",
+                game_path,
+                "mai",
+            )
+            manifest.files = [
+                record
+                for record in manifest.files
+                if not record.relative_path.casefold().endswith("card_id.bin")
+            ]
+            records_by_source: dict[str, list[ProjectFileRecord]] = {}
+            for record in manifest.files:
+                records_by_source.setdefault(record.source_file.casefold(), []).append(
+                    record
                 )
+            for records in records_by_source.values():
+                for order, record in enumerate(
+                    sorted(records, key=lambda item: item.order)
+                ):
+                    record.order = order
+
+            with (
+                patch.object(
+                    ProjectRepository,
+                    "begin_pack",
+                    autospec=True,
+                ) as begin_pack,
+                patch.object(
+                    ProjectService,
+                    "_reconstruct_container",
+                    autospec=True,
+                ) as reconstruct,
+                self.assertLogs(level="ERROR"),
+                self.assertRaisesRegex(
+                    ProjectValidationError,
+                    "missing or has an invalid physical card_ids",
+                ),
+            ):
+                service.pack_project(manifest)
+
+            begin_pack.assert_not_called()
+            reconstruct.assert_not_called()
+
+    def test_pack_preflight_rejects_unsupported_extended_executable(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            game.write_executable("joey_pc.exe", b"MZ-unsupported")
+            service = ProjectService()
+            manifest = service.create_project(
+                "Unsupported executable",
+                root_path / "workspace",
+                game_path,
+                "mai",
+            )
+            ProjectRepository(manifest).save_table(
+                "card_ids",
+                pd.DataFrame({"value": [-1, *range(1115)]}),
+            )
+
+            with (
+                patch.object(
+                    ProjectRepository,
+                    "begin_pack",
+                    autospec=True,
+                ) as begin_pack,
+                patch.object(
+                    ProjectService,
+                    "_reconstruct_container",
+                    autospec=True,
+                ) as reconstruct,
+                self.assertLogs(level="ERROR"),
+                self.assertRaisesRegex(
+                    ProjectValidationError,
+                    "Unsupported executable source",
+                ),
+            ):
+                service.pack_project(manifest)
+
+            begin_pack.assert_not_called()
+            reconstruct.assert_not_called()
+            self.assertEqual(
+                (manifest.root / "mai" / "mai_pc.exe").read_bytes(),
+                b"MZ-unsupported",
+            )
+            self.assertEqual(
+                (game_path / "joey_pc.exe").read_bytes(),
+                b"MZ-unsupported",
+            )
+
+    def test_pack_validates_configured_icon_before_staging(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            game.write_executable("joey_pc.exe", b"MZ-stock")
+            selected_icon = root_path / "selected.ico"
+            Image.new("RGBA", (32, 32), "red").save(
+                selected_icon,
+                format="ICO",
+            )
+            service = ProjectService()
+            manifest = service.create_project(
+                "Invalid Pack icon",
+                root_path / "workspace",
+                game_path,
+                "mai",
+                selected_icon,
+            )
+            (manifest.root / "project.ico").write_bytes(b"not-an-icon")
+
+            with (
+                patch.object(
+                    ProjectRepository,
+                    "begin_pack",
+                    autospec=True,
+                ) as begin_pack,
+                self.assertLogs(level="ERROR"),
+                self.assertRaisesRegex(ValueError, "ICO"),
+            ):
+                service.pack_project(manifest)
+
+            begin_pack.assert_not_called()
+
+    def test_post_icon_capacity_verification_failure_rolls_back_pack(self):
+        source, _profile, configs = self._synthetic_executable_rule_config()
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch(
+                "yugioh_editor.repositories.game.repository.SUBFILE_RULE_CONFIGS",
+                configs,
+            ),
+        ):
+            root_path = Path(root)
+            game_path = root_path / "game"
+            game = GameFolderConnection(game_path)
+            self._write_required_files(game)
+            game.write_executable("joey_pc.exe", source)
+            selected_icon = root_path / "selected.ico"
+            Image.new("RGBA", (32, 32), "blue").save(
+                selected_icon,
+                format="ICO",
+            )
+            service = ProjectService()
+            manifest = service.create_project(
+                "Verifier rollback",
+                root_path / "workspace",
+                game_path,
+                "mai",
+                selected_icon,
+            )
+            ProjectRepository(manifest).save_table(
+                "card_ids",
+                pd.DataFrame({"value": [-1, *range(1115)]}),
+            )
+            bin_root = manifest.root / "bin"
+            bin_root.mkdir()
+            sentinel = bin_root / "previous.bin"
+            sentinel.write_bytes(b"PREVIOUS")
+
+            with (
+                patch.object(
+                    GameFolderConnection,
+                    "update_executable_icon",
+                    autospec=True,
+                ) as update_icon,
+                patch.object(
+                    GameRepository,
+                    "verify_executable_card_capacity",
+                    side_effect=(
+                        None,
+                        None,
+                        OSError("controlled post-icon verification failure"),
+                    ),
+                ) as verify_capacity,
+                self.assertLogs(level="ERROR"),
+                self.assertRaisesRegex(OSError, "post-icon verification failure"),
+            ):
+                service.pack_project(manifest)
+
+            update_icon.assert_called_once()
+            self.assertEqual(verify_capacity.call_count, 3)
+            self.assertEqual(sentinel.read_bytes(), b"PREVIOUS")
+            self.assertEqual(
+                (manifest.root / "mai" / "mai_pc.exe").read_bytes(),
+                source,
+            )
+            self.assertEqual((game_path / "joey_pc.exe").read_bytes(), source)
+            self.assertEqual(
+                list(manifest.root.parent.glob(f".{manifest.root.name}.pack.*.tmp")),
+                [],
+            )
 
     def test_create_project_uses_exact_required_prefix(self):
         with tempfile.TemporaryDirectory() as root:
@@ -539,7 +941,7 @@ class ProjectPipelineTests(unittest.TestCase):
             game.write_executable("joey_pc.exe", b"MZ-rollback")
             card_ids = GameRepository.encode_binary_resource(
                 "card_id.bin",
-                pd.DataFrame({"value": [-1, 0, 1, 2068]}),
+                pd.DataFrame({"value": [-1, *range(1111), 2068, 2389, 4093]}),
             )
             game.write_container(
                 "data.dat",
@@ -616,7 +1018,7 @@ class ProjectPipelineTests(unittest.TestCase):
                         "patch_executable_card_capacity",
                         new=staticmethod(fail_executable_encode),
                     ),
-                    RulePipelineError,
+                    ProjectValidationError,
                 ),
             )
             for label, failure, expected_error in failures:
@@ -718,7 +1120,25 @@ class ProjectPipelineTests(unittest.TestCase):
                 "mai",
             )
 
-            saved_values = [-1, 0, 1, 100, 2000, 2040, 2047, 2048, 2068, 2389]
+            selected_values = [
+                -1,
+                0,
+                1,
+                100,
+                2000,
+                2040,
+                2047,
+                2048,
+                2068,
+                2389,
+            ]
+            filler = [
+                card_id for card_id in range(1114) if card_id not in selected_values
+            ]
+            saved_values = [
+                *selected_values,
+                *filler[: 1115 - len(selected_values)],
+            ]
             project = ProjectRepository(manifest)
             project.save_table(
                 "card_ids",
@@ -1211,7 +1631,13 @@ class ProjectPipelineTests(unittest.TestCase):
             self.assertEqual(exported, export_root.resolve())
             self.assertEqual(unrelated.read_text(encoding="utf-8"), "keep")
 
-            output = project_service.pack_project(reloaded)
+            # Preserve the deliberately tiny correlated card/image tables in this
+            # image/catalog test; strict Pack capacity has dedicated coverage.
+            with patch(
+                "yugioh_editor.services.project_service.analyze_joey_card_ids",
+                side_effect=validate_joey_edit_topology,
+            ):
+                output = project_service.pack_project(reloaded)
             packed = GameFolderConnection(output).read_container("Data.dat")
             packed_paths = [
                 item.relative_path.replace("\\", "/") for item in packed.entries

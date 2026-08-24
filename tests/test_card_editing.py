@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unicodedata
 import unittest
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from time import sleep
@@ -16,6 +17,7 @@ from tests.pipeline_support import decode_description_resource
 from tests.test_repository_tables import ProjectTableFixture
 from yugioh_editor.common import worker_limits
 from yugioh_editor.common.card_errors import (
+    CardCapacityError,
     CardImportError,
     CardPersistenceError,
     CardValidationError,
@@ -682,6 +684,119 @@ class CardEditingServiceTests(unittest.TestCase):
             )
             self.assertEqual(len(catalog), 3)
             self.assertEqual(catalog.iloc[-1]["image_name"], "token_sl.bmp")
+
+    def test_create_card_draft_allows_slot_4094_and_allocates_id_4093(self):
+        dummy = self.service.get_card_detail(self.manifest, 0)
+        card = self.service.get_card_detail(self.manifest, 1)
+        cards = [dummy]
+        cards.extend(
+            replace(card, card_index=index, card_id=index - 1)
+            for index in range(1, 4094)
+        )
+
+        with patch.object(self.service, "load_card_details", return_value=cards):
+            draft = self.service.create_card_draft(self.manifest)
+
+        self.assertEqual(draft.card_index, 4094)
+        self.assertEqual(draft.card_id, 4093)
+
+    def test_create_card_draft_rejects_full_or_missing_dummy_topology(self):
+        dummy = self.service.get_card_detail(self.manifest, 0)
+        card = self.service.get_card_detail(self.manifest, 1)
+        full_cards = [dummy]
+        full_cards.extend(
+            replace(card, card_index=index, card_id=index - 1)
+            for index in range(1, 4095)
+        )
+
+        with (
+            patch.object(
+                self.service,
+                "load_card_details",
+                return_value=full_cards,
+            ),
+            self.assertRaisesRegex(CardCapacityError, "4094 active cards"),
+        ):
+            self.service.create_card_draft(self.manifest)
+
+        with (
+            patch.object(self.service, "load_card_details", return_value=[]),
+            self.assertRaisesRegex(CardCapacityError, "dummy slot 0"),
+        ):
+            self.service.create_card_draft(self.manifest)
+
+    def test_new_card_rejects_protected_alias_before_staging(self):
+        draft = self.service.create_card_draft(self.manifest)
+        draft.card_id = 2000
+
+        errors = self.service.validate_card_draft(draft)
+        self.assertTrue(any("protected legacy alias" in error for error in errors))
+        with (
+            patch.object(self.repository, "begin_update") as begin_update,
+            self.assertRaisesRegex(CardValidationError, "protected legacy alias"),
+        ):
+            self.service.save_card_changes(self.manifest, [draft])
+        begin_update.assert_not_called()
+
+    def test_existing_protected_alias_remains_editable(self):
+        self.repository.save_table(
+            "card_ids",
+            pd.DataFrame({"value": [-1, 2000]}),
+        )
+        draft = self.service.get_card_detail(self.manifest, 1).to_draft()
+        draft.localized_text.names["eng"] = "Existing Alias"
+        draft.dirty = True
+
+        self.service.save_card_changes(self.manifest, [draft])
+
+        reloaded = self.service.get_card_detail(self.manifest, 1)
+        self.assertEqual(reloaded.card_id, 2000)
+        self.assertEqual(reloaded.localized_text.names["eng"], "Existing Alias")
+
+    def test_stale_new_draft_revalidates_capacity_before_staging(self):
+        current = pd.DataFrame(
+            {
+                "card_index": range(4095),
+                "card_id": [-1, *range(4094)],
+            }
+        )
+        stale = CardEditDraft(card_index=4094, card_id=4094, is_new=True)
+
+        with (
+            patch.object(self.repository, "get_table", return_value=current),
+            patch.object(self.repository, "begin_update") as begin_update,
+            self.assertRaisesRegex(CardValidationError, "4095 total records"),
+        ):
+            self.service.save_card_changes(self.manifest, [stale])
+
+        begin_update.assert_not_called()
+
+    def test_corrupt_persisted_id_topology_fails_before_staging(self):
+        draft = self.service.get_card_detail(self.manifest, 1).to_draft()
+        invalid_cases = (
+            ([-1, 2, 2], "duplicate active Card ID 2"),
+            ([-1, 2, 5000], "outside the supported Joey range"),
+        )
+
+        for card_ids, message in invalid_cases:
+            with (
+                self.subTest(message=message),
+                patch.object(
+                    self.repository,
+                    "get_table",
+                    return_value=pd.DataFrame(
+                        {
+                            "card_index": range(len(card_ids)),
+                            "card_id": card_ids,
+                        }
+                    ),
+                ),
+                patch.object(self.repository, "begin_update") as begin_update,
+                self.assertRaisesRegex(CardCapacityError, message),
+            ):
+                self.service.save_card_changes(self.manifest, [draft])
+
+            begin_update.assert_not_called()
 
     def test_generated_image_pair_is_bmp_and_catalogs_are_synchronized(self):
         large = self.root / "large.png"

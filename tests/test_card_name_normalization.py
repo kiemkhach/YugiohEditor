@@ -49,6 +49,7 @@ class CardNameNormalizationTests(unittest.TestCase):
             "ガジバパ": "カシハハ",
             "ァィゥェォャュョッヮヵヶ": "アイウエオヤユヨツワカケ",
             "「A・B－C」": "エエヒイシイ",
+            "＜ブーフォ＞": "フウフオ",
         }
         for source, expected in fixtures.items():
             with self.subTest(source=source):

@@ -175,6 +175,10 @@ Open a row by double-clicking it or selecting it and choosing Update. Card
 Detail saves validated changes through the card service and refreshes the list.
 The list can display localized names and descriptions in any supported
 language, and its optional Unused filter shows cards whose pack is `disabled`.
+Add Card is bounded by Joey's 4094 active slots and allocates the lowest safe
+free Card ID from `0..4094`; it never creates slot or ID `4095`/`0xFFF` and
+reports a clear capacity error when full. Existing stock legacy-alias IDs remain
+valid, while a free alias is protected from assignment to an unrelated card.
 Card Detail Suggest resolves one canonical card ID through Konami's official
 card database, fills only missing localized text and compatible Power of Chaos
 properties, and can stage a large/mini BMP pair from YGO Vietnam. Suggested
@@ -215,30 +219,35 @@ Packing creates:
 └── <prefix>_pc.exe
 ```
 
-When an executable is present, Pack derives its active card capacity from the
-actual row count of the logical `card_ids` table. The count is not hard-coded to
-1116 and is not stored in `project.json`. The original game executable and the
-project's workspace executable remain byte-identical source files; only the
-copy written into Pack staging passes through the physical `*_pc.exe` rule,
-which uses the existing generic binary codec and a declarative pre-encode
-profile. If an icon is configured, its PE icon groups are updated only after
-that staged encode; unrelated PE resources and both source executable copies
-remain untouched.
+Pack derives capacity from the physical `card_ids` row count, not the maximum
+Card ID or a generated sidecar. It validates that topology before rebuilding
+large containers: row zero must be the dummy, active IDs must be unique integers
+`0..4094`, and the total must be 1115..4095 records. Count 1115 keeps the
+executable byte-identical. Counts 1116..4095 require the exact supported stock
+Joey executable and install the Step 8 runtime; smaller and larger tables fail
+without truncation. The count and derived plan are ephemeral and are not stored
+in `project.json`.
 
-The current Joey profile preserves bytes for counts through 1115, supports
-formula-driven encoding for counts 1116 through its statically inferred safe
-maximum 2166, and rejects larger counts without truncating card data. A patch
-requires the exact whole-file SHA-256 and validates every original instruction
-site before changing only declared immediates and the odd/even trailing-WORD
-instruction. The count-1116 output has a known regression hash; other counts
-are not rejected merely because they lack a known output hash. Unknown
-executables fail Pack when a patch is required, and normal Pack rollback keeps
-the previous `bin` intact.
+The extended runtime adds `.ygst` for 4096 state WORDs at `0x00C24000` plus a
+4096-byte snapshot at `0x00C26000`, and `.ygsx` for helper code at `0x00C27000`.
+It preserves `0xFFF` as the invalid slot/Card ID, performs direct 12-bit Card ID
+lookup, and canonicalizes only the nine audited stock aliases. Its compatibility
+bridge persists state slots `0..2047`; extended slots do not survive a restart.
 
-The formulas and one-card binary output are statically verified. One-card
-Windows runtime behavior is not yet dynamically verified. Counts above 1116
-are formula-driven but not runtime verified, and 2166 is inferred from the next
-known global address rather than being a general editor limit.
+The original game executable and workspace copy remain byte-identical. Only
+Pack staging receives the structural patch. If an icon is configured, native
+Windows APIs update icon groups after patching, and the executable is then
+reopened to verify both new sections, helper fragments, masks, hooks, and all 17
+dynamic capacity sites. Unknown executable sources fail during preflight, and
+normal rollback preserves the previous `bin`.
+
+Historical experimental builds runtime-verified the Step 8 architecture's
+bridge, lookup, and high-slot semantics. The production helper bytes are newly
+assembled from that durable contract and statically verified against complete
+stock instructions; they are not claimed to be byte-identical to a retained
+experimental output. Static tests and native icon-resource verification are not
+actual gameplay verification. The production-packed executable still requires
+manual game/runtime testing.
 
 The Project window's **Run** button only launches this already-packed
 executable; it never starts Pack or Build implicitly. A successful launch does
@@ -328,4 +337,9 @@ and offscreen UI loading.
 
 ## Current compatibility boundaries
 
-The application implements the known file structures and preserves unknown binary data without interpretation. Original game files should remain backed up. Before distributing a modified build, validate the packed output against the intended game installation and test all affected card, audio, and text content in the game.
+The application implements the known file structures and preserves unknown
+binary data without interpretation. Original game files should remain backed
+up. Step 8 extended card-state slots `2048..4094` are not persisted by the
+legacy `system.dat` format. Before distributing a modified build, validate the
+packed output against the intended game installation and test all affected
+card, audio, and text content in the game.

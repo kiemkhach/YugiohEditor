@@ -19,6 +19,16 @@ Keep these namespaces separate:
 
 Never infer record count from the maximum Card ID. Index zero/dummy behavior must be handled explicitly per table.
 
+For Joey production policy, use `common/joey_card_capacity.py`: slot zero is
+the dummy, active slots are `1..4094`, Pack accepts 1115..4095 physical
+`card_id` records, valid active Card IDs are unique integers `0..4094`, and
+`4095`/`0xFFF` is reserved. Keep these limits out of generic reverse-lookup,
+sort, padding, and codec helpers.
+
+The nine existing legacy alias IDs `2000`, `2014`, `2034`, `2037`, `2040`,
+`2063`, `2068`, `2387`, and `2389` remain valid. When one is free, Add Card
+must not allocate it to an unrelated new card. ID 4093 is ordinary.
+
 ## Source-of-truth rules
 
 Read `/AGENTS.md` plus card sections of `/FILE_FORMATS.md` and `/DEVELOPMENT.md`. Inspect table handlers and `CardService` before adding fields or registries.
@@ -53,6 +63,12 @@ Save through the shared `CardService.save_card_changes()` transaction. Repeated 
 
 When adding a new card, derive new index/ID/image/catalog state in the owning service/repository rather than in widget code. If initialization is expensive, show Card Detail first in a processing state and perform preparation asynchronously; only enable editable fields after a valid draft is ready. Failure must leave the project unchanged.
 
+Allocate only through active slot 4094 and search Card IDs only in
+`0x000..0xFFE`, skipping occupied and protected free alias IDs. Reload and
+validate the current physical topology both while creating the draft and again
+when saving the composed table. A stale draft that crosses capacity or creates
+a duplicate/out-of-range ID must fail before staging.
+
 ## Tests
 
-Use the existing card codec/editing/UI/sort/password/indexed-text/repository tests as anchors. Add cross-table assertions whenever a change can affect more than one physical/virtual card resource. Test rollback after a late image/catalog/manifest failure.
+Use the existing card codec/editing/UI/sort/password/indexed-text/repository tests as anchors. Add cross-table assertions whenever a change can affect more than one physical/virtual card resource. Test rollback after a late image/catalog/manifest failure. Capacity coverage must include record counts 1114/1115/1116/4095/4096, Card IDs 4094/4095, invalid dummy/negative/duplicate IDs, protected aliases, ordinary ID 4093 allocation, slot 4094 Add Card success, full-capacity failure, and stale-draft revalidation.

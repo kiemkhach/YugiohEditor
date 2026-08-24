@@ -34,6 +34,7 @@ not import or instantiate codecs.
 ```text
 yugioh_editor/
 ├── common/
+│   ├── joey_card_capacity.py
 │   └── subfile_rules_config.py
 ├── models/
 ├── repositories/
@@ -487,7 +488,9 @@ create sibling staging directory
 Project packing uses:
 
 ```text
-create sibling output staging directory
+validate manifest and physical card_ids topology
+-> preflight the supported executable and capacity plan
+-> create sibling output staging directory
 -> export physical and virtual records
 -> encode and validate outputs
 -> reopen generated containers
@@ -505,10 +508,13 @@ never delete the chosen directory.
 Failures remove staging data. A failed pack preserves the previous `bin`
 directory.
 
-When a project has an executable, `ProjectService` obtains the active count only
-through `len(project.get_table("card_ids"))`. It passes that integer as
-operation metadata to `GameRepository`; it never parses CSV or binary data and
-does not persist the derived count. The executable resource then follows the
+`ProjectService` obtains the physical card record count only through
+`len(project.get_table("card_ids"))`. The pure
+`common/joey_card_capacity.py` policy validates the table and creates the
+capacity plan before output staging or large container reconstruction. The
+service does not derive capacity from a maximum Card ID or virtual table and
+does not persist the plan. Extended counts also preflight the configured
+executable through a repository public API. The executable then follows the
 same rule orchestration as other physical resources:
 
 ```text
@@ -518,6 +524,7 @@ workspace source bytes
 -> generic binary codec
 -> Pack staging/<prefix>_pc.exe
 -> optional PE icon-group update on that staged file
+-> post-write Step 8 structural verification
 ```
 
 Create Project copies a validated optional ICO to `project.ico`; only its
@@ -525,22 +532,32 @@ relative path is stored in the manifest. Older manifests may keep an explicit
 `project.icon` path because Pack treats the manifest path as authoritative.
 Pack reads that project-owned copy before creating output staging, fails clearly
 when it is missing, and updates only icon resource types while retaining
-existing group identities/languages and unrelated PE resources.
+existing group identities/languages and unrelated PE resources. Because native
+resource APIs may move raw PE data, the post-icon verifier locates sections by
+their headers rather than assuming the helper's original raw offset.
 
-The profile contains plain frozen data: the original whole-file SHA-256, safe
-state bounds, 21 integer instruction sites, one conditional `MOVSW` site, and
-optional known output hashes. Counts `<=1115` remain byte-identical without a
-source-hash requirement. Counts `1116..2166` are encoded from formulas after
-hash, instruction, region, overlap, width, and capacity validation. A count
-above 2166 fails before mutation. Repacking always starts from the unchanged
-workspace executable, so identical source/count input is deterministic. Any
-failure discards the complete Pack staging directory and leaves the prior
-`bin`, workspace executable, and original game installation unchanged.
+The profile is plain frozen data describing the exact stock hash and PE layout,
+the `.ygst` and `.ygsx` sections, 69 fixed state-reference relocations, two
+complete snapshot windows, fixed masks/hooks/helpers, 11 explicit alias
+consumer patches, and 17 dynamic sites. Slot zero is the dummy; active slots
+are `1..4094`; Card IDs are `0..0xFFE`; and `0xFFF` is reserved. Counts below
+1115 fail, count 1115 remains byte-identical, counts 1116..4095 install the
+structural Step 8 runtime, and larger counts fail before mutation.
 
-The patch formulas and the count-1116 binary result are **Statically
-verified**. Windows runtime behavior for the added card is **Not yet dynamically
-verified**. Counts above 1116 are **Formula-driven but not runtime verified**.
-The 2166 maximum is **Inferred** from the next known global address.
+Extended state is 4096 WORDs at `0x00C24000`; its fixed 4096-byte high-byte
+snapshot starts at `0x00C26000`; helpers start at `0x00C27000`. The legacy
+save/load bridge copies only slots `0..2047` between relocated state and the
+stock block, so slots `2048..4094` are not persistent. Repacking always starts
+from the unchanged workspace executable. Any failure discards Pack staging and
+leaves the prior `bin`, workspace executable, and game installation unchanged.
+
+Historical experimental builds runtime-tested the Step 8 architecture's
+semantics. Production helper fragments were newly assembled against complete
+stock instructions and are statically verified by byte, disassembly, PE, and
+invariant tests; no retained experimental output identity is claimed. Native
+Windows icon-resource verification is a separate integration layer. Actual
+gameplay/runtime verification of the production-packed executable remains
+manual.
 
 `CardService` uses only:
 
@@ -551,6 +568,13 @@ repository.save_table("cards", cards, language=...)
 
 Image use cases call repository resource methods. The service does not know card
 subfile paths, virtual construction pipelines, connections, or codecs.
+
+CardService reuses the pure Joey capacity policy. Add Card selects the next
+slot only through 4094 and the lowest safe free Card ID through `0xFFE`, while
+protecting the nine legacy alias IDs from unrelated new allocation. ID 4093 is
+ordinary. Save reloads the current table and revalidates dummy row, resulting
+record count, namespace, and Card ID uniqueness before opening its staging
+transaction, which closes stale-draft capacity races.
 
 Card Detail and Card List both persist edits through
 `CardService.save_card_changes()`. The service creates one staging clone, sends

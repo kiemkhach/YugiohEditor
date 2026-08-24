@@ -40,9 +40,20 @@ Keep separate:
 - UI/list clamps;
 - save-format storage.
 
-Verified project knowledge includes a `uint16`-sized per-slot runtime state region at base `0x00A53CCC` with structural storage for 2048 WORD records. Stock active consumers commonly stop at the range corresponding to slots `0..1114`, but structural storage does not by itself prove all 2048 slots are safely usable.
+The final Step 8 contract keeps slot zero as the dummy, supports active slots
+`1..4094`, and reserves slot/Card ID `0xFFF`. Valid Card IDs are
+`0x000..0xFFE`; ID 4093 is ordinary. Extended builds relocate 4096 state WORDs
+to `0x00C24000`, place the fixed 4096-byte high-byte snapshot at `0x00C26000`,
+and place helpers at `0x00C27000` in new `.ygst` and `.ygsx` sections.
 
-`system.dat` research indicates storage exists for all 2048 structural card-state WORDs; this does not prove every executable consumer supports them.
+The original state block at `0x00A53CCC` remains only as the lower-2048
+`system.dat` compatibility bridge. Save copies relocated slots `0..2047` to
+that block before the original checksum/write call; load copies them back.
+Slots `2048..4094` are not persistent.
+
+The blanket historical alias-range rule is obsolete. Only the nine audited
+aliases `2000`, `2014`, `2034`, `2037`, `2040`, `2063`, `2068`, `2387`, and
+`2389` canonicalize by subtracting 2000, and only at audited consumers.
 
 Some `0x45A`/1114 literals are named-card logic (for example Giant Germ-related effect branches) and are explicitly not capacity constants. Never globally replace them.
 
@@ -65,10 +76,18 @@ YugiohEditor currently owns supported capacity patching through the existing `*_
 - only Pack staging is transformed;
 - `card_record_count` comes from `len(ProjectRepository.get_table("card_ids"))`;
 - profile data stays declarative;
-- validate whole-file hash for expanded counts and every complete original instruction before mutation;
-- derive immediates with integer formulas;
-- validate widths, bounds, overlap, and conditional trailing `MOVSW` behavior;
-- fail before mutation when the profile safety limit is exceeded.
+- counts below 1115 fail, count 1115 is byte-identical without a hash
+  requirement, counts 1116..4095 require the exact supported stock source and
+  install Step 8, and larger counts fail;
+- validate the whole-file hash, exact PE32 baseline, complete original
+  instructions/windows, section geometry, widths, bounds, and overlap;
+- install only the declared 69 state relocations, two complete snapshot
+  rewrites, fixed masks/hooks/helpers, 11 alias-consumer patches, and exactly
+  17 formula-driven capacity sites;
+- preserve the verified 12-bit masks at `0x0040262E`, `0x005B91D7`, and
+  `0x005B9214`;
+- after an optional native icon update, use current PE section mappings and
+  reverify `.ygst`, `.ygsx`, helpers, hooks, masks, aliases, and dynamic values.
 
 Do not add a parallel patch script/class/manifest count unless a new requirement cannot fit the existing pipeline and the architecture change is justified first.
 
@@ -82,6 +101,12 @@ Separate:
 
 Never claim runtime support for a count or patch that has only been generated and hash-checked.
 
+Historical experimental builds runtime-tested the Step 8 architecture's
+bridge, direct lookup, and high-slot semantics. Production helper fragments are
+newly assembled against complete stock instructions and statically verified;
+do not claim byte identity to removed experiments or actual production gameplay
+verification. Native Windows resource verification is a separate result.
+
 ## Reference material
 
 When available in the project research corpus, consult the latest versions of the Video Notes, Reverse Engineering Knowledge Base, Executable Modification Map, Card Slot Memory Model, System DAT Save Format, patch-point/capacity CSVs, `Assembly.txt`, `change card effect.txt`, `card_list.xlsx`, and the IDA database. Treat author/tutorial notes as leads until locally verified.
@@ -92,9 +117,10 @@ For production patch changes require:
 
 - baseline/hash/profile rejection tests;
 - complete original-instruction mismatch tests;
-- exact changed-byte assertions for known counts;
-- unchanged output at legacy counts;
-- odd/even copy-tail behavior;
-- boundary maximum and maximum+1;
-- deterministic output hash where a verified fixture exists;
+- PE geometry, changed-region, helper, relocation, snapshot, hook, alias,
+  invariant, and all-17-dynamic-site assertions;
+- exact unchanged output at 1115;
+- structural outputs at 1116, an intermediate count, and 4095;
+- rejection before mutation at 1114 and 4096;
+- native Windows icon-update re-verification when a supported fixture exists;
 - explicit manual/runtime checklist for behavior not automated.

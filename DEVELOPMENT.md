@@ -370,8 +370,8 @@ executable bytes exactly. The physical `*_pc.exe` subfile rule uses the generic
 Pack encodes the workspace resource into staging.
 
 Do not add an executable codec, patcher class, patch script, manifest count, or
-filename dispatch. `ProjectService.pack_project()` must obtain the current
-record count through:
+filename dispatch. `ProjectService.pack_project()` obtains the physical record
+count through:
 
 ```python
 card_record_count = len(project.get_table("card_ids"))
@@ -382,21 +382,36 @@ external Card ID, the composite `cards` table, `card_intid.bin`, or
 `card_sort`. Keep the declarative profile in `subfile_rules_config.py` as plain
 data and let the existing factory deep-freeze it.
 
-The patch method validates the profile, whole-file source SHA-256, every full
-original instruction, immediate widths, file bounds, and non-overlapping
-regions before allocating a mutable output buffer. Derived values use integer
-arithmetic only. Preserve the trailing `MOVSW` for odd record counts and replace
-it with `NOP NOP` for even counts. Update both snapshot stack allocation sites
-from the same derived size. Counts through the legacy 1115 remain byte-identical
-without requiring the Joey hash; 1116 through the profile maximum 2166 are
-formula-driven; larger counts fail Pack without truncating card data. Optional
-known-output hashes validate specific regression counts but never form an
-allowlist.
+Before creating Pack staging or rebuilding large containers, validate the
+physical `card_ids` topology with the central Joey policy. Require 1115..4095
+records, dummy `-1` at row zero, and unique integer Card IDs `0..4094` in active
+rows. Counts below 1115 and above 4095 fail. Count 1115 preserves executable
+bytes exactly; counts 1116..4095 require exactly one supported Joey executable.
+Pass the validated plan with the count, but require the patcher to recompute and
+compare all derived values.
 
-The count-1116 formulas and binary output are statically verified. Do not claim
-Windows runtime verification until the packed executable has actually been
-tested. Counts above 1116 remain formula-driven but not runtime verified, and
-2166 is inferred from the next known global address.
+For an extended count, the patcher validates the profile, whole-file stock
+SHA-256, PE32 layout, every complete original instruction/window, file bounds,
+and non-overlapping regions before mutation. It adds the uninitialized `.ygst`
+state/snapshot section and initialized `.ygsx` helper section, applies the 69
+direct relocations and two fixed snapshot rewrites, installs save/load and Card
+ID helpers, patches only the audited alias consumers, and writes the 17 dynamic
+capacity sites. The derived values are maximum slot `record_count - 1`,
+exclusive bound `record_count`, and active state end
+`0x00C24000 + record_count * 2`.
+
+Keep executable processing ordered as capacity patch, staged write, optional
+native Windows icon update, then structural verification of `.ygst`, `.ygsx`,
+helper bytes, masks, hooks, aliases, and all dynamic sites. Whole-file output
+hashes are not valid after resource mutation. Source and workspace executable
+bytes remain unchanged, and any failure still discards Pack staging.
+
+Historical experimental builds runtime-verified the Step 8 architecture's
+bridge, lookup, and high-slot semantics. Production helper bytes were newly
+assembled against the complete stock instructions and are statically verified;
+they are not a retained experimental binary. Native icon-resource integration
+verification is also not gameplay verification. Report actual production game
+runtime as pending until it is manually exercised.
 
 ## Working with project tables
 
@@ -686,6 +701,20 @@ card mutation must keep the same row count and order across:
 Description index files, `card_intid.bin`, and sort files are generated during
 packing and must not be edited independently.
 
+Joey capacity policy lives in the pure `common/joey_card_capacity.py` helper
+and is reused by Card Save and Pack. Slot zero is the dummy; active slots are
+`1..4094`; total records are at most 4095. Active Card IDs are unique integers
+`0..4094`, while `4095`/`0xFFF` is reserved. Card ID and slot number are
+independent, and ID 4093 is an ordinary allocatable value.
+
+Add Card selects the next sequential slot and the lowest safe free Card ID, but
+never crosses slot 4094 or returns `0xFFF`. It skips a currently free ID in the
+exact protected legacy-alias set `2000, 2014, 2034, 2037, 2040, 2063, 2068,
+2387, 2389`; existing rows using those legitimate stock IDs remain valid.
+Never replace a general `>=2000` range or every literal 2000. Save reloads the
+current table and validates the resulting topology before creating its staging
+clone, so a stale draft cannot cross capacity or introduce a duplicate ID.
+
 The Spanish dependency pairs are:
 
 ```text
@@ -816,6 +845,11 @@ Before considering a change complete:
 6. Pack the project.
 7. Reopen the packed containers and compare entry count, paths, order, and decompressed payloads.
 8. Launch the packed executable when the change affects runtime game data.
+
+For executable work, record static binary verification, native Windows
+resource/API verification, and actual game runtime as separate results. Python
+tests, disassembly, structural checks, and a successful icon update do not by
+themselves establish gameplay/runtime support.
 
 ## Build output
 

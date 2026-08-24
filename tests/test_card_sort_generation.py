@@ -72,6 +72,22 @@ class CardSortGenerationTests(unittest.TestCase):
                 self.assertEqual(len(result), expected_length)
                 self.assertFalse(any(result[card_count:]))
 
+    def test_maximum_joey_record_count_has_4096_valid_inverse_ranks(self):
+        repository = GameRepository.from_root(".")
+        card_count = 4095
+        names = [""] + [f"Card {index:04d}" for index in range(1, card_count)]
+        card_ids = [-1, *range(1, card_count)]
+
+        result = repository.generate_sort_indices(
+            self._records(names, card_ids),
+            context=self._context(repository),
+        )
+
+        self.assertEqual(len(result), 4096)
+        self.assertEqual(result[0], 0)
+        self.assertEqual(result[1:card_count], list(range(card_count - 1)))
+        self.assertEqual(result[card_count], 0)
+
     def test_duplicate_low_card_ids_do_not_change_target_length(self):
         repository = GameRepository.from_root(".")
         result = repository.generate_sort_indices(

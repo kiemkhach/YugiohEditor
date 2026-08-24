@@ -155,8 +155,9 @@ naturally sized to the containing power of two and encoded in full as unsigned
 16-bit little-endian records. The editor imposes no fixed record-count cap,
 while the codec still validates each record's representable range. A longer
 generated file does not guarantee support from an arbitrary game executable.
-For the supported Joey executable, Pack independently applies a SHA-identified
-capacity profile described below.
+For the supported Joey executable, Pack applies the SHA-identified capacity
+profile documented in
+[JOEY_EXECUTABLE_ARCHITECTURE.md](JOEY_EXECUTABLE_ARCHITECTURE.md).
 
 Manifest loading validates localized paths and explicit language metadata.
 Unsupported language codes are reported with the affected resource path; the
@@ -224,30 +225,19 @@ Card ID or a generated sidecar. It validates that topology before rebuilding
 large containers: row zero must be the dummy, active IDs must be unique integers
 `0..4094`, and the total must be 1115..4095 records. Count 1115 keeps the
 executable byte-identical. Counts 1116..4095 require the exact supported stock
-Joey executable and install the Step 8 runtime; smaller and larger tables fail
-without truncation. The count and derived plan are ephemeral and are not stored
-in `project.json`.
+Joey executable and install the extended card-capacity runtime; smaller and
+larger tables fail without truncation. The count and derived plan are ephemeral
+and are not stored in `project.json`.
 
-The extended runtime adds `.ygst` for 4096 state WORDs at `0x00C24000` plus a
-4096-byte snapshot at `0x00C26000`, and `.ygsx` for helper code at `0x00C27000`.
-It preserves `0xFFF` as the invalid slot/Card ID, performs direct 12-bit Card ID
-lookup, and canonicalizes only the nine audited stock aliases. Its compatibility
-bridge persists state slots `0..2047`; extended slots do not survive a restart.
-
-The original game executable and workspace copy remain byte-identical. Only
-Pack staging receives the structural patch. If an icon is configured, native
-Windows APIs update icon groups after patching, and the executable is then
-reopened to verify both new sections, helper fragments, masks, hooks, and all 17
-dynamic capacity sites. Unknown executable sources fail during preflight, and
-normal rollback preserves the previous `bin`.
-
-Historical experimental builds runtime-verified the Step 8 architecture's
-bridge, lookup, and high-slot semantics. The production helper bytes are newly
-assembled from that durable contract and statically verified against complete
-stock instructions; they are not claimed to be byte-identical to a retained
-experimental output. Static tests and native icon-resource verification are not
-actual gameplay verification. The production-packed executable still requires
-manual game/runtime testing.
+Executable relocation, the 12-bit slot/Card-ID contract, legacy alias
+compatibility, the lower-2048 save-state bridge, effect-table architecture, and
+the verified address map are centralized in
+[JOEY_EXECUTABLE_ARCHITECTURE.md](JOEY_EXECUTABLE_ARCHITECTURE.md). The original
+game executable and workspace copy remain byte-identical; only Pack staging is
+transformed. If an icon is configured, native Windows APIs update icon groups
+after the structural patch and the executable is then reopened for structural
+verification. Actual game/runtime verification remains distinct from static
+binary and Windows resource verification.
 
 The Project window's **Run** button only launches this already-packed
 executable; it never starts Pack or Build implicitly. A successful launch does
@@ -334,12 +324,13 @@ and offscreen UI loading.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — application structure, responsibilities, and data flows.
 - [FILE_FORMATS.md](FILE_FORMATS.md) — container, LZSS, deck, card, text, and workspace formats.
 - [DEVELOPMENT.md](DEVELOPMENT.md) — development workflow, conventions, testing, and extension guides.
+- [JOEY_EXECUTABLE_ARCHITECTURE.md](JOEY_EXECUTABLE_ARCHITECTURE.md) — executable baseline, extended card-capacity runtime, patch points, and card-effect architecture.
 
 ## Current compatibility boundaries
 
 The application implements the known file structures and preserves unknown
 binary data without interpretation. Original game files should remain backed
-up. Step 8 extended card-state slots `2048..4094` are not persisted by the
-legacy `system.dat` format. Before distributing a modified build, validate the
-packed output against the intended game installation and test all affected
-card, audio, and text content in the game.
+up. Extended card-state slots `2048..4094` are not persisted by the legacy
+`system.dat` format. Before distributing a modified build, validate the packed
+output against the intended game installation and test all affected card,
+audio, and text content in the game.

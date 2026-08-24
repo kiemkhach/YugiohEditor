@@ -58,110 +58,26 @@ them as `bin/<prefix>_pc.exe`. The original game file and editable workspace
 file always retain the source bytes. Only Pack staging receives the result of
 the physical `*_pc.exe` rule's generic-binary `pre_encode` pipeline.
 
-#### Step 8 card-capacity profile
+#### Executable card-capacity profile
 
-Pack validates the physical `card_ids` table and derives one immutable capacity
-plan before rebuilding containers:
+Pack derives the executable capacity plan from the physical `card_id.bin` row
+count. Slot zero is the dummy; active rows must use unique Card IDs in
+`0..4094`, and `0xFFF` remains reserved. Count 1115 preserves the supported
+stock executable byte-for-byte; counts 1116..4095 require the exact supported
+stock baseline and install the extended card-capacity runtime; smaller or
+larger topologies fail without truncation.
 
-```text
-card_record_count       = len(card_id.bin records)
-active_count            = card_record_count - 1
-maximum_active_slot     = card_record_count - 1
-exclusive_upper_bound   = card_record_count
-active_state_end        = 0x00C24000 + card_record_count * 2
-```
+The executable profile is distinct from the reusable DATA formats.
+`card_intid.bin`, `card_sort<language>.bin`, and indexed-text sidecars continue
+to use their generic generation rules; their file sizes do not define the
+runtime card limit.
 
-Slot zero is the dummy. The row count, maximum active slot, and Card ID are
-separate values; no bound is derived from the maximum Card ID,
-`card_intid.bin`, `card_sort`, the Cards UI, or image count. The plan is
-operation metadata and is never persisted in the manifest.
-
-The supported count contract is exact:
-
-| Physical records | Result |
-|---:|---|
-| Below 1115 | Reject as an unsupported Joey topology |
-| 1115 | Preserve the executable byte-for-byte |
-| 1116..4095 | Install the Step 8 extended runtime |
-| Above 4095 | Reject without truncating card data |
-
-At most 4094 cards occupy active slots `1..4094`. Card IDs are `0..4094`
-(`0x000..0xFFE`); `4095`/`0xFFF` remains the all-ones 12-bit invalid value and
-is never an active slot or Card ID. At the maximum, the exclusive bound is
-`0xFFF` and the active state ends at `0x00C25FFE`.
-
-Extended counts require the exact supported stock executable:
-
-| Field | Value |
-|---|---:|
-| Source size | 3,919,872 bytes / `0x3BD000` |
-| ImageBase | `0x00400000` |
-| Source sections | 8 |
-| Source SHA-256 | `c5749eb934a1cf68d9236e44ff81e98b8aaee486b4f8ebd417440505d44ac1ea` |
-
-The patch validates the DOS/PE32 headers, complete stock section layout, header
-slack, alignments, whole-file hash, and every complete source instruction or
-rewrite window before mutation. It installs two sections:
-
-| Section | RVA | Virtual size | Raw data | Purpose |
-|---|---:|---:|---:|---|
-| `.ygst` | `0x824000` | `0x3000` | none | live state plus snapshot |
-| `.ygsx` | `0x827000` | `0x1000` | `0x1000` NOP-filled bytes appended at `0x3BD000` | helper code and alias table |
-
-With ImageBase applied, `.ygst` maps 4096 two-byte state slots at
-`0x00C24000..0x00C25FFF` and a 4096-byte high-byte snapshot at
-`0x00C26000..0x00C26FFF`. `.ygsx` begins at `0x00C27000`. Before an optional
-icon update, the output has ten sections, `SizeOfImage=0x828000`, and size
-`0x3BE000`.
-
-The structural patch has these audited layers:
-
-- 69 direct state-reference relocations: 59 state-base, four high-byte-base,
-  five slot-1-base, and one structural-end reference;
-- two complete fixed snapshot-loop rewrites, independent of active count;
-- the `CARD_Prop` mask at `0x0040262E` changed from `0x7FF` to `0xFFF`;
-- save/load bridge hooks, direct 12-bit Card ID lookup, declarative helper
-  fragments, and 11 audited legacy-alias consumer patches;
-- exactly 17 count-dependent sites.
-
-The supported stock snapshot windows are complete instruction ranges. Copy is
-rewritten at `0x0047DCEA..0x0047DCFF`, with the successor at `0x0047DD00`;
-restore is rewritten at `0x0047DD71..0x0047DD8F`, with the successor at
-`0x0047DD90`.
-
-The 17 dynamic sites are:
-
-| Derived value | Virtual addresses |
-|---|---|
-| `maximum_active_slot` | `0x00402315`, `0x0046E5C7`, `0x0046E5CE`, `0x00476339`, `0x00476340` |
-| `exclusive_upper_bound` | `0x0043A9B2`, `0x0043AA9D`, `0x00445703`, `0x0047DBFD`, `0x0046E5B3`, `0x00476327` |
-| `active_state_end` | `0x00463F18`, `0x00463F8B`, `0x0047DA75`, `0x0047DC7D`, `0x005BED0D`, `0x005BEE16` |
-
-The direct lookup accepts IDs through `0xFFE`, rejects `0xFFF` and above, and
-indexes `CARD_IntID` directly. Only these stock aliases canonicalize at the 11
-audited consumers:
-
-```text
-2000->0  2014->14  2034->34  2037->37  2040->40
-2063->63  2068->68  2387->387  2389->389
-```
-
-These nine IDs remain valid existing Card IDs, but a currently free alias is
-not assigned to an unrelated new card. ID 4093 is ordinary and is not reserved.
-Other occurrences of the literal 2000 are not capacity patches.
-
-The compatibility bridge copies relocated slots `0..2047` to the original
-legacy state block before the checksum/write routine and copies them back after
-load. Slots `2048..4094` are intentionally not persisted by `system.dat`.
-
-Historical experimental builds runtime-verified the Step 8 bridge, lookup, and
-4094-card architecture semantics. The production helper fragments were newly
-assembled against complete stock instructions and are covered by static byte,
-disassembly, PE-layout, and invariant tests; they are not claimed to be a
-byte-identical retained experimental artifact. Native Windows icon updates are
-followed by the same structural verifier because an icon changes the whole-file
-hash. Actual gameplay/runtime verification of the production-packed executable
-remains manual.
+The executable's PE layout, stock fingerprint, relocated state, fixed snapshot,
+12-bit Card-ID resolution, legacy aliases, save-state bridge, fixed and dynamic
+patch addresses, verification status, and card-effect architecture are
+centralized in
+[JOEY_EXECUTABLE_ARCHITECTURE.md](JOEY_EXECUTABLE_ARCHITECTURE.md). This file
+only documents the file-format contract needed by Pack.
 
 ## `KCEJYUGI` container
 
@@ -630,9 +546,9 @@ behavior. The supported Joey executable uses the independent, SHA-identified
 Pack profile above; this does not imply compatibility for other executables and
 does not change the `card_intid.bin` format.
 
-For the Step 8 boundary, Card ID `4094` produces a 4096-record reverse lookup,
-and `card_intid[4094]` contains that card's high slot. This is a Joey runtime
-namespace check, not a new fixed cap in the reusable generator.
+At the supported Joey boundary, Card ID `4094` produces a 4096-record reverse
+lookup, and `card_intid[4094]` contains that card's high slot. This is a Joey
+runtime namespace check, not a new fixed cap in the reusable generator.
 
 ### `card_pack.bin`
 
@@ -823,9 +739,9 @@ continues to validate every generated offset value.
 
 The 2048-record band preserves the complete legacy sequence and its 8192-byte
 encoding. Larger power-of-two bands describe DATA-side representability only.
-They do not change the separate executable policy: the Step 8 profile permits
-at most 4095 physical card records and Card IDs through `0xFFE`, and generated
-DATA alone does not establish Windows runtime compatibility.
+They do not change the separate executable policy: the supported profile
+permits at most 4095 physical card records and Card IDs through `0xFFE`, and
+generated DATA alone does not establish Windows runtime compatibility.
 
 The dependency is:
 

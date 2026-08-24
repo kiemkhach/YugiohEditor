@@ -524,7 +524,7 @@ workspace source bytes
 -> generic binary codec
 -> Pack staging/<prefix>_pc.exe
 -> optional PE icon-group update on that staged file
--> post-write Step 8 structural verification
+-> post-write executable structural verification
 ```
 
 Create Project copies a validated optional ICO to `project.ico`; only its
@@ -536,28 +536,19 @@ existing group identities/languages and unrelated PE resources. Because native
 resource APIs may move raw PE data, the post-icon verifier locates sections by
 their headers rather than assuming the helper's original raw offset.
 
-The profile is plain frozen data describing the exact stock hash and PE layout,
-the `.ygst` and `.ygsx` sections, 69 fixed state-reference relocations, two
-complete snapshot windows, fixed masks/hooks/helpers, 11 explicit alias
-consumer patches, and 17 dynamic sites. Slot zero is the dummy; active slots
-are `1..4094`; Card IDs are `0..0xFFE`; and `0xFFF` is reserved. Counts below
-1115 fail, count 1115 remains byte-identical, counts 1116..4095 install the
-structural Step 8 runtime, and larger counts fail before mutation.
+The application-level executable contract is intentionally short here: slot
+zero is the dummy; active slots are `1..4094`; active Card IDs are
+`0..0xFFE`; `0xFFF` is reserved; count 1115 leaves the executable unchanged;
+and counts 1116..4095 require the exact supported stock baseline. The
+structural PE layout, relocation/reference model, snapshot architecture,
+12-bit lookup, legacy aliases, save-state bridge, dynamic patch addresses, and
+runtime evidence are centralized in
+[JOEY_EXECUTABLE_ARCHITECTURE.md](JOEY_EXECUTABLE_ARCHITECTURE.md).
 
-Extended state is 4096 WORDs at `0x00C24000`; its fixed 4096-byte high-byte
-snapshot starts at `0x00C26000`; helpers start at `0x00C27000`. The legacy
-save/load bridge copies only slots `0..2047` between relocated state and the
-stock block, so slots `2048..4094` are not persistent. Repacking always starts
-from the unchanged workspace executable. Any failure discards Pack staging and
-leaves the prior `bin`, workspace executable, and game installation unchanged.
-
-Historical experimental builds runtime-tested the Step 8 architecture's
-semantics. Production helper fragments were newly assembled against complete
-stock instructions and are statically verified by byte, disassembly, PE, and
-invariant tests; no retained experimental output identity is claimed. Native
-Windows icon-resource verification is a separate integration layer. Actual
-gameplay/runtime verification of the production-packed executable remains
-manual.
+Repacking always starts from the unchanged workspace executable. Any failure
+discards Pack staging and leaves the prior `bin`, workspace executable, and
+game installation unchanged. Native Windows icon-resource verification is a
+separate integration layer from actual game/runtime verification.
 
 `CardService` uses only:
 

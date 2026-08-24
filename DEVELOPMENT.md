@@ -357,61 +357,39 @@ raw bytes before calling the project service.
 
 ## Version executable
 
-Project creation requires the caller to pass a non-empty version prefix
-containing only ASCII letters, numbers, underscores, and hyphens. The start
-view reads and trims the current Designer-backed widget value; the service
-validates it again. There is no Python default or manifest fallback. Executable
-candidates must match `<name>_pc.exe` case-insensitively. When several
-candidates exist, the first case-insensitively sorted filename is selected.
-The workspace path is `<prefix>/<prefix>_pc.exe`, and packing writes
-`bin/<prefix>_pc.exe`. Source discovery and project creation preserve the
-executable bytes exactly. The physical `*_pc.exe` subfile rule uses the generic
-`binary` operation; its `patch_executable_card_capacity` step runs only while
-Pack encodes the workspace resource into staging.
+Project creation requires a validated version prefix and stores the exact source
+executable at `<prefix>/<prefix>_pc.exe`; Pack writes
+`bin/<prefix>_pc.exe`. Source discovery and project creation preserve those
+bytes exactly. The physical `*_pc.exe` rule remains a generic `binary` resource,
+and `patch_executable_card_capacity` runs only in the Pack `pre_encode` path.
 
-Do not add an executable codec, patcher class, patch script, manifest count, or
-filename dispatch. `ProjectService.pack_project()` obtains the physical record
-count through:
+Do not add an executable codec, a parallel patcher class/script, a manifest
+capacity field, or filename-specific dispatch. `ProjectService.pack_project()`
+derives capacity only from:
 
 ```python
 card_record_count = len(project.get_table("card_ids"))
 ```
 
-Pass the integer as rule-operation metadata. Do not calculate it from maximum
-external Card ID, the composite `cards` table, `card_intid.bin`, or
-`card_sort`. Keep the declarative profile in `subfile_rules_config.py` as plain
-data and let the existing factory deep-freeze it.
+The central Joey policy validates the physical topology before expensive Pack
+work: 1115..4095 records, dummy `-1` at row zero, and unique active Card IDs in
+`0..4094`. Count 1115 leaves the executable unchanged; extended counts require
+exactly one supported Joey executable. The declarative executable profile stays
+plain data in `subfile_rules_config.py` and the patcher must fail closed when
+the stock fingerprint, PE layout, source instruction windows, or derived
+capacity plan do not match.
 
-Before creating Pack staging or rebuilding large containers, validate the
-physical `card_ids` topology with the central Joey policy. Require 1115..4095
-records, dummy `-1` at row zero, and unique integer Card IDs `0..4094` in active
-rows. Counts below 1115 and above 4095 fail. Count 1115 preserves executable
-bytes exactly; counts 1116..4095 require exactly one supported Joey executable.
-Pass the validated plan with the count, but require the patcher to recompute and
-compare all derived values.
+Keep executable processing ordered as structural patch, staged write, optional
+native Windows icon update, then structural verification. Source and workspace
+executable bytes remain unchanged, and failures discard Pack staging. Treat
+static binary verification, Windows resource/API verification, and actual game
+runtime as separate results.
 
-For an extended count, the patcher validates the profile, whole-file stock
-SHA-256, PE32 layout, every complete original instruction/window, file bounds,
-and non-overlapping regions before mutation. It adds the uninitialized `.ygst`
-state/snapshot section and initialized `.ygsx` helper section, applies the 69
-direct relocations and two fixed snapshot rewrites, installs save/load and Card
-ID helpers, patches only the audited alias consumers, and writes the 17 dynamic
-capacity sites. The derived values are maximum slot `record_count - 1`,
-exclusive bound `record_count`, and active state end
-`0x00C24000 + record_count * 2`.
-
-Keep executable processing ordered as capacity patch, staged write, optional
-native Windows icon update, then structural verification of `.ygst`, `.ygsx`,
-helper bytes, masks, hooks, aliases, and all dynamic sites. Whole-file output
-hashes are not valid after resource mutation. Source and workspace executable
-bytes remain unchanged, and any failure still discards Pack staging.
-
-Historical experimental builds runtime-verified the Step 8 architecture's
-bridge, lookup, and high-slot semantics. Production helper bytes were newly
-assembled against the complete stock instructions and are statically verified;
-they are not a retained experimental binary. Native icon-resource integration
-verification is also not gameplay verification. Report actual production game
-runtime as pending until it is manually exercised.
+All executable-specific PE layout, state relocation, snapshot logic, 12-bit
+Card-ID resolution, legacy aliases, save-state bridge, fixed/dynamic patch
+addresses, effect-table architecture, and evidence status belong in
+[JOEY_EXECUTABLE_ARCHITECTURE.md](JOEY_EXECUTABLE_ARCHITECTURE.md). Do not copy
+those address maps into this development guide.
 
 ## Working with project tables
 

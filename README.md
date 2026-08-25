@@ -4,6 +4,8 @@ A Python and PySide6 desktop application for inspecting, editing, and rebuilding
 
 The application creates an editable project workspace from a game installation folder. Container files are unpacked, structured binary data is converted to editable CSV-backed tables, text is decoded with the appropriate language encoding, and media or binary data is preserved as raw files. The project can later be packed into a runnable game folder under the project's `bin` directory.
 
+> **New to YugiohEditor?** See the illustrated [User Guide](USER_GUIDE.md) for the complete Create/Load → Edit → Build → Run workflow.
+
 ## Main capabilities
 
 - Create a project from a game folder containing:
@@ -321,6 +323,7 @@ and offscreen UI loading.
 
 ## Documentation
 
+- [USER_GUIDE.md](USER_GUIDE.md) — illustrated end-user guide for creating/loading projects, editing resources and cards, building, and running the modified game.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — application structure, responsibilities, and data flows.
 - [FILE_FORMATS.md](FILE_FORMATS.md) — container, LZSS, deck, card, text, and workspace formats.
 - [DEVELOPMENT.md](DEVELOPMENT.md) — development workflow, conventions, testing, and extension guides.

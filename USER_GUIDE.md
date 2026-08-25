@@ -4,6 +4,8 @@ This guide explains the normal end-user workflow for **Yu-Gi-Oh! Power of Chaos 
 
 > **Important:** Keep a backup of the original game installation. YugiohEditor works in a project workspace and Pack/Build produces runnable output under the project's `bin` directory, but modified game data should still be tested before distribution.
 
+The screenshots in this guide are maintained with the project evidence in Google Drive under `yugioh/evident/user_guide_images`.
+
 ## 1. Start the application
 
 Run the editor with:
@@ -21,6 +23,8 @@ The start window contains these fields:
 - **Icon** — optional `.ico` file for the project executable.
 
 Use **Browse...** to select paths when necessary. The application remembers the last valid workspace folder and may discover the game folder from the Windows Konami registry.
+
+![Start window and Create Project fields](https://drive.google.com/uc?export=view&id=1WWRvWJl6OpOJ13vQu56oFK1ijsD7AH-o)
 
 ## 2. Create a project
 
@@ -40,7 +44,7 @@ Project creation uses staging, so a failed operation should not replace an alrea
 
 ### Load an existing project
 
-To reopen a project, use **Load Project** and select its `project.json` manifest. Do not manually depend on the original game-folder path: the project is designed to contain the data required for subsequent editing and packing.
+To reopen a project, use **Load Project** and select its project folder/manifest as requested by the current UI. Do not manually depend on the original game-folder path: the project is designed to contain the data required for subsequent editing and packing.
 
 ## 3. Project window
 
@@ -53,7 +57,9 @@ After a project is opened, the main project window provides the primary actions:
 - **Run** — launches the already-built executable. Run does **not** automatically start Build.
 - **Close Project** — closes the current project.
 
-The left side contains the project resource tree. Typical roots include `data`, `deck`, the version executable, `region`, and `voice`.
+The left side contains the project resource tree. Typical roots include `data`, `deck`, the version executable, `region`, and `voice`. Selecting a file opens the appropriate editor in the main area.
+
+![Project window with text resource selected](https://drive.google.com/uc?export=view&id=1I4dBUGfSeMm7OT9sRWv7haBQ0voX3MNI)
 
 ## 4. Browse and edit project files
 
@@ -61,7 +67,9 @@ Select a resource in the left tree. YugiohEditor chooses an editor according to 
 
 ### Structured binary data
 
-Known structured resources are displayed as tables. Examples include card-property and localized card resources. Edit the supported cells and use **Save Current File** when the file editor requires an explicit save.
+Known structured resources are displayed as tables. Examples include `card_prop.bin`, card-property resources, and localized card resources. Edit the supported cells and use **Save Current File** when the file editor requires an explicit save.
+
+![Structured table editor for a project resource](https://drive.google.com/uc?export=view&id=1EJqDJKoOUacM4lkHJ4RR0Jw-uW0YMSDt)
 
 ### Text resources
 
@@ -77,9 +85,13 @@ eng, fra, jpn, spa, ita, ger
 
 Selecting an image displays a preview. Use **Replace Image** to choose replacement artwork. PNG and JPEG card replacements are converted to real BMP payloads by the application when saved through the card workflow.
 
+![Image preview and Replace Image action](https://drive.google.com/uc?export=view&id=1Bi2rSzMFtylhPk0FAPstCyU7c8evs4pC)
+
 ### Audio
 
 Selecting a WAV resource displays **Play** and **Replace Audio** controls. Use Play to preview the current sound and Replace Audio to substitute it in the project workspace.
+
+![Audio resource with Play and Replace Audio controls](https://drive.google.com/uc?export=view&id=1hzzUvmgkGwF5Re-dYriecR5kFJd2lH-y)
 
 ### Binary and executable files
 
@@ -108,6 +120,8 @@ Use **Display Language** to switch localized names/descriptions. The optional un
 
 The buttons at the bottom provide card-level operations such as **Add Card**, **Update Card**, **Import**, **Export**, and **Suggest** where supported by the current build.
 
+![Card List showing the combined card data](https://drive.google.com/uc?export=view&id=1CXvAad5N9cb79tCK8qjxrNMT8wcazENv)
+
 ## 6. Edit an existing card
 
 Double-click a card row, or select it and choose **Update Card**, to open **Card Detail**.
@@ -118,9 +132,13 @@ Use **Previous** and **Next** to move between cards without repeatedly closing t
 
 The editor validates card data through the card service rather than directly editing unrelated physical `card_*.bin` files.
 
+![Card Detail for an existing card](https://drive.google.com/uc?export=view&id=1mkCSgQ2vC65phIRjDgj4etVoz3ebOpql)
+
 ## 7. Add a card
 
-Choose **Add Card** from Card List. The dialog prepares a new logical card slot and resolves the Card ID/reference information before the user commits it.
+Choose **Add Card** from Card List. The Card Detail dialog opens first and may temporarily show a lookup/initialization state while the editor resolves the new logical slot, Card ID, and reference information.
+
+![Add Card while reference data is being resolved](https://drive.google.com/uc?export=view&id=1SZLLuCfpvwJfRNFm8XESfkCciidCpz4L)
 
 The supported Joey extended-capacity model allows active Card IDs in `0..4094`. ID `4095` (`0xFFF`) is reserved and is never allocated as a normal card ID. Add Card chooses the lowest safe free Card ID and reports a capacity error if no valid slot remains.
 
@@ -131,6 +149,8 @@ Fill or verify the card fields and select **Save** when ready.
 The **Suggest** workflow can resolve a canonical card through Konami's official card database and fill missing compatible metadata. Depending on available reference data, it can populate localized names/descriptions and Power of Chaos-compatible properties, and can stage card artwork.
 
 Suggested values should still be reviewed before saving. Staged images are committed with the card only when Save succeeds.
+
+![Add Card after Suggest populated reference data and artwork](https://drive.google.com/uc?export=view&id=1O5eCjmdBQhNIC7QU5uNXE95AYoMLjDRv)
 
 ## 8. Replace card artwork
 
@@ -166,7 +186,9 @@ Export overwrites the files it owns but does not clear unrelated files from the 
 
 Select **Build** after saving the edits that should be included in the game.
 
-Build runs in the background and temporarily locks conflicting project mutations. The progress indicator at the bottom of the project window shows that packing is in progress. Do not close the project while a build is being committed.
+Build runs in the background and temporarily locks conflicting project mutations. The progress indicator at the bottom of the project window shows that packing is in progress. While Build is active, conflicting actions are disabled. Wait for the operation to finish before closing the project or starting another project mutation.
+
+![Build running in the background with the progress indicator](https://drive.google.com/uc?export=view&id=1rJDph0nPxVUZR9EopXA-MTxP65c0xu2v)
 
 Successful packing produces approximately:
 
@@ -204,6 +226,8 @@ Run launches the executable that already exists in the project's `bin` directory
 Run never performs an implicit Build. If you change project data after the last Build, build again before running if you want those changes included.
 
 A missing or unlaunchable packed executable is reported as an error.
+
+![Running the packed game from the Project window](https://drive.google.com/uc?export=view&id=1VDb443FbcagTlsif-nDHh1wIYu6FDbIy)
 
 ## 13. Recommended workflow
 

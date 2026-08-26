@@ -162,6 +162,33 @@ class CardEditingServiceTests(unittest.TestCase):
         Image.new("RGB", (320, 460), color).save(payload, format="PNG")
         return payload.getvalue()
 
+    def _canonicalize_fast_path_catalogs(self) -> None:
+        card_ids = self.repository.get_table("card_ids")["value"].astype(int)
+        english_names = self.repository.get_table("card_names", language="eng")[
+            "value"
+        ].astype(str)
+        large = self.repository.get_table(
+            "card_catalog", image_variant=CardImageVariant.LARGE
+        ).reset_index(drop=True)
+        for variant in CardImageVariant:
+            catalog = self.repository.get_table(
+                "card_catalog", image_variant=variant
+            ).reset_index(drop=True)
+            catalog["index"] = range(len(card_ids))
+            catalog["card_id"] = [0 if card_id < 0 else card_id for card_id in card_ids]
+            for row_index, card_id in enumerate(card_ids):
+                if card_id >= 0:
+                    catalog.at[row_index, "name"] = english_names.iloc[row_index]
+                catalog.at[row_index, "image_name"] = large.iloc[row_index][
+                    "image_name"
+                ]
+                catalog.at[row_index, "note"] = large.iloc[row_index]["note"]
+            self.repository.save_table(
+                "card_catalog",
+                catalog,
+                image_variant=variant,
+            )
+
     @staticmethod
     def _complete_suggest_card(
         index: int,
@@ -226,6 +253,601 @@ class CardEditingServiceTests(unittest.TestCase):
         )
         self.assertTrue(draft.dirty)
         self.assertEqual(draft.touched_fields, {"description:eng"})
+
+    def test_trusted_detail_fast_path_rewrites_only_affected_property_table(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.attack = 1700
+        edited.dirty = True
+        edited.touched_fields.add("attack")
+        before = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+        staging = self.repository.begin_update()
+
+        with (
+            patch.object(self.repository, "begin_update", return_value=staging),
+            patch.object(staging, "get_table", side_effect=AssertionError("composite")),
+            patch.object(
+                staging,
+                "save_table",
+                side_effect=AssertionError("composite"),
+            ),
+            patch.object(
+                staging._connection,
+                "rewrite_csv_rows",
+                wraps=staging._connection.rewrite_csv_rows,
+            ) as rewrite_rows,
+        ):
+            saved = self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        self.assertEqual(saved.attack, 1700)
+        self.assertFalse(edited.dirty)
+        self.assertEqual(rewrite_rows.call_count, 1)
+        self.assertTrue(
+            rewrite_rows.call_args.args[0].replace("\\", "/").endswith("card_prop.bin")
+        )
+        after = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+        changed = {name for name in before if before[name] != after[name]}
+        self.assertEqual(changed, {"data/bin#/card_prop.bin"})
+        self.assertEqual(
+            self.service.get_card_detail(self.manifest, 1).attack,
+            1700,
+        )
+
+    def test_trusted_detail_fast_path_groups_each_affected_resource_once(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.password = "00112233"
+        edited.pack = "disabled"
+        edited.attack = 1800
+        edited.defense = 1300
+        edited.localized_text.names["eng"] = "Fast Dragon"
+        edited.localized_text.descriptions["eng"] = 'Fast, quoted "effect"'
+        edited.dirty = True
+        staging = self.repository.begin_update()
+
+        with (
+            patch.object(self.repository, "begin_update", return_value=staging),
+            patch.object(
+                staging._connection,
+                "rewrite_csv_rows",
+                wraps=staging._connection.rewrite_csv_rows,
+            ) as rewrite_rows,
+            patch.object(
+                staging._connection,
+                "write_manifest",
+                wraps=staging._connection.write_manifest,
+            ) as manifest_write,
+        ):
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        paths = [
+            str(call_item.args[0]).replace("\\", "/")
+            for call_item in rewrite_rows.call_args_list
+        ]
+        self.assertEqual(len(paths), len(set(paths)))
+        self.assertEqual(len(paths), 7)
+        self.assertTrue(any(path.endswith("card_pass.bin") for path in paths))
+        self.assertTrue(any(path.endswith("card_pack.bin") for path in paths))
+        self.assertTrue(any(path.endswith("card_prop.bin") for path in paths))
+        self.assertTrue(any(path.endswith("card_nameeng.bin") for path in paths))
+        self.assertTrue(any(path.endswith("card_desceng.bin") for path in paths))
+        self.assertTrue(any(path.endswith("card/list_card.txt") for path in paths))
+        self.assertTrue(any(path.endswith("mini/list_card.txt") for path in paths))
+        self.assertEqual(manifest_write.call_count, 1)
+        reloaded = self.service.get_card_detail(self.manifest, 1)
+        self.assertEqual(reloaded.password, "00112233")
+        self.assertEqual(reloaded.pack, "disabled")
+        self.assertEqual(reloaded.attack, 1800)
+        self.assertEqual(reloaded.defense, 1300)
+        self.assertEqual(reloaded.localized_text.names["eng"], "Fast Dragon")
+        self.assertEqual(
+            reloaded.localized_text.descriptions["eng"],
+            'Fast, quoted "effect"',
+        )
+
+    def test_trusted_detail_true_noop_skips_staging_and_cleans_draft(self):
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.dirty = True
+        edited.touched_fields.add("attack")
+
+        with patch.object(self.repository, "begin_update") as begin_update:
+            saved = self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        begin_update.assert_not_called()
+        self.assertEqual(saved, original.to_detail())
+        self.assertFalse(edited.dirty)
+
+    def test_trusted_detail_catalog_identity_conflict_fails_atomically(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.localized_text.names["eng"] = "Rejected Rename"
+        edited.image_name = "usr777.bmp"
+        edited.large_image_source, edited.small_image_source = build_card_image_pair(
+            self._image_payload("orange")
+        )
+        edited.dirty = True
+        mini = self.repository.get_table(
+            "card_catalog", image_variant=CardImageVariant.MINI
+        )
+        mini.at[1, "card_id"] = 1
+        self.repository.save_table(
+            "card_catalog", mini, image_variant=CardImageVariant.MINI
+        )
+        before = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+
+        with self.assertRaises(CardPersistenceError) as raised:
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        self.assertIn("mini card catalog", str(raised.exception))
+        after = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertTrue(edited.dirty)
+        self.assertEqual(
+            self.service.get_card_detail(self.manifest, 1).localized_text.names["eng"],
+            "Dragon",
+        )
+        self.assertFalse(
+            any(
+                path.name.casefold() == "usr777.bmp"
+                for path in self.repository.root.rglob("*")
+            )
+        )
+
+    def test_trusted_detail_rejects_generated_image_reference_without_pair(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.image_name = "usr404.bmp"
+        edited.dirty = True
+        before = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+
+        with self.assertRaisesRegex(
+            CardPersistenceError,
+            "complete physical card/mini pair",
+        ):
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        after = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertTrue(edited.dirty)
+        self.assertEqual(
+            self.service.get_card_detail(self.manifest, 1).image_name,
+            original.image_name,
+        )
+
+    def test_trusted_detail_stale_clean_baseline_fails_without_fallback(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        concurrent = self.repository.get_table("card_packs")
+        concurrent.at[1, "value"] = "yugi"
+        self.repository.save_table("card_packs", concurrent)
+        edited = original.clone()
+        edited.pack = "disabled"
+        edited.dirty = True
+
+        with (
+            patch.object(
+                self.repository,
+                "get_table",
+                wraps=self.repository.get_table,
+            ) as get_table,
+            self.assertRaises(CardPersistenceError) as raised,
+        ):
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        self.assertIn("Stale CSV row 1", str(raised.exception))
+        self.assertFalse(
+            any(call_item.args[0] == "cards" for call_item in get_table.call_args_list)
+        )
+        self.assertTrue(edited.dirty)
+        self.assertEqual(
+            self.repository.get_table("card_packs").iloc[1]["value"],
+            "yugi",
+        )
+
+    def test_trusted_detail_normalization_only_diff_is_persisted(self):
+        self._canonicalize_fast_path_catalogs()
+        raw_name = "Dragon \N{BLACK CIRCLE}"
+        expected_name = "Dragon \N{BULLET}"
+        names = self.repository.get_table("card_names", language="eng")
+        names.at[1, "value"] = raw_name
+        self.repository.save_table("card_names", names, language="eng")
+        for variant in CardImageVariant:
+            catalog = self.repository.get_table("card_catalog", image_variant=variant)
+            catalog.at[1, "name"] = raw_name
+            self.repository.save_table("card_catalog", catalog, image_variant=variant)
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.dirty = True
+
+        saved = self.service.update_card(
+            self.manifest,
+            edited,
+            original=original,
+        )
+
+        self.assertEqual(saved.localized_text.names["eng"], expected_name)
+        self.assertEqual(edited.localized_text.names["eng"], expected_name)
+        self.assertEqual(
+            self.repository.get_table("card_names", language="eng").iloc[1]["value"],
+            expected_name,
+        )
+
+    def test_trusted_detail_description_empty_preserves_active_state(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.localized_text.descriptions["eng"] = ""
+        edited.dirty = True
+
+        self.service.update_card(
+            self.manifest,
+            edited,
+            original=original,
+        )
+
+        descriptions = self.repository.get_table("card_descriptions", language="eng")
+        self.assertEqual(descriptions.iloc[1]["text"], "")
+        self.assertFalse(descriptions.iloc[1]["is_reserved"])
+
+    def test_trusted_detail_new_image_consumes_each_pending_catalog_once(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.image_name = "usr321.bmp"
+        edited.large_image_source, edited.small_image_source = build_card_image_pair(
+            self._image_payload("navy")
+        )
+        edited.dirty = True
+        staging = self.repository.begin_update()
+
+        with (
+            patch.object(self.repository, "begin_update", return_value=staging),
+            patch.object(
+                staging,
+                "_save_card_catalog",
+                wraps=staging._save_card_catalog,
+            ) as catalog_save,
+            patch.object(
+                staging._connection,
+                "write_manifest",
+                wraps=staging._connection.write_manifest,
+            ) as manifest_write,
+        ):
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        self.assertEqual(catalog_save.call_count, 2)
+        self.assertEqual(
+            {
+                call_item.kwargs["image_variant"]
+                for call_item in catalog_save.call_args_list
+            },
+            set(CardImageVariant),
+        )
+        self.assertEqual(staging._pending_card_catalogs, {})
+        self.assertEqual(manifest_write.call_count, 1)
+        self.assertEqual(
+            self.service.get_card_detail(self.manifest, 1).image_name,
+            "usr321.bmp",
+        )
+        self.assertTrue(
+            all(
+                self.repository.card_image_pair_exists("usr321.bmp") for _unused in (0,)
+            )
+        )
+
+    def test_trusted_detail_same_name_replacement_writes_only_supplied_variant(self):
+        seeded = self.service.get_card_detail(self.manifest, 1).to_draft()
+        seeded.image_name = "usr099.bmp"
+        seeded.large_image_source, seeded.small_image_source = build_card_image_pair(
+            self._image_payload("red")
+        )
+        seeded.dirty = True
+        self.service.save_card_changes(self.manifest, [seeded])
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        catalog_paths = {}
+        for variant in CardImageVariant:
+            folder = "mini" if variant is CardImageVariant.MINI else "card"
+            record = next(
+                record
+                for record in self.manifest.files
+                if record.relative_path.replace("\\", "/") == f"{folder}/list_card.txt"
+            )
+            catalog_paths[self.repository.resource_path(record)] = variant
+        catalog_bytes = {path: path.read_bytes() for path in catalog_paths}
+        edited = original.clone()
+        replacement_large = self._image_payload("blue")
+        edited.large_image_source = replacement_large
+        edited.dirty = True
+        staging = self.repository.begin_update()
+
+        with (
+            patch.object(self.repository, "begin_update", return_value=staging),
+            patch.object(
+                staging,
+                "replace_card_images",
+                wraps=staging.replace_card_images,
+            ) as replace_images,
+            patch.object(
+                staging,
+                "_save_card_catalog",
+                wraps=staging._save_card_catalog,
+            ) as catalog_save,
+        ):
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        replace_images.assert_called_once_with(
+            "usr099.bmp",
+            large_source=replacement_large,
+            mini_source=None,
+        )
+        catalog_save.assert_not_called()
+        for path, before in catalog_bytes.items():
+            self.assertEqual(path.read_bytes(), before)
+        large, mini = self.service.load_card_images(self.manifest, "usr099.bmp")
+        self.assertNotEqual(large, mini)
+
+    def test_trusted_detail_preflight_checks_unaffected_localized_headers(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.attack = 1900
+        edited.dirty = True
+        names_record = next(
+            record
+            for record in self.manifest.files
+            if record.relative_path.endswith("card_nameeng.bin")
+        )
+        self.repository._connection.write_table(
+            names_record.workspace_path,
+            pd.DataFrame({"wrong": ["", "Dragon"]}),
+        )
+
+        with self.assertRaises(CardPersistenceError) as raised:
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        self.assertIn("header mismatch", str(raised.exception))
+        self.assertEqual(
+            self.repository.get_table("card_properties").iloc[1]["attack"],
+            1600,
+        )
+
+    def test_trusted_detail_preflight_rejects_reserved_dummy_description(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.attack = 1900
+        edited.dirty = True
+        descriptions = self.repository.get_table("card_descriptions", language="eng")
+        descriptions.at[0, "text"] = ""
+        descriptions.at[0, "is_reserved"] = True
+        record = next(
+            record
+            for record in self.manifest.files
+            if record.relative_path.endswith("card_desceng.bin")
+        )
+        self.repository._connection.write_table(
+            record.workspace_path,
+            descriptions,
+            ("text", "is_reserved"),
+        )
+
+        with self.assertRaises(CardPersistenceError) as raised:
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        self.assertIn(
+            "active indexed text row cannot be reserved",
+            str(raised.exception),
+        )
+
+    def test_trusted_detail_preflight_rejects_reordered_catalog(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.localized_text.names["eng"] = "Rejected"
+        edited.dirty = True
+        mini = self.repository.get_table(
+            "card_catalog", image_variant=CardImageVariant.MINI
+        ).iloc[::-1]
+        self.repository.save_table(
+            "card_catalog",
+            mini,
+            image_variant=CardImageVariant.MINI,
+        )
+
+        with self.assertRaises(CardPersistenceError) as raised:
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        self.assertIn("reordered", str(raised.exception))
+
+    def test_update_card_without_trusted_original_uses_batch_path(self):
+        draft = self.service.get_card_detail(self.manifest, 1).to_draft()
+        draft.attack = 2000
+        draft.dirty = True
+
+        with patch.object(
+            ProjectRepository,
+            "plan_existing_card_update",
+            side_effect=AssertionError("unexpected fast path"),
+        ):
+            self.service.update_card(self.manifest, draft)
+
+        self.assertEqual(self.service.get_card_detail(self.manifest, 1).attack, 2000)
+
+    def test_trusted_detail_localized_field_mapping_targets_one_language(self):
+        order = max(record.order for record in self.manifest.files) + 1
+        resources = []
+        for stem, table in (
+            ("card_name", pd.DataFrame({"value": ["", "Ancien"]})),
+            (
+                "card_desc",
+                pd.DataFrame(
+                    {
+                        "text": ["Dos", "Ancienne description"],
+                        "is_reserved": [False, False],
+                    }
+                ),
+            ),
+        ):
+            relative_path = f"bin#/{stem}fra.bin"
+            resources.append(
+                ProjectResource(
+                    ProjectFileRecord(
+                        "Data.dat",
+                        relative_path,
+                        f"data/{relative_path}",
+                        "table",
+                        "table",
+                        language="fra",
+                        order=order,
+                    ),
+                    table,
+                )
+            )
+            order += 1
+        self.manifest.files.extend(self.repository.import_resources(resources))
+        self.repository.save(self.manifest)
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.localized_text.names["fra"] = "Nouveau"
+        edited.localized_text.descriptions["fra"] = "Nouvelle description"
+        edited.dirty = True
+        staging = self.repository.begin_update()
+
+        with (
+            patch.object(self.repository, "begin_update", return_value=staging),
+            patch.object(
+                staging._connection,
+                "rewrite_csv_rows",
+                wraps=staging._connection.rewrite_csv_rows,
+            ) as rewrite_rows,
+        ):
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        paths = {
+            str(call_item.args[0]).replace("\\", "/")
+            for call_item in rewrite_rows.call_args_list
+        }
+        self.assertEqual(
+            paths,
+            {
+                "data/bin#/card_namefra.bin",
+                "data/bin#/card_descfra.bin",
+            },
+        )
+
+    def test_trusted_detail_commit_failure_rolls_back_rows_and_draft(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        edited = original.clone()
+        edited.attack = 2100
+        edited.dirty = True
+        before = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+
+        with (
+            patch.object(
+                self.repository,
+                "commit_update",
+                side_effect=OSError("controlled fast commit failure"),
+            ),
+            self.assertRaises(CardPersistenceError),
+        ):
+            self.service.update_card(
+                self.manifest,
+                edited,
+                original=original,
+            )
+
+        after = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertTrue(edited.dirty)
+        self.assertEqual(edited.attack, 2100)
+        self.assertEqual(self.service.get_card_detail(self.manifest, 1).attack, 1600)
 
     def test_official_japanese_name_audits_every_cp932_character(self):
         with self.assertRaises(UnicodeEncodeError) as raised:
@@ -971,6 +1593,152 @@ class CardEditingServiceTests(unittest.TestCase):
         self.assertEqual(large, replacement_large)
         self.assertEqual(mini, original_mini)
 
+    def test_same_casefold_image_target_coalesces_latest_complete_pair(self):
+        first = self.service.get_card_detail(self.manifest, 0).to_draft()
+        second = self.service.get_card_detail(self.manifest, 1).to_draft()
+        first_large, first_mini = build_card_image_pair(self._image_payload("red"))
+        last_large, last_mini = build_card_image_pair(self._image_payload("green"))
+        first.image_name = "usr030.bmp"
+        first.large_image_source = first_large
+        first.small_image_source = first_mini
+        first.dirty = True
+        second.image_name = "USR030.BMP"
+        second.large_image_source = last_large
+        second.small_image_source = last_mini
+        second.dirty = True
+
+        self.service.save_card_changes(self.manifest, [first, second])
+
+        self.assertEqual(first.image_name, "USR030.BMP")
+        self.assertEqual(second.image_name, "USR030.BMP")
+        large, mini = self.service.load_card_images(self.manifest, "usr030.bmp")
+        self.assertEqual(large, last_large)
+        self.assertEqual(mini, last_mini)
+        records = [
+            record
+            for record in self.manifest.files
+            if Path(record.relative_path).name.casefold() == "usr030.bmp"
+        ]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            len({record.relative_path.casefold() for record in records}),
+            2,
+        )
+        reloaded = {
+            card.card_index: card
+            for card in self.service.load_card_details(self.manifest)
+        }
+        self.assertEqual(reloaded[0].image_name, "USR030.BMP")
+        self.assertEqual(reloaded[1].image_name, "USR030.BMP")
+
+    def test_same_image_target_merges_latest_nonempty_variants(self):
+        first = self.service.get_card_detail(self.manifest, 0).to_draft()
+        second = self.service.get_card_detail(self.manifest, 1).to_draft()
+        first_large, _unused_first_mini = build_card_image_pair(
+            self._image_payload("navy")
+        )
+        _unused_last_large, last_mini = build_card_image_pair(
+            self._image_payload("orange")
+        )
+        first.image_name = "usr031.bmp"
+        first.large_image_source = first_large
+        first.dirty = True
+        second.image_name = "USR031.BMP"
+        second.small_image_source = last_mini
+        second.dirty = True
+
+        self.service.save_card_changes(self.manifest, [first, second])
+
+        large, mini = self.service.load_card_images(self.manifest, "usr031.bmp")
+        self.assertEqual(large, first_large)
+        self.assertEqual(mini, last_mini)
+        self.assertEqual(first.image_name, "USR031.BMP")
+        self.assertEqual(second.image_name, "USR031.BMP")
+
+    def test_detail_image_commit_then_list_batch_reuses_existing_pair(self):
+        self._canonicalize_fast_path_catalogs()
+        original = self.service.get_card_detail(self.manifest, 1).to_draft()
+        detail = original.clone()
+        detail_large, detail_mini = build_card_image_pair(self._image_payload("blue"))
+        detail.image_name = "usr032.bmp"
+        detail.large_image_source = detail_large
+        detail.small_image_source = detail_mini
+        detail.dirty = True
+
+        self.service.update_card(
+            self.manifest,
+            detail,
+            original=original,
+        )
+
+        list_draft = self.service.get_card_detail(self.manifest, 0).to_draft()
+        list_large, list_mini = build_card_image_pair(self._image_payload("purple"))
+        list_draft.image_name = "USR032.BMP"
+        list_draft.large_image_source = list_large
+        list_draft.small_image_source = list_mini
+        list_draft.dirty = True
+        self.service.save_card_changes(self.manifest, [list_draft])
+
+        large, mini = self.service.load_card_images(self.manifest, "usr032.bmp")
+        self.assertEqual(large, list_large)
+        self.assertEqual(mini, list_mini)
+        records = [
+            record
+            for record in self.manifest.files
+            if Path(record.relative_path).name.casefold() == "usr032.bmp"
+        ]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            len({record.relative_path.casefold() for record in records}),
+            2,
+        )
+
+    def test_existing_image_overwrite_failure_rolls_back_staging(self):
+        seeded = self.service.get_card_detail(self.manifest, 1).to_draft()
+        original_large, original_mini = build_card_image_pair(
+            self._image_payload("teal")
+        )
+        seeded.image_name = "usr033.bmp"
+        seeded.large_image_source = original_large
+        seeded.small_image_source = original_mini
+        seeded.dirty = True
+        self.service.save_card_changes(self.manifest, [seeded])
+        before = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+
+        replacement = self.service.get_card_detail(self.manifest, 1).to_draft()
+        replacement.large_image_source, replacement.small_image_source = (
+            build_card_image_pair(self._image_payload("yellow"))
+        )
+        replacement.dirty = True
+        staging = self.repository.begin_update()
+        with (
+            patch.object(self.repository, "begin_update", return_value=staging),
+            patch.object(
+                staging,
+                "save_table",
+                side_effect=OSError("controlled table failure"),
+            ),
+            self.assertRaises(CardPersistenceError),
+        ):
+            self.service.save_card_changes(self.manifest, [replacement])
+
+        after = {
+            path.relative_to(self.repository.root).as_posix(): path.read_bytes()
+            for path in self.repository.root.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertTrue(replacement.dirty)
+        self.assertIsNotNone(replacement.large_image_source)
+        self.assertIsNotNone(replacement.small_image_source)
+        large, mini = self.service.load_card_images(self.manifest, "usr033.bmp")
+        self.assertEqual(large, original_large)
+        self.assertEqual(mini, original_mini)
+
     def test_mixed_image_save_preserves_replacement_metadata_and_reloads(self):
         original_large, original_mini = build_card_image_pair(
             self._image_payload("blue")
@@ -1031,9 +1799,9 @@ class CardEditingServiceTests(unittest.TestCase):
             ) as image_batch,
             patch.object(
                 staging,
-                "replace_card_image",
-                wraps=staging.replace_card_image,
-            ) as replace_image,
+                "replace_card_images",
+                wraps=staging.replace_card_images,
+            ) as replace_images,
             patch.object(
                 staging._connection,
                 "write_manifest",
@@ -1050,10 +1818,10 @@ class CardEditingServiceTests(unittest.TestCase):
             [item.image_name for item in image_batch.call_args.args[0]],
             ["usr021.bmp"],
         )
-        replace_image.assert_called_once_with(
+        replace_images.assert_called_once_with(
             "usr020.bmp",
-            replacement_large,
-            mini=False,
+            large_source=replacement_large,
+            mini_source=None,
         )
         self.assertEqual(manifest_write.call_count, 1)
         replacement_records = [
@@ -1442,6 +2210,33 @@ class CardEditingServiceTests(unittest.TestCase):
             if record.relative_path.endswith("usr000.bmp")
         }
         self.assertEqual(records, {"data/card/usr000.bmp", "data/mini/usr000.bmp"})
+
+    def test_detail_suggestion_skips_casefolded_pending_list_reservation(self):
+        draft = self.service.create_card_draft()
+        draft.localized_text.names["eng"] = "Reserved Image Card"
+        self.reference_service.suggest_card_reference.return_value = CardReferenceData(
+            matched_name="Reserved Image Card",
+            matched_language="eng",
+            localized_names={"eng": "Reserved Image Card"},
+            localized_descriptions={"eng": "Reference text"},
+        )
+        self.reference_service.generate_card_image_name.side_effect = (
+            generate_unique_card_image_name
+        )
+        source = BytesIO()
+        Image.new("RGB", (320, 460), "blue").save(source, format="PNG")
+        self.reference_service.crawl_card_image.return_value = source.getvalue()
+
+        result = self.service.suggest_card_draft(
+            self.manifest,
+            draft,
+            additional_reserved_image_names=("USR000.BMP",),
+        )
+
+        self.assertTrue(result.image_staged)
+        self.assertEqual(result.draft.image_name, "usr001.bmp")
+        reserved = self.reference_service.generate_card_image_name.call_args.args[0]
+        self.assertIn("usr000.bmp", reserved)
 
     def test_japanese_suggestion_uses_canonical_english_name_for_image(self):
         draft = self.service.create_card_draft()

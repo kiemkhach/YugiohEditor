@@ -550,15 +550,20 @@ discards Pack staging and leaves the prior `bin`, workspace executable, and
 game installation unchanged. Native Windows icon-resource verification is a
 separate integration layer from actual game/runtime verification.
 
-`CardService` uses only:
+`CardService` keeps both persistence strategies behind repository contracts:
 
 ```python
 repository.get_table("cards", language=...)
 repository.save_table("cards", cards, language=...)
+repository.plan_existing_card_update(before, after, ...)
+repository.apply_existing_card_update(plan)
 ```
 
-Image use cases call repository resource methods. The service does not know card
-subfile paths, virtual construction pipelines, connections, or codecs.
+The composite calls are the Card List batch strategy. A trusted, clean existing
+Card Detail baseline uses the planned-row strategy, which inspects table
+topology and rewrites only affected physical CSV rows. Image use cases call
+repository resource methods. The service does not know card subfile paths, CSV
+paths/encoding, virtual construction pipelines, connections, or codecs.
 
 CardService reuses the pure Joey capacity policy. Add Card selects the next
 slot only through 4094 and the lowest safe free Card ID through `0xFFE`, while
@@ -568,15 +573,25 @@ record count, namespace, and Card ID uniqueness before opening its staging
 transaction, which closes stale-draft capacity races.
 
 Card Detail and Card List both persist edits through
-`CardService.save_card_changes()`. The service creates one staging clone, sends
-all new image pairs through the repository batch API without per-image manifest
-writes, applies replacements, saves the logical cards table and its two
-catalogs, writes the final validated manifest once, and atomically commits the
-staging directory. Batch inventory/catalog work is constant per save rather
-than proportional to the number of images. Any preparation, file, catalog,
+`CardService.save_card_changes()`. With a trusted single-card baseline, that
+entry point calculates a normalized field diff and asks the repository to
+preflight every physical card table before applying only the affected row
+patches. New/untrusted cards and Card List Save retain the composite pandas
+batch path. Both strategies create one staging clone, apply image targets,
+validate generated/custom image references, write the final manifest once, and
+atomically commit the staging directory. Any preparation, file, catalog,
 manifest, or commit failure discards staging and leaves the original project
 and `project.json` unchanged; files and manifest records cannot be committed
 independently.
+
+Image writes are coalesced by case-folded plain BMP filename. Later staged
+payloads win independently for the large and mini variants, so multiple cards
+may intentionally reference one complete pair without creating duplicate
+manifest paths. An existing pair is replaced in place and retains path, order,
+and compression metadata. A new target creates exactly one `card/` and one
+`mini/` record. Partial pairs, missing workspace files, wrong source/type,
+virtual/generated records, or paths outside the canonical image namespaces
+still fail the whole staging transaction.
 
 `SubfileService` is a small compatibility use-case facade that delegates archive
 decode/encode and workspace import/export to repositories.
@@ -584,6 +599,13 @@ decode/encode and workspace import/export to repositories.
 ## UI and workers
 
 Qt Designer XML remains in `yugioh_editor/ui` and is loaded at runtime.
+
+Project and Card List commands are canonical window-scoped `QAction` objects
+owned by their views. Project exposes File, Tools, and Build menus; Card List
+exposes File, Edit, and Tools. There is one menu bar and no duplicate command
+toolbar. Card List keeps only the display-language, empty-filter, and Enable All
+quick controls outside the menu. Action enabled state, shortcut, status text,
+and handler therefore have one source of truth.
 
 Project creation, loading, packing, Card List loading/save, Suggest, and card
 image-pair reads run through retained `TaskRunner` jobs and `QThreadPool`.
@@ -600,6 +622,25 @@ language, and export interactions available while disabling Add, Update,
 Import, Enable All, Suggest, and Save. Closing requests cancellation and defers
 dialog teardown until the retained runner finishes. Save has one retained
 runner guard, so repeated clicks cannot run concurrent repository transactions.
+When Card List Save begins, its indeterminate progress bar is shown before work
+is queued, and menus, table interaction, filters, language, Export, and Close
+are locked until the retained worker finishes. Model-owned dirty drafts are
+captured by reference while locked and cloned in the worker rather than on the
+GUI thread. Successful results that only clear dirty/image-source state require
+no model notification; normalization that changes displayed values produces at
+most one scoped notification instead of one proxy-invalidating notification per
+card. This keeps the Qt event loop responsive throughout the transaction.
+
+The Save lock is also a data-race boundary, not only a presentation state.
+Every path that can mutate a `CardEditDraft` owned by `CardListModel`--including
+future programmatic writers, delayed worker callbacks, signals, and timers--must
+run its model mutation on the GUI thread and reject or defer it while Save is
+pending or running. Disabled widgets alone do not serialize those writers. If a
+future requirement cannot honor this boundary, the reference handoff is no
+longer valid: replace it with an immutable GUI-thread snapshot or a thread-safe
+snapshot/generation protocol that detects changes during capture and before
+applying the Save result. Cover that protocol with a race regression before
+enabling the new writer.
 
 Reference lookup tries Official directly, resolves explicit English redirects
 through the Yugipedia MediaWiki API, retries Official with the canonical name,
@@ -664,6 +705,16 @@ partial mutation, and per-card failures do not affect other cards. The progress
 total and `total_candidates` are the semantic post-filter count, while the
 result separately reports source count, skipped-complete count, selected worker
 count, available-memory estimate, image outcomes, and cancellation.
+Runner identity guards ignore progress/result/finish signals from an older
+cancelled session. Completed image payloads intentionally retained in the Card
+List model reserve their case-folded names when Card Detail Suggest allocates a
+new target. A close-with-Save request applies the cancelled session's completed
+result before taking the Save snapshot; discard/teardown paths do not accept a
+late result.
+Card Detail blocks teardown while its Save or Suggest runner owns UI callbacks.
+Preview runners use lifetime-safe bound slots and retain every overlapping
+request, so a late image failure is disconnected automatically if the dialog is
+destroyed.
 
 The reference-data service also keeps per-key in-flight futures for lookup and
 image keys. One owner performs an identical concurrent request while waiters

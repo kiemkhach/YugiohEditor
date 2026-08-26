@@ -3,7 +3,7 @@ from __future__ import annotations
 import codecs
 import logging
 import unicodedata
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError,
@@ -137,6 +137,13 @@ class _StagedImageSaveStats:
     replacement_pairs: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _StagedCardImageTarget:
+    image_name: str
+    large_source: Path | bytes | None
+    mini_source: Path | bytes | None
+
+
 class CardService:
     """Coordinate card editing through the repository's logical table API."""
 
@@ -231,32 +238,35 @@ class CardService:
         self,
         manifest: ProjectManifest | None,
         draft: CardEditDraft,
+        *,
+        original: CardEditDraft | None = None,
     ) -> CardDetailData:
         if draft.is_new:
             raise CardValidationError(
                 ["update_card cannot update a CREATE-mode draft."]
             )
-        self.save_card_changes(manifest, [draft])
+        self.save_card_changes(manifest, [draft], original=original)
         return draft.to_detail()
 
     def save_card_changes(
         self,
         manifest: ProjectManifest | None,
         changes: Sequence[CardEditDraft],
+        *,
+        original: CardEditDraft | None = None,
     ) -> None:
+        if (
+            len(changes) == 1
+            and isinstance(original, CardEditDraft)
+            and self._is_trusted_existing_card_baseline(changes[0], original)
+        ):
+            self._update_existing_card_fast(manifest, changes[0], original)
+            return
         overall_started = perf_counter()
-        drafts = [self._normalize_card_draft_text(draft) for draft in changes]
+        drafts = self._prepare_card_drafts_for_save(changes)
         if not drafts:
             return
         validation_errors: list[str] = []
-        for draft in drafts:
-            try:
-                draft.password = normalize_card_password(draft.password)
-            except ValueError:
-                pass
-            validation_errors.extend(self._validate_normalized_card_draft(draft))
-        if validation_errors:
-            raise CardValidationError(validation_errors)
 
         repository = self._project(manifest)
         current = repository.get_table("cards", language=DEFAULT_LANGUAGE)
@@ -360,15 +370,7 @@ class CardService:
             ) from error
 
         for original, saved in zip(changes, drafts, strict=True):
-            original.localized_text.names.update(saved.localized_text.names)
-            original.localized_text.descriptions.update(
-                saved.localized_text.descriptions
-            )
-            original.password = saved.password
-            original.dirty = False
-            original.is_new = False
-            original.large_image_source = None
-            original.small_image_source = None
+            self._sync_saved_draft(original, saved)
 
         try:
             logging.info(
@@ -387,6 +389,175 @@ class CardService:
         except Exception:
             # Telemetry cannot turn an already committed save into a failure.
             pass
+
+    def _update_existing_card_fast(
+        self,
+        manifest: ProjectManifest | None,
+        draft: CardEditDraft,
+        original: CardEditDraft,
+    ) -> CardDetailData:
+        overall_started = perf_counter()
+        normalized = self._prepare_card_drafts_for_save((draft,))[0]
+        before = self._canonical_card_row(original)
+        after = self._canonical_card_row(normalized)
+        changed_fields = {
+            field_name
+            for field_name in set(before).union(after)
+            if before.get(field_name) != after.get(field_name)
+        }
+        has_image_change = (
+            normalized.large_image_source is not None
+            or normalized.small_image_source is not None
+        )
+        if not changed_fields and not has_image_change:
+            self._sync_saved_draft(draft, normalized)
+            return normalized.to_detail()
+
+        repository = self._project(manifest)
+        staging_started = perf_counter()
+        staging = repository.begin_update()
+        staging_duration = perf_counter() - staging_started
+        try:
+            image_is_addition = bool(
+                has_image_change
+                and not staging.card_image_pair_exists(normalized.image_name)
+            )
+            plan = staging.plan_existing_card_update(
+                before,
+                after,
+                include_catalogs=image_is_addition,
+            )
+            image_started = perf_counter()
+            image_stats = self._apply_staged_images(staging, (normalized,))
+            staging.validate_card_image_references((normalized.image_name,))
+            image_duration = perf_counter() - image_started
+            table_started = perf_counter()
+            written_resources = staging.apply_existing_card_update(plan)
+            staging.save()
+            table_duration = perf_counter() - table_started
+            commit_started = perf_counter()
+            repository.commit_update(staging)
+            commit_duration = perf_counter() - commit_started
+        except CardError:
+            staging.discard()
+            raise
+        except Exception as error:
+            staging.discard()
+            raise CardPersistenceError(
+                f"update_card failed for card index {draft.card_index}; "
+                f"the project was not committed: {error}"
+            ) from error
+
+        self._sync_saved_draft(draft, normalized)
+        try:
+            logging.info(
+                "Card Detail fast Save completed: card_index=%d resources=%s "
+                "new_image_pairs=%d replacement_image_pairs=%d "
+                "staging_clone=%.3fs images=%.3fs rows_and_manifest=%.3fs "
+                "commit=%.3fs overall=%.3fs",
+                normalized.card_index,
+                ",".join(written_resources) or "none",
+                image_stats.new_pairs,
+                image_stats.replacement_pairs,
+                staging_duration,
+                image_duration,
+                table_duration,
+                commit_duration,
+                perf_counter() - overall_started,
+            )
+        except Exception:
+            pass
+        return normalized.to_detail()
+
+    def _prepare_card_drafts_for_save(
+        self,
+        changes: Sequence[CardEditDraft],
+    ) -> list[CardEditDraft]:
+        drafts = [self._normalize_card_draft_text(draft) for draft in changes]
+        validation_errors: list[str] = []
+        for draft in drafts:
+            try:
+                draft.password = normalize_card_password(draft.password)
+            except ValueError:
+                pass
+            validation_errors.extend(self._validate_normalized_card_draft(draft))
+        if validation_errors:
+            raise CardValidationError(validation_errors)
+        canonical_names = {
+            target.image_name.casefold(): target.image_name
+            for target in self._coalesce_staged_image_targets(drafts)
+        }
+        for draft in drafts:
+            canonical_name = canonical_names.get(draft.image_name.casefold())
+            if canonical_name is not None:
+                draft.image_name = canonical_name
+        return drafts
+
+    @staticmethod
+    def _is_trusted_existing_card_baseline(
+        draft: CardEditDraft,
+        original: CardEditDraft | None,
+    ) -> bool:
+        return bool(
+            isinstance(original, CardEditDraft)
+            and not original.is_new
+            and not original.dirty
+            and original.large_image_source is None
+            and original.small_image_source is None
+            and original.card_index == draft.card_index
+            and original.card_id == draft.card_id
+        )
+
+    @staticmethod
+    def _sync_saved_draft(target: CardEditDraft, saved: CardEditDraft) -> None:
+        target.localized_text.names.update(saved.localized_text.names)
+        target.localized_text.descriptions.update(saved.localized_text.descriptions)
+        for field_name in (
+            "password",
+            "level",
+            "attack",
+            "defense",
+            "attribute",
+            "card_type",
+            "card_category",
+            "pack",
+            "image_name",
+            "note",
+            "monster_type_code",
+            "card_category_code",
+            "attribute_code",
+        ):
+            setattr(target, field_name, getattr(saved, field_name))
+        target.dirty = False
+        target.is_new = False
+        target.large_image_source = None
+        target.small_image_source = None
+
+    @staticmethod
+    def _canonical_card_row(draft: CardEditDraft) -> dict[str, object]:
+        row: dict[str, object] = {
+            "card_index": int(draft.card_index),
+            "card_id": int(draft.card_id),
+            "passcode": normalize_card_password(draft.password),
+            "pack": str(draft.pack),
+            "attack": CardService._optional_int_value(draft.attack),
+            "defense": CardService._optional_int_value(draft.defense),
+            "monster_type": draft.card_type,
+            "card_category": draft.card_category,
+            "attribute": draft.attribute,
+            "monster_type_code": draft.monster_type_code,
+            "card_category_code": draft.card_category_code,
+            "attribute_code": draft.attribute_code,
+            "level": CardService._optional_int_value(draft.level),
+            "image_name": draft.image_name,
+            "note": draft.note,
+        }
+        for language in LANGUAGE_PREFIXES:
+            row[card_name_column(language)] = draft.localized_text.names[language]
+            row[card_description_column(language)] = draft.localized_text.descriptions[
+                language
+            ]
+        return row
 
     def validate_card_draft(self, draft: CardEditDraft) -> list[str]:
         normalized = self._normalize_card_draft_text(draft)
@@ -785,6 +956,7 @@ class CardService:
         *,
         include_image: bool = True,
         preferred_language: str | None = None,
+        additional_reserved_image_names: Iterable[str] = (),
     ) -> CardSuggestionResult:
         return self._suggest_card_draft(
             manifest,
@@ -792,6 +964,7 @@ class CardService:
             include_image=include_image,
             preferred_language=preferred_language,
             reserved_image_names=None,
+            additional_reserved_image_names=additional_reserved_image_names,
             image_inventory_error=None,
         )
 
@@ -803,6 +976,7 @@ class CardService:
         include_image: bool,
         preferred_language: str | None,
         reserved_image_names: set[str] | None,
+        additional_reserved_image_names: Iterable[str] = (),
         image_inventory_error: str | None,
     ) -> CardSuggestionResult:
         """Run the shared one-card Suggest pipeline without mutating ``draft``."""
@@ -828,6 +1002,7 @@ class CardService:
             manifest,
             resolved,
             reserved_image_names=reserved_image_names,
+            additional_reserved_image_names=additional_reserved_image_names,
         )
 
     def _resolve_card_suggestion(
@@ -923,6 +1098,7 @@ class CardService:
         resolved: _ResolvedCardSuggestion,
         *,
         reserved_image_names: set[str] | None,
+        additional_reserved_image_names: Iterable[str] = (),
     ) -> CardSuggestionResult:
         staged = resolved.draft
         applied = list(resolved.applied_fields)
@@ -935,6 +1111,17 @@ class CardService:
                         name.casefold()
                         for name in self.existing_card_image_names(manifest)
                     }
+                else:
+                    normalized_reserved_names = {
+                        str(name).casefold() for name in reserved_image_names
+                    }
+                    reserved_image_names.clear()
+                    reserved_image_names.update(normalized_reserved_names)
+                reserved_image_names.update(
+                    str(name).casefold()
+                    for name in additional_reserved_image_names
+                    if str(name).strip()
+                )
                 candidate = self._card_reference_data_service.generate_card_image_name(
                     reserved_image_names
                 )
@@ -1256,51 +1443,82 @@ class CardService:
         repository: ProjectRepository,
         drafts: Sequence[CardEditDraft],
     ) -> _StagedImageSaveStats:
-        image_drafts = [
-            draft
-            for draft in drafts
-            if draft.large_image_source is not None
-            or draft.small_image_source is not None
-        ]
-        if not image_drafts:
+        targets = self._coalesce_staged_image_targets(drafts)
+        if not targets:
             return _StagedImageSaveStats()
 
+        existing_pair_keys = repository.existing_card_image_pair_keys(
+            target.image_name for target in targets
+        )
         additions: list[NamedCardImagePair] = []
-        replacements: list[CardEditDraft] = []
-        for draft in image_drafts:
-            large = draft.large_image_source
-            small = draft.small_image_source
-            if not repository.card_image_pair_exists(draft.image_name):
-                if large is None or small is None:
+        replacements: list[_StagedCardImageTarget] = []
+        for target in targets:
+            if target.image_name.casefold() not in existing_pair_keys:
+                if target.large_source is None or target.mini_source is None:
                     raise CardImageError(
-                        f"New image {draft.image_name} requires a complete pair."
+                        f"New image {target.image_name} requires a complete pair."
                     )
                 additions.append(
                     NamedCardImagePair(
-                        image_name=draft.image_name,
-                        large_source=large,
-                        mini_source=small,
+                        image_name=target.image_name,
+                        large_source=target.large_source,
+                        mini_source=target.mini_source,
                     )
                 )
                 continue
-            replacements.append(draft)
+            replacements.append(target)
 
         if additions:
             repository.add_named_card_images_batch(
                 additions,
                 save_manifest=False,
             )
-        for draft in replacements:
-            large = draft.large_image_source
-            small = draft.small_image_source
-            if large is not None:
-                repository.replace_card_image(draft.image_name, large, mini=False)
-            if small is not None:
-                repository.replace_card_image(draft.image_name, small, mini=True)
+        for target in replacements:
+            repository.replace_card_images(
+                target.image_name,
+                large_source=target.large_source,
+                mini_source=target.mini_source,
+            )
         return _StagedImageSaveStats(
             new_pairs=len(additions),
             replacement_pairs=len(replacements),
         )
+
+    @staticmethod
+    def _coalesce_staged_image_targets(
+        drafts: Sequence[CardEditDraft],
+    ) -> tuple[_StagedCardImageTarget, ...]:
+        """Merge staged writes by logical target while preserving source order."""
+
+        targets: dict[str, _StagedCardImageTarget] = {}
+        for draft in drafts:
+            large_source = draft.large_image_source
+            mini_source = draft.small_image_source
+            if large_source is None and mini_source is None:
+                continue
+            image_name = str(draft.image_name)
+            key = image_name.casefold()
+            previous = targets.get(key)
+            targets[key] = _StagedCardImageTarget(
+                # The last source-order spelling is canonical for a new target.
+                # Existing targets still retain their manifest path spelling.
+                image_name=image_name,
+                large_source=(
+                    large_source
+                    if large_source is not None
+                    else None
+                    if previous is None
+                    else previous.large_source
+                ),
+                mini_source=(
+                    mini_source
+                    if mini_source is not None
+                    else None
+                    if previous is None
+                    else previous.mini_source
+                ),
+            )
+        return tuple(targets.values())
 
     @staticmethod
     def _row_to_detail(row: Mapping[str, object]) -> CardDetailData:

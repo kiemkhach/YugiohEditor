@@ -48,18 +48,24 @@ To reopen a project, use **Load Project** and select its project folder/manifest
 
 ## 3. Project window
 
-After a project is opened, the main project window provides the primary actions:
+After a project is opened, its single menu bar provides the primary actions:
 
-- **Card List** — opens the combined card editor.
-- **Save Current File** — saves edits made in the currently selected file editor.
-- **Export Files** — reconstructs editable/decompressed project files to a selected destination.
-- **Build** — packs the current project into runnable game files under `bin/`.
-- **Run** — launches the already-built executable. Run does **not** automatically start Build.
-- **Close Project** — closes the current project.
+- **File > Save Current File** (`Ctrl+S`) — saves edits made in the currently selected file editor.
+- **File > Export Files** (`Ctrl+Shift+E`) — reconstructs editable/decompressed project files to a selected destination.
+- **File > Close Project** (`Ctrl+W`) — closes the current project.
+- **Tools > Card List** — opens the combined card editor.
+- **Build > Build** (`Ctrl+Shift+B`) — packs the current project into runnable game files under `bin/`.
+- **Build > Run** (`F5`) — launches the already-built executable. Run does **not** automatically start Build.
 
-The left side contains the project resource tree. Typical roots include `data`, `deck`, the version executable, `region`, and `voice`. Selecting a file opens the appropriate editor in the main area.
+There is no second toolbar or command row. The left side contains the project
+resource tree, and the selected editor expands beside it through the full usable
+height above the status/progress area. Typical roots include `data`, `deck`, the
+version executable, `region`, and `voice`. Selecting a file opens the appropriate editor in the main area.
 
 ![Project window with text resource selected](https://drive.google.com/uc?export=view&id=1I4dBUGfSeMm7OT9sRWv7haBQ0voX3MNI)
+
+> The screenshot may show the earlier command-row layout. Current builds use
+> the menu-only layout described above; the editing area is otherwise the same.
 
 ## 4. Browse and edit project files
 
@@ -118,9 +124,27 @@ Typical columns include:
 
 Use **Display Language** to switch localized names/descriptions. The optional unused/empty filter can be used to focus on disabled cards.
 
-The buttons at the bottom provide card-level operations such as **Add Card**, **Update Card**, **Import**, **Export**, and **Suggest** where supported by the current build.
+Card List has one menu bar and no duplicate toolbar/command row:
+
+- **File** — Import Cards (`Ctrl+O`), Export Cards (`Ctrl+Shift+E`), Save (`Ctrl+S`), and Close (`Ctrl+W`).
+- **Edit** — Add Card (`Ctrl+N`), Update Card (`F2`), and `enable all`.
+- **Tools** — Suggest and Cancel Suggest while a bulk suggestion is active.
+
+Display Language, the exact `filter empty`/`un-filter empty` toggle, and the
+quick `enable all` control remain beside the table because they act directly on
+the current list.
+
+When **Save** is selected, the complete Card List window locks immediately and
+the indeterminate progress bar starts before the save worker begins. The table,
+menus, filters, language selector, export, and close actions remain locked until
+success or failure. Saving and model reconciliation stay off the GUI hot path,
+so the window continues processing paint and timer events instead of entering a
+Not Responding state.
 
 ![Card List showing the combined card data](https://drive.google.com/uc?export=view&id=1CXvAad5N9cb79tCK8qjxrNMT8wcazENv)
+
+> The screenshot may show the earlier command-row layout. Use the menus and
+> shortcuts listed above in current builds.
 
 ## 6. Edit an existing card
 
@@ -129,6 +153,10 @@ Double-click a card row, or select it and choose **Update Card**, to open **Card
 Card Detail exposes the logical card fields together in one window, including localized text, Card ID, image name, password, monster statistics, attribute/type/category, pack assignment, and card artwork.
 
 Use **Previous** and **Next** to move between cards without repeatedly closing the dialog. After changing a card, choose **Save** to validate and persist the change.
+
+Existing-card Save uses a strict single-row fast path when the original row is
+still trustworthy; it keeps the same staging-and-atomic-commit guarantee as the
+full Card List/new-card path.
 
 The editor validates card data through the card service rather than directly editing unrelated physical `card_*.bin` files.
 
@@ -157,6 +185,11 @@ Suggested values should still be reviewed before saving. Staged images are commi
 Card Detail shows the large card image and its mini-image preview. Replacement images are processed by Pillow and stored as BMP data compatible with the project resource pipeline.
 
 When a new physical card image is introduced, YugiohEditor updates the Data.dat manifest ordering required by the game. Do not manually reorder generated manifest entries to compensate for image changes.
+
+If several staged edits refer to the same image filename with different casing,
+they are one canonical target. The last staged nonempty large and mini payloads
+win independently, and Save commits exactly one validated `card/` + `mini/`
+pair. A partial or malformed pair fails atomically.
 
 ## 9. Save your work
 
@@ -255,7 +288,7 @@ For projects that extend the original 1115-card topology, runtime testing is esp
 
 ## 14. Troubleshooting
 
-### Build button is disabled
+### Build is disabled
 
 A project mutation, export, or existing background build may still be active. Wait for the current operation and progress indicator to finish.
 

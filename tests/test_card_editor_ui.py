@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -15,8 +16,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PYSIDE_AVAILABLE = importlib.util.find_spec("PySide6") is not None
 
 if PYSIDE_AVAILABLE:
-    from PySide6.QtCore import QRect, QSize, Qt, QThread
-    from PySide6.QtGui import QColor, QPixmap
+    from PySide6.QtCore import QEvent, QRect, QSize, Qt, QThread, QTimer
+    from PySide6.QtGui import QAction, QColor, QKeySequence, QPixmap
+    from PySide6.QtTest import QTest
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -24,10 +26,14 @@ if PYSIDE_AVAILABLE:
         QFileDialog,
         QFrame,
         QLineEdit,
+        QMenu,
         QMessageBox,
         QPushButton,
+        QToolBar,
+        QToolButton,
         QWidget,
     )
+    from shiboken6 import isValid
 
     from yugioh_editor.common.constants import LANGUAGE_PREFIXES
     from yugioh_editor.models.card_editing import (
@@ -312,6 +318,7 @@ class CardEditorUiTests(unittest.TestCase):
             self.manifest,
             ANY,
             preferred_language="eng",
+            additional_reserved_image_names=(),
         )
         dialog.deleteLater()
 
@@ -332,9 +339,148 @@ class CardEditorUiTests(unittest.TestCase):
             self.manifest,
             ANY,
             preferred_language="fra",
+            additional_reserved_image_names=(),
         )
         self.assertEqual(dialog._language.currentText(), "fra")
         dialog.deleteLater()
+
+    def test_detail_suggest_reserves_card_list_pending_image_names(self):
+        draft = self.detail().to_draft()
+        self.service.suggest_card_draft.return_value = CardSuggestionResult(
+            draft, (), False
+        )
+        reserved = Mock(return_value=("usr000.bmp", "USR002.BMP"))
+        dialog = CardEditorDialog(
+            self.manifest,
+            self.service,
+            draft,
+            additional_reserved_image_names=reserved,
+        )
+
+        with patch.object(dialog._thread_pool, "start") as start:
+            dialog._suggest()
+
+        reserved.assert_called_once_with()
+        self.assertFalse(dialog._suggest_button.isEnabled())
+        self.assertFalse(dialog._save_button.isEnabled())
+        start.call_args.args[0].run()
+        self.service.suggest_card_draft.assert_called_once_with(
+            self.manifest,
+            ANY,
+            preferred_language="eng",
+            additional_reserved_image_names=("usr000.bmp", "USR002.BMP"),
+        )
+        self.application.processEvents()
+        self.assertTrue(dialog._suggest_button.isEnabled())
+        self.assertTrue(dialog._save_button.isEnabled())
+        dialog.deleteLater()
+
+    def test_card_detail_serializes_suggest_save_and_close_during_save(self):
+        detail = self.detail()
+        self.service.update_card.return_value = detail
+        dialog = CardEditorDialog(
+            self.manifest,
+            self.service,
+            detail.to_draft(),
+        )
+        dialog._name.setText("Changed")
+
+        with patch.object(dialog._thread_pool, "start") as start:
+            self.assertTrue(dialog._start_commit(Mock()))
+
+        self.assertFalse(dialog._save_button.isEnabled())
+        self.assertFalse(dialog._suggest_button.isEnabled())
+        self.assertFalse(dialog._start_commit(Mock()))
+        dialog._suggest()
+        start.assert_called_once()
+        close_event = Mock()
+        dialog.closeEvent(close_event)
+        close_event.ignore.assert_called_once_with()
+        self.assertIsNotNone(dialog._save_runner)
+
+        start.call_args.args[0].run()
+        self.application.processEvents()
+        self.assertIsNone(dialog._save_runner)
+        self.assertTrue(dialog._save_button.isEnabled())
+        self.assertTrue(dialog._suggest_button.isEnabled())
+        dialog.deleteLater()
+
+    def test_card_detail_defers_teardown_until_suggest_runner_finishes(self):
+        draft = self.detail().to_draft()
+        draft.large_image_source = self.image_source(
+            "suggest-live-large.bmp", (200, 300), Qt.blue
+        )
+        draft.small_image_source = self.image_source(
+            "suggest-live-mini.bmp", (50, 72), Qt.red
+        )
+        self.service.suggest_card_draft.return_value = CardSuggestionResult(
+            draft.clone(), (), False
+        )
+        dialog = CardEditorDialog(self.manifest, self.service, draft)
+        finished = Mock()
+        dialog.finished.connect(finished)
+
+        with patch.object(dialog._thread_pool, "start") as start:
+            dialog._suggest()
+
+        self.assertEqual(start.call_count, 1)
+        self.assertFalse(dialog._close_button.isEnabled())
+        close_event = Mock()
+        dialog.closeEvent(close_event)
+        close_event.ignore.assert_called_once_with()
+        dialog.reject()
+        finished.assert_not_called()
+
+        start.call_args.args[0].run()
+        self.application.processEvents()
+
+        self.assertIsNone(dialog._suggest_runner)
+        self.assertTrue(dialog._close_button.isEnabled())
+        dialog.reject()
+        self.application.processEvents()
+        self.assertEqual(finished.call_count, 1)
+        dialog.deleteLater()
+
+    def test_card_detail_tracks_all_preview_runners_before_teardown(self):
+        draft = self.detail().to_draft()
+        draft.large_image_source = self.image_source(
+            "preview-live-large.bmp", (200, 300), Qt.blue
+        )
+        draft.small_image_source = self.image_source(
+            "preview-live-mini.bmp", (50, 72), Qt.red
+        )
+        dialog = CardEditorDialog(self.manifest, self.service, draft)
+        dialog._draft.large_image_source = None
+        dialog._draft.small_image_source = None
+        self.service.load_card_images.side_effect = OSError(
+            "controlled preview failure"
+        )
+        finished = Mock()
+        dialog.finished.connect(finished)
+
+        with patch.object(dialog._thread_pool, "start") as start:
+            dialog._refresh_image_previews()
+            dialog._refresh_image_previews()
+
+        self.assertEqual(start.call_count, 2)
+        self.assertEqual(len(dialog._image_runners), 2)
+        self.assertTrue(dialog._close_button.isEnabled())
+        dialog.reject()
+        self.application.processEvents()
+        self.assertEqual(finished.call_count, 1)
+        runners = [call.args[0] for call in start.call_args_list]
+        dialog.deleteLater()
+        self.application.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.assertFalse(isValid(dialog))
+
+        with (
+            patch.object(sys, "excepthook") as excepthook,
+            self.assertLogs(level="ERROR"),
+        ):
+            for runner in runners:
+                runner.run()
+        self.application.processEvents()
+        excepthook.assert_not_called()
 
     def test_card_list_language_changes_only_displayed_text(self):
         self.service.load_card_details.return_value = [self.detail()]
@@ -354,6 +500,148 @@ class CardEditorUiTests(unittest.TestCase):
         self.service.load_card_details.assert_called_once_with(self.manifest)
         view.deleteLater()
 
+    def test_card_list_menu_and_quick_action_are_canonical_without_toolbar(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+
+        self.assertEqual(
+            [action.text().replace("&", "") for action in view._menu_bar.actions()],
+            ["File", "Edit", "Tools"],
+        )
+        self.assertEqual(len(view._menu_bar.actions()), 3)
+        self.assertIs(view.findChild(QMenu, "menuFile"), view._file_menu)
+        self.assertIs(view.findChild(QMenu, "menuEdit"), view._edit_menu)
+        self.assertIs(view.findChild(QMenu, "menuTools"), view._tools_menu)
+        self.assertEqual(
+            [
+                None if action.isSeparator() else action.text()
+                for action in view._file_menu.actions()
+            ],
+            [
+                "Import Cards…",
+                "Export Cards…",
+                None,
+                "Save",
+                None,
+                "Close",
+            ],
+        )
+        self.assertEqual(
+            [
+                None if action.isSeparator() else action.text()
+                for action in view._edit_menu.actions()
+            ],
+            ["Add Card", "Update Card", None, "enable all"],
+        )
+        self.assertEqual(
+            [action.text() for action in view._tools_menu.actions()],
+            ["Suggest", "Cancel Suggest"],
+        )
+
+        self.assertEqual(view.findChildren(QToolBar), [])
+        quick_enable = view.findChild(QToolButton, "btnEnableAll")
+        self.assertIs(quick_enable, view._enable_all_button)
+        self.assertIs(quick_enable.defaultAction(), view._enable_all_action)
+        self.assertEqual(quick_enable.text(), "enable all")
+        self.assertIs(view._edit_menu.actions()[-1], view._enable_all_action)
+
+        actions = {
+            "actionImportCards": view._import_cards_action,
+            "actionExportCards": view._export_cards_action,
+            "actionSaveCards": view._save_cards_action,
+            "actionCloseCardList": view._close_card_list_action,
+            "actionAddCard": view._add_card_action,
+            "actionUpdateCard": view._update_card_action,
+            "actionEnableAll": view._enable_all_action,
+            "actionSuggestCards": view._suggest_cards_action,
+            "actionCancelSuggest": view._cancel_suggest_action,
+        }
+        for object_name, action in actions.items():
+            self.assertIs(view.findChild(QAction, object_name), action)
+            self.assertIs(action.parent(), view)
+            self.assertTrue(action.statusTip())
+            self.assertNotIn("\t", action.text())
+
+        for object_name in (
+            "btnAdd",
+            "btnUpdate",
+            "btnImport",
+            "btnExport",
+            "btnSuggest",
+            "btnCancelSuggest",
+            "btnSave",
+            "btnClose",
+        ):
+            self.assertIsNone(view.findChild(QPushButton, object_name))
+        self.assertIsNotNone(view.findChild(QPushButton, "btnUnusedFilter"))
+        view.deleteLater()
+
+    def test_card_list_action_shortcuts_are_window_scoped_and_unique(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        expected = {
+            view._import_cards_action: "Ctrl+O",
+            view._export_cards_action: "Ctrl+Shift+E",
+            view._save_cards_action: "Ctrl+S",
+            view._close_card_list_action: "Ctrl+W",
+            view._add_card_action: "Ctrl+N",
+            view._update_card_action: "F2",
+        }
+        for action in (
+            view._enable_all_action,
+            view._suggest_cards_action,
+            view._cancel_suggest_action,
+        ):
+            self.assertTrue(action.shortcut().isEmpty())
+        for action, shortcut in expected.items():
+            self.assertEqual(action.shortcut(), QKeySequence(shortcut))
+            self.assertEqual(
+                action.shortcutContext(),
+                Qt.ShortcutContext.WindowShortcut,
+            )
+        portable = [
+            action.shortcut().toString(QKeySequence.SequenceFormat.PortableText)
+            for action in expected
+        ]
+        self.assertEqual(len(portable), len(set(portable)))
+        view.deleteLater()
+
+    def test_card_list_action_states_keep_view_only_commands_available(self):
+        with patch.object(CardListView, "_reload"):
+            view = CardListView(self.manifest, self.service)
+
+        view._set_loading(True)
+        for action in (
+            view._add_card_action,
+            view._update_card_action,
+            view._import_cards_action,
+            view._enable_all_action,
+            view._suggest_cards_action,
+            view._save_cards_action,
+        ):
+            self.assertFalse(action.isEnabled())
+        self.assertTrue(view._export_cards_action.isEnabled())
+        self.assertTrue(view._close_card_list_action.isEnabled())
+        self.assertFalse(view._table.isEnabled())
+        self.assertFalse(view._unused_filter_button.isEnabled())
+        self.assertFalse(view._display_language.isEnabled())
+
+        view._set_loading(False)
+        view.set_external_project_mutation_blocked(True)
+        self.assertFalse(view._add_card_action.isEnabled())
+        self.assertFalse(view._import_cards_action.isEnabled())
+        self.assertTrue(view._export_cards_action.isEnabled())
+        self.assertTrue(view._close_card_list_action.isEnabled())
+        self.assertTrue(view._table.isEnabled())
+        self.assertTrue(view._unused_filter_button.isEnabled())
+        self.assertTrue(view._display_language.isEnabled())
+        view.set_external_project_mutation_blocked(False)
+        view._closing = True
+        view.reject()
+        view.deleteLater()
+
     def test_model_language_signal_is_scoped_and_same_language_is_noop(self):
         model = CardListModel([self.detail()])
         emissions = []
@@ -369,6 +657,84 @@ class CardEditorUiTests(unittest.TestCase):
         self.assertEqual(
             (left.column(), right.column()), (columns["name"], columns["description"])
         )
+
+    def test_model_applies_unchanged_display_save_without_proxy_signal(self):
+        drafts = [self.detail(index).to_draft() for index in range(4095)]
+        for draft in drafts:
+            draft.dirty = True
+        model = CardListModel(drafts)
+        save_sources = model.dirty_card_save_sources()
+        self.assertEqual(len(save_sources), 4095)
+        self.assertIs(save_sources[0], model._cards[0])
+        saved = tuple(card.clone() for card in save_sources)
+        for card in saved:
+            card.dirty = False
+        emissions = []
+        model.dataChanged.connect(lambda *args: emissions.append(args))
+
+        model.apply_saved_cards(saved)
+
+        self.assertEqual(emissions, [])
+        self.assertFalse(model.has_dirty_cards())
+        self.assertIs(model._cards[0], saved[0])
+
+    def test_model_scopes_normalized_save_display_changes_to_one_signal(self):
+        drafts = [self.detail(index).to_draft() for index in range(1, 4)]
+        for draft in drafts:
+            draft.dirty = True
+        model = CardListModel(drafts)
+        saved = tuple(card.clone() for card in drafts)
+        saved[1].password = "00ABCDEF"
+        for card in saved:
+            card.dirty = False
+        emissions = []
+        model.dataChanged.connect(lambda *args: emissions.append(args))
+
+        model.apply_saved_cards(saved)
+
+        self.assertEqual(len(emissions), 1)
+        left, right, roles = emissions[0]
+        password_column = next(
+            column
+            for column, (field_name, _label) in enumerate(model.COLUMNS)
+            if field_name == "password"
+        )
+        self.assertEqual((left.row(), left.column()), (1, password_column))
+        self.assertEqual((right.row(), right.column()), (1, password_column))
+        self.assertEqual(roles, [Qt.DisplayRole, Qt.UserRole])
+
+    def test_model_rejects_invalid_saved_snapshot_without_partial_mutation(self):
+        drafts = [self.detail(index).to_draft() for index in range(1, 4)]
+        for draft in drafts:
+            draft.dirty = True
+        model = CardListModel(drafts)
+        original_cards = tuple(model._cards)
+        emissions = []
+        model.dataChanged.connect(lambda *args: emissions.append(args))
+
+        duplicate = drafts[0].clone()
+        missing = drafts[1].clone()
+        missing.card_index = 999
+
+        with self.assertRaisesRegex(ValueError, "Duplicate saved card index"):
+            model.apply_saved_cards((duplicate, duplicate.clone()))
+        self.assertTrue(
+            all(
+                current is original
+                for current, original in zip(model._cards, original_cards, strict=True)
+            )
+        )
+        self.assertEqual(emissions, [])
+
+        with self.assertRaisesRegex(IndexError, "Card index 999"):
+            model.apply_saved_cards((drafts[0].clone(), missing))
+        self.assertTrue(
+            all(
+                current is original
+                for current, original in zip(model._cards, original_cards, strict=True)
+            )
+        )
+        self.assertEqual(emissions, [])
 
     def test_preview_frames_are_equal_and_mini_renders_native_and_centered(self):
         large_source = self.image_source("large.bmp", (200, 300), Qt.blue)
@@ -656,7 +1022,7 @@ class CardEditorUiTests(unittest.TestCase):
         self.wait_for_cards(view, 1)
         view.show()
 
-        view._add_button.click()
+        view._add_card_action.trigger()
 
         dialog = view._editor_dialog
         self.assertIsNotNone(dialog)
@@ -695,7 +1061,7 @@ class CardEditorUiTests(unittest.TestCase):
         view.show()
 
         with patch.object(QMessageBox, "critical") as critical:
-            view._add_button.click()
+            view._add_card_action.trigger()
             dialog = view._editor_dialog
             self.assertIsNotNone(dialog)
             self.assertTrue(dialog.is_initializing)
@@ -711,8 +1077,8 @@ class CardEditorUiTests(unittest.TestCase):
         self.assertEqual(critical.call_count, 1)
         self.assertEqual(critical.call_args.args[1], "Card List Error")
         self.assertIn("controlled add failure", critical.call_args.args[2])
-        self.assertTrue(view._add_button.isEnabled())
-        self.assertTrue(view._import_button.isEnabled())
+        self.assertTrue(view._add_card_action.isEnabled())
+        self.assertTrue(view._import_cards_action.isEnabled())
         self.assertEqual(view._model.rowCount(), 1)
         self.assertFalse(view.is_dirty)
         dialog.deleteLater()
@@ -734,7 +1100,7 @@ class CardEditorUiTests(unittest.TestCase):
         view = CardListView(self.manifest, self.service)
         self.wait_for_cards(view, 1)
         view.show()
-        view._add_button.click()
+        view._add_card_action.trigger()
         self.assertTrue(self.wait_until(started.is_set))
         dialog = view._editor_dialog
         self.assertIsNotNone(dialog)
@@ -1057,7 +1423,7 @@ class CardEditorUiTests(unittest.TestCase):
         self.assertEqual(search_proxy.sortColumn(), name_column)
         self.assertEqual(search_proxy.sortOrder(), Qt.DescendingOrder)
         self.assertTrue(view.is_dirty)
-        self.assertTrue(view._save_button.isEnabled())
+        self.assertTrue(view._save_cards_action.isEnabled())
         self.assertEqual(view.windowTitle(), "Card List *")
         self.assertEqual(information.call_count, 1)
         self.assertEqual(
@@ -1078,7 +1444,7 @@ class CardEditorUiTests(unittest.TestCase):
         )
 
         with patch.object(QMessageBox, "information") as saved_information:
-            view._save_button.click()
+            view._save_cards_action.trigger()
             self.assertTrue(
                 self.wait_until(
                     lambda: (
@@ -1094,7 +1460,7 @@ class CardEditorUiTests(unittest.TestCase):
         )
         self.assertFalse(view.is_dirty)
         self.assertFalse(view._model.has_dirty_cards())
-        self.assertFalse(view._save_button.isEnabled())
+        self.assertFalse(view._save_cards_action.isEnabled())
         self.assertEqual(view.windowTitle(), "Card List")
         self.assertEqual(view._selected_card_index(), 3)
         self.assertEqual(
@@ -1243,15 +1609,19 @@ class CardEditorUiTests(unittest.TestCase):
             patch.object(view._thread_pool, "start") as start,
             patch.object(QMessageBox, "information") as information,
         ):
-            view._suggest_button.click()
-            view._suggest_button.click()
+            view._suggest_cards_action.trigger()
+            view._suggest_cards_action.trigger()
             start.assert_called_once()
-            self.assertFalse(view._add_button.isEnabled())
-            self.assertFalse(view._update_button.isEnabled())
-            self.assertFalse(view._import_button.isEnabled())
-            self.assertFalse(view._enable_all_button.isEnabled())
-            self.assertFalse(view._save_button.isEnabled())
-            self.assertFalse(view._suggest_button.isEnabled())
+            self.assertFalse(view._add_card_action.isEnabled())
+            self.assertFalse(view._update_card_action.isEnabled())
+            self.assertFalse(view._import_cards_action.isEnabled())
+            self.assertFalse(view._enable_all_action.isEnabled())
+            self.assertFalse(view._save_cards_action.isEnabled())
+            self.assertFalse(view._suggest_cards_action.isEnabled())
+            self.assertTrue(view._cancel_suggest_action.isVisible())
+            self.assertTrue(view._cancel_suggest_action.isEnabled())
+            self.assertTrue(view._export_cards_action.isEnabled())
+            self.assertTrue(view._close_card_list_action.isEnabled())
             self.assertTrue(view._unused_filter_button.isEnabled())
             self.assertTrue(view._display_language.isEnabled())
             self.assertEqual(view._pgb_progress.minimum(), 0)
@@ -1318,15 +1688,16 @@ class CardEditorUiTests(unittest.TestCase):
         self.assertEqual(view._proxy_model.sortColumn(), name_column)
         self.assertEqual(view._proxy_model.sortOrder(), Qt.DescendingOrder)
         self.assertTrue(view.is_dirty)
-        self.assertTrue(view._save_button.isEnabled())
+        self.assertTrue(view._save_cards_action.isEnabled())
         self.assertEqual(view.windowTitle(), "Card List *")
         self.assertIsNone(view._suggest_runner)
-        self.assertTrue(view._add_button.isEnabled())
-        self.assertTrue(view._update_button.isEnabled())
-        self.assertTrue(view._import_button.isEnabled())
-        self.assertTrue(view._enable_all_button.isEnabled())
-        self.assertTrue(view._suggest_button.isEnabled())
-        self.assertTrue(view._cancel_suggest_button.isHidden())
+        self.assertTrue(view._add_card_action.isEnabled())
+        self.assertTrue(view._update_card_action.isEnabled())
+        self.assertTrue(view._import_cards_action.isEnabled())
+        self.assertTrue(view._enable_all_action.isEnabled())
+        self.assertTrue(view._suggest_cards_action.isEnabled())
+        self.assertFalse(view._cancel_suggest_action.isVisible())
+        self.assertFalse(view._cancel_suggest_action.isEnabled())
         self.assertEqual(view._pgb_progress.maximum(), 3)
         self.assertEqual(view._pgb_progress.value(), 3)
         self.service.suggest_card_draft.assert_not_called()
@@ -1375,7 +1746,7 @@ class CardEditorUiTests(unittest.TestCase):
             callback_threads.append(QThread.currentThread())
 
         with patch.object(QMessageBox, "information", side_effect=show_result):
-            view._suggest_button.click()
+            view._suggest_cards_action.trigger()
             self.assertTrue(
                 self.wait_until(
                     lambda: (
@@ -1392,6 +1763,100 @@ class CardEditorUiTests(unittest.TestCase):
         self.assertEqual(view._pgb_progress.value(), 1)
         self.assertTrue(view._pgb_progress.isHidden())
         view.close()
+        view.deleteLater()
+
+    def test_cancelled_suggest_partial_result_is_applied_before_close_save(self):
+        source = self.detail()
+        partial = source.to_draft()
+        partial.image_name = "usr001.bmp"
+        partial.large_image_source = b"large"
+        partial.small_image_source = b"mini"
+        partial.dirty = True
+        result = BulkSuggestionResult(
+            cards=(partial,),
+            total_candidates=1,
+            resolved=1,
+            partially_filled=0,
+            not_found=0,
+            skipped_no_query_name=0,
+            unchanged=0,
+            failed=0,
+            cancelled=True,
+            image_staged=1,
+            total_source_cards=1,
+            skipped_complete=0,
+            selected_workers=1,
+        )
+        self.service.load_card_details.return_value = [source]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        runner = Mock()
+        view._suggest_runner = runner
+        view._close_after_save = True
+
+        with (
+            patch.object(QMessageBox, "information") as information,
+            patch.object(view, "_save") as save,
+        ):
+            view._suggest_succeeded(result, runner=runner)
+            staged = view._model.card_by_index(source.card_index)
+            self.assertTrue(staged.dirty)
+            self.assertEqual(staged.image_name, "usr001.bmp")
+            self.assertEqual(
+                view._model.pending_card_image_names(),
+                ("usr001.bmp",),
+            )
+            information.assert_not_called()
+
+            view._suggest_finished(runner=runner)
+            save.assert_called_once_with()
+
+        self.assertIsNone(view._suggest_runner)
+        view.deleteLater()
+
+    def test_late_cancelled_suggest_callbacks_cannot_mutate_new_session(self):
+        source = self.detail()
+        late = source.to_draft()
+        late.localized_text.names["eng"] = "Late result"
+        late.dirty = True
+        result = BulkSuggestionResult(
+            cards=(late,),
+            total_candidates=1,
+            resolved=1,
+            partially_filled=0,
+            not_found=0,
+            skipped_no_query_name=0,
+            unchanged=0,
+            failed=0,
+            cancelled=True,
+            total_source_cards=1,
+            skipped_complete=0,
+            selected_workers=1,
+        )
+        self.service.load_card_details.return_value = [source]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        cancelled_runner = Mock()
+        current_runner = Mock()
+        view._suggest_runner = current_runner
+
+        with patch.object(QMessageBox, "information") as information:
+            view._suggest_succeeded(result, runner=cancelled_runner)
+            view._suggest_finished(runner=cancelled_runner)
+
+        self.assertIs(view._suggest_runner, current_runner)
+        self.assertEqual(
+            view._model.card_by_index(source.card_index).localized_text.names["eng"],
+            "English",
+        )
+        information.assert_not_called()
+
+        view._suggest_finished(runner=current_runner)
+        view._suggest_succeeded(result, runner=current_runner)
+        self.assertEqual(
+            view._model.card_by_index(source.card_index).localized_text.names["eng"],
+            "English",
+        )
         view.deleteLater()
 
     def test_card_list_save_double_click_dispatches_one_transaction(self):
@@ -1416,28 +1881,36 @@ class CardEditorUiTests(unittest.TestCase):
             patch.object(QMessageBox, "information"),
             patch.object(
                 view._model,
-                "dirty_cards",
-                wraps=view._model.dirty_cards,
-            ) as dirty_cards,
+                "dirty_card_save_sources",
+                wraps=view._model.dirty_card_save_sources,
+            ) as save_sources,
         ):
-            view._save_button.click()
-            view._save_button.click()
+            view._save_cards_action.trigger()
+            view._save_cards_action.trigger()
             single_shot.assert_called_once()
+            self.assertEqual(single_shot.call_args.args[0], 16)
             start.assert_not_called()
-            dirty_cards.assert_not_called()
+            save_sources.assert_not_called()
             self.service.save_card_changes.assert_not_called()
             self.assertTrue(view._save_pending)
             self.assertIsNone(view._save_runner)
             self.assertFalse(view._pgb_progress.isHidden())
-            self.assertFalse(view._save_button.isEnabled())
-            self.assertFalse(view._add_button.isEnabled())
-            self.assertFalse(view._update_button.isEnabled())
-            self.assertFalse(view._import_button.isEnabled())
-            self.assertFalse(view._enable_all_button.isEnabled())
-            self.assertFalse(view._suggest_button.isEnabled())
+            self.assertTrue(view._pgb_progress.isEnabled())
+            self.assertFalse(view._save_cards_action.isEnabled())
+            self.assertFalse(view._add_card_action.isEnabled())
+            self.assertFalse(view._update_card_action.isEnabled())
+            self.assertFalse(view._import_cards_action.isEnabled())
+            self.assertFalse(view._enable_all_action.isEnabled())
+            self.assertFalse(view._suggest_cards_action.isEnabled())
+            self.assertFalse(view._export_cards_action.isEnabled())
+            self.assertFalse(view._close_card_list_action.isEnabled())
+            self.assertFalse(view._menu_bar.isEnabled())
+            self.assertFalse(view._table.isEnabled())
+            self.assertFalse(view._unused_filter_button.isEnabled())
+            self.assertFalse(view._display_language.isEnabled())
 
             single_shot.call_args.args[1]()
-            dirty_cards.assert_called_once_with()
+            save_sources.assert_called_once_with()
             start.assert_called_once()
             self.assertFalse(view._save_pending)
             self.assertIsNotNone(view._save_runner)
@@ -1447,13 +1920,95 @@ class CardEditorUiTests(unittest.TestCase):
         self.service.save_card_changes.assert_called_once()
         self.assertIsNone(view._save_runner)
         self.assertFalse(view.is_dirty)
-        self.assertFalse(view._save_button.isEnabled())
-        self.assertTrue(view._add_button.isEnabled())
-        self.assertTrue(view._update_button.isEnabled())
-        self.assertTrue(view._import_button.isEnabled())
-        self.assertTrue(view._enable_all_button.isEnabled())
-        self.assertTrue(view._suggest_button.isEnabled())
+        self.assertFalse(view._save_cards_action.isEnabled())
+        self.assertTrue(view._add_card_action.isEnabled())
+        self.assertTrue(view._update_card_action.isEnabled())
+        self.assertTrue(view._import_cards_action.isEnabled())
+        self.assertTrue(view._enable_all_action.isEnabled())
+        self.assertTrue(view._suggest_cards_action.isEnabled())
+        self.assertTrue(view._export_cards_action.isEnabled())
+        self.assertTrue(view._close_card_list_action.isEnabled())
+        self.assertTrue(view._menu_bar.isEnabled())
+        self.assertTrue(view._table.isEnabled())
+        self.assertTrue(view._unused_filter_button.isEnabled())
+        self.assertTrue(view._display_language.isEnabled())
         self.assertEqual(save_states, [True, False])
+        view.deleteLater()
+
+    def test_card_list_save_keeps_event_loop_live_and_locks_entire_window(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        draft = view._model.card_at(0)
+        draft.pack = "joey"
+        draft.dirty = True
+        view._model.update_card(draft)
+        view._set_dirty(True)
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_threads = []
+
+        def save_cards(_manifest, changes):
+            worker_threads.append(QThread.currentThread())
+            worker_started.set()
+            if not release_worker.wait(timeout=5):
+                raise TimeoutError("test did not release Card List Save")
+            for change in changes:
+                change.dirty = False
+
+        self.service.save_card_changes.side_effect = save_cards
+        clone_threads = []
+        original_clone = type(draft).clone
+
+        def recorded_clone(card):
+            clone_threads.append(QThread.currentThread())
+            return original_clone(card)
+
+        heartbeat = []
+        timer = QTimer(view)
+        timer.setInterval(5)
+        timer.timeout.connect(lambda: heartbeat.append(time.monotonic()))
+        timer.start()
+        try:
+            with (
+                patch.object(type(draft), "clone", new=recorded_clone),
+                patch.object(QMessageBox, "information"),
+            ):
+                view._save_cards_action.trigger()
+                self.assertFalse(view._pgb_progress.isHidden())
+                self.assertEqual(view._pgb_progress.minimum(), 0)
+                self.assertEqual(view._pgb_progress.maximum(), 0)
+                self.assertFalse(view._menu_bar.isEnabled())
+                self.assertFalse(view._table.isEnabled())
+                self.assertFalse(view._unused_filter_button.isEnabled())
+                self.assertFalse(view._display_language.isEnabled())
+                self.assertFalse(view._export_cards_action.isEnabled())
+                self.assertFalse(view._close_card_list_action.isEnabled())
+                self.assertTrue(self.wait_until(worker_started.is_set, timeout=2))
+                view._save()
+                self.application.processEvents()
+                self.assertEqual(self.service.save_card_changes.call_count, 1)
+                self.assertTrue(self.wait_until(lambda: len(heartbeat) >= 3))
+                self.assertEqual(len(worker_threads), 1)
+                self.assertNotEqual(worker_threads[0], self.application.thread())
+                self.assertTrue(clone_threads)
+                self.assertTrue(
+                    all(
+                        thread is not self.application.thread()
+                        for thread in clone_threads
+                    )
+                )
+                release_worker.set()
+                self.assertTrue(self.wait_until(lambda: view._save_runner is None))
+        finally:
+            release_worker.set()
+            timer.stop()
+
+        self.assertTrue(view._pgb_progress.isHidden())
+        self.assertTrue(view._menu_bar.isEnabled())
+        self.assertTrue(view._table.isEnabled())
+        self.assertTrue(view._unused_filter_button.isEnabled())
+        self.assertTrue(view._display_language.isEnabled())
         view.deleteLater()
 
     def test_close_during_pending_and_running_save_reuses_one_transaction(self):
@@ -1475,7 +2030,7 @@ class CardEditorUiTests(unittest.TestCase):
             patch.object(QMessageBox, "information"),
             patch.object(view, "accept") as accept,
         ):
-            view._save_button.click()
+            view._save_cards_action.trigger()
             pending_close = Mock()
             view.closeEvent(pending_close)
             pending_close.ignore.assert_called_once_with()
@@ -1513,13 +2068,13 @@ class CardEditorUiTests(unittest.TestCase):
             ) as single_shot,
             patch.object(
                 view._model,
-                "dirty_cards",
+                "dirty_card_save_sources",
                 side_effect=RuntimeError("controlled snapshot failure"),
             ),
             patch.object(QMessageBox, "critical") as critical,
             self.assertLogs(level="ERROR"),
         ):
-            view._save_button.click()
+            view._save_cards_action.trigger()
             self.assertTrue(view._save_pending)
             single_shot.call_args.args[1]()
 
@@ -1531,11 +2086,194 @@ class CardEditorUiTests(unittest.TestCase):
         self.assertFalse(view._save_pending)
         self.assertIsNone(view._save_runner)
         self.assertTrue(view.is_dirty)
-        self.assertTrue(view._save_button.isEnabled())
-        self.assertTrue(view._add_button.isEnabled())
-        self.assertTrue(view._import_button.isEnabled())
+        self.assertTrue(view._save_cards_action.isEnabled())
+        self.assertTrue(view._add_card_action.isEnabled())
+        self.assertTrue(view._import_cards_action.isEnabled())
+        self.assertTrue(view._export_cards_action.isEnabled())
+        self.assertTrue(view._close_card_list_action.isEnabled())
+        self.assertTrue(view._menu_bar.isEnabled())
+        self.assertTrue(view._table.isEnabled())
+        self.assertTrue(view._unused_filter_button.isEnabled())
+        self.assertTrue(view._display_language.isEnabled())
         self.assertTrue(view._pgb_progress.isHidden())
         self.service.save_card_changes.assert_not_called()
+        view.deleteLater()
+
+    def test_save_worker_failure_restores_full_window_and_allows_retry(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        draft = view._model.card_at(0)
+        draft.pack = "joey"
+        draft.dirty = True
+        view._model.update_card(draft)
+        view._set_dirty(True)
+        self.service.save_card_changes.side_effect = [
+            OSError("controlled worker failure"),
+            None,
+        ]
+        save_states = []
+        view.project_save_state_changed.connect(save_states.append)
+
+        with (
+            patch.object(QMessageBox, "critical") as critical,
+            patch.object(QMessageBox, "information"),
+            self.assertLogs(level="ERROR"),
+        ):
+            view._save()
+            self.assertTrue(
+                self.wait_until(
+                    lambda: (
+                        self.service.save_card_changes.call_count == 1
+                        and not view._save_pending
+                        and view._save_runner is None
+                    )
+                )
+            )
+
+        self.assertEqual(critical.call_count, 1)
+        self.assertIn("controlled worker failure", critical.call_args.args[2])
+        self.assertTrue(view.is_dirty)
+        self.assertTrue(view._save_cards_action.isEnabled())
+        self.assertTrue(view._export_cards_action.isEnabled())
+        self.assertTrue(view._close_card_list_action.isEnabled())
+        self.assertTrue(view._menu_bar.isEnabled())
+        self.assertTrue(view._table.isEnabled())
+        self.assertTrue(view._unused_filter_button.isEnabled())
+        self.assertTrue(view._display_language.isEnabled())
+        self.assertTrue(view._pgb_progress.isHidden())
+        self.assertEqual(save_states, [True, False])
+
+        with patch.object(QMessageBox, "information"):
+            view._save()
+            self.assertTrue(
+                self.wait_until(
+                    lambda: (
+                        self.service.save_card_changes.call_count == 2
+                        and not view._save_pending
+                        and view._save_runner is None
+                    )
+                )
+            )
+        self.assertEqual(self.service.save_card_changes.call_count, 2)
+        self.assertFalse(view.is_dirty)
+        self.assertEqual(save_states, [True, False, True, False])
+        view.deleteLater()
+
+    def test_card_list_escape_and_close_action_use_dirty_guard(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        view.show()
+        self.application.processEvents()
+        view._set_dirty(True)
+
+        with patch.object(
+            QMessageBox,
+            "warning",
+            return_value=QMessageBox.Cancel,
+        ) as warning:
+            QTest.keyClick(view, Qt.Key.Key_Escape)
+            self.application.processEvents()
+            self.assertTrue(view.isVisible())
+            self.assertEqual(warning.call_count, 1)
+
+            view._close_card_list_action.trigger()
+            self.application.processEvents()
+            self.assertTrue(view.isVisible())
+            self.assertEqual(warning.call_count, 2)
+
+        view._set_dirty(False)
+        view.close()
+        view.deleteLater()
+
+    def test_card_list_escape_preserves_pending_save_add_and_suggest_guards(self):
+        def make_view() -> CardListView:
+            with patch.object(CardListView, "_reload"):
+                guarded = CardListView(self.manifest, self.service)
+            guarded.show()
+            self.application.processEvents()
+            return guarded
+
+        with self.subTest(state="save"):
+            view = make_view()
+            view._save_pending = True
+            QTest.keyClick(view, Qt.Key.Key_Escape)
+            self.application.processEvents()
+            self.assertTrue(view.isVisible())
+            self.assertTrue(view._close_after_save)
+            view._save_pending = False
+            view._close_after_save = False
+            view._closing = True
+            view.reject()
+            view.deleteLater()
+
+        with self.subTest(state="add"):
+            view = make_view()
+            view._add_runner = Mock()
+            QTest.keyClick(view, Qt.Key.Key_Escape)
+            self.application.processEvents()
+            self.assertTrue(view.isVisible())
+            self.assertTrue(view._reject_after_add)
+            view._add_runner = None
+            view._reject_after_add = False
+            view._closing = True
+            view.reject()
+            view.deleteLater()
+
+        with self.subTest(state="suggest"):
+            view = make_view()
+            runner = Mock()
+            view._suggest_runner = runner
+            view._refresh_action_states()
+            QTest.keyClick(view, Qt.Key.Key_Escape)
+            self.application.processEvents()
+            runner.cancel.assert_called_once_with()
+            self.assertTrue(view.isVisible())
+            self.assertTrue(view._reject_after_suggest)
+            view._suggest_runner = None
+            view._reject_after_suggest = False
+            view._closing = True
+            view.reject()
+            view.deleteLater()
+
+    def test_card_list_window_shortcuts_do_not_fire_through_modal_card_detail(self):
+        self.service.load_card_details.return_value = [self.detail()]
+        view = CardListView(self.manifest, self.service)
+        self.wait_for_cards(view, 1)
+        view.show()
+        view._table.selectRow(0)
+        view._update_card_action.trigger()
+        self.application.processEvents()
+        dialog = view._editor_dialog
+        self.assertIsNotNone(dialog)
+        self.assertTrue(dialog.isModal())
+
+        observed = {
+            action: Mock()
+            for action in (
+                view._add_card_action,
+                view._save_cards_action,
+                view._update_card_action,
+            )
+        }
+        for action, observer in observed.items():
+            action.triggered.connect(observer)
+
+        QTest.keyClick(dialog, Qt.Key.Key_N, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(dialog, Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(dialog, Qt.Key.Key_F2)
+        self.application.processEvents()
+
+        for observer in observed.values():
+            observer.assert_not_called()
+        self.service.create_card_draft.assert_not_called()
+        self.service.save_card_changes.assert_not_called()
+        self.assertIs(view._editor_dialog, dialog)
+
+        dialog.close()
+        self.application.processEvents()
+        view.close()
         view.deleteLater()
 
     def test_card_list_restores_maximized_state_but_permits_minimize(self):
@@ -1598,10 +2336,10 @@ class CardEditorUiTests(unittest.TestCase):
         )
         self.assertIsNone(view.findChild(QPushButton, "btnReplaceImage"))
         self.assertIsNone(view.findChild(QPushButton, "btnReplaceMini"))
-        self.assertFalse(view._update_button.isEnabled())
+        self.assertFalse(view._update_card_action.isEnabled())
         view._table.selectRow(0)
         self.application.processEvents()
-        self.assertTrue(view._update_button.isEnabled())
+        self.assertTrue(view._update_card_action.isEnabled())
         with patch.object(view, "_open_card_detail") as open_editor:
             view._open_index(index)
         self.assertEqual(open_editor.call_args.args[0].card_index, 1)

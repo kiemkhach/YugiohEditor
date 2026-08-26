@@ -4,16 +4,19 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QModelIndex, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDialog,
     QFileDialog,
     QHeaderView,
+    QMenuBar,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QTableView,
+    QToolButton,
     QVBoxLayout,
 )
 
@@ -69,10 +72,14 @@ class CardListView(QDialog):
         self._maximize_policy_active = False
         self._maximize_restore_pending = False
         self.setWindowTitle("Card List")
+        self.setMinimumSize(1200, 700)
         root = load_ui(ui_path("card_list_window.ui"), self)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(root)
+        self._menu_bar = QMenuBar(self)
+        self._menu_bar.setObjectName("menuBar")
+        layout.setMenuBar(self._menu_bar)
+        layout.addWidget(root, 1)
         self.resize(1280, 760)
 
         self._table = self.findChild(QTableView, "tableCards")
@@ -93,25 +100,11 @@ class CardListView(QDialog):
         )
         self._unused_filter_button = self.findChild(QPushButton, "btnUnusedFilter")
         self._unused_filter_button.toggled.connect(self._unused_filter_toggled)
-        self._enable_all_button = self.findChild(QPushButton, "btnEnableAll")
-        self._enable_all_button.clicked.connect(self._enable_all_cards)
-        self._add_button = self.findChild(QPushButton, "btnAdd")
-        self._update_button = self.findChild(QPushButton, "btnUpdate")
-        self._save_button = self.findChild(QPushButton, "btnSave")
-        self._import_button = self.findChild(QPushButton, "btnImport")
-        self._suggest_button = self.findChild(QPushButton, "btnSuggest")
-        self._cancel_suggest_button = self.findChild(
-            QPushButton,
-            "btnCancelSuggest",
-        )
-        self._add_button.clicked.connect(self._add_card)
-        self._update_button.clicked.connect(self._update_card)
-        self._import_button.clicked.connect(self._import_cards)
-        self.findChild(QPushButton, "btnExport").clicked.connect(self._export_cards)
-        self._suggest_button.clicked.connect(self._suggest_cards)
-        self._cancel_suggest_button.clicked.connect(self._cancel_suggest)
-        self._save_button.clicked.connect(self._save)
-        self.findChild(QPushButton, "btnClose").clicked.connect(self.close)
+        self._enable_all_button = self.findChild(QToolButton, "btnEnableAll")
+        self._create_actions()
+        self._create_menus()
+        self._enable_all_button.setDefaultAction(self._enable_all_action)
+        self._enable_all_button.setAutoRaise(True)
         self._table.doubleClicked.connect(self._open_index)
         self._model = CardListModel((), self)
         self._model.set_display_language(self._display_language.currentText())
@@ -124,7 +117,117 @@ class CardListView(QDialog):
             (75, 75, 190, 300, 95, 55, 70, 70, 90, 120, 100, 95, 140)
         ):
             self._table.setColumnWidth(column, width)
+        self._refresh_action_states()
         self._reload()
+
+    def _create_actions(self) -> None:
+        self._import_cards_action = self._new_action(
+            "actionImportCards",
+            "Import Cards…",
+            self._import_cards,
+            shortcut="Ctrl+O",
+            status_tip="Import card changes from a CSV file into the staged list.",
+        )
+        self._export_cards_action = self._new_action(
+            "actionExportCards",
+            "Export Cards…",
+            self._export_cards,
+            shortcut="Ctrl+Shift+E",
+            status_tip="Export the displayed staged cards to a CSV file.",
+        )
+        self._save_cards_action = self._new_action(
+            "actionSaveCards",
+            "Save",
+            self._save,
+            shortcut="Ctrl+S",
+            status_tip="Commit all staged card changes to the project.",
+        )
+        self._close_card_list_action = self._new_action(
+            "actionCloseCardList",
+            "Close",
+            self.close,
+            shortcut="Ctrl+W",
+            status_tip="Close Card List.",
+        )
+        self._add_card_action = self._new_action(
+            "actionAddCard",
+            "Add Card",
+            self._add_card,
+            shortcut="Ctrl+N",
+            status_tip="Create a new card draft.",
+        )
+        self._update_card_action = self._new_action(
+            "actionUpdateCard",
+            "Update Card",
+            self._update_card,
+            shortcut="F2",
+            status_tip="Open the selected card for editing.",
+        )
+        self._enable_all_action = self._new_action(
+            "actionEnableAll",
+            "enable all",
+            self._enable_all_cards,
+            status_tip=(
+                "Change eligible disabled cards to the joey pack while preserving "
+                "protected cards."
+            ),
+        )
+        self._suggest_cards_action = self._new_action(
+            "actionSuggestCards",
+            "Suggest",
+            self._suggest_cards,
+            status_tip="Suggest missing card data for all source cards.",
+        )
+        self._cancel_suggest_action = self._new_action(
+            "actionCancelSuggest",
+            "Cancel Suggest",
+            self._cancel_suggest,
+            status_tip="Cancel the active card suggestion operation.",
+        )
+        self._cancel_suggest_action.setVisible(False)
+        self._cancel_suggest_action.setEnabled(False)
+
+    def _new_action(
+        self,
+        object_name: str,
+        text: str,
+        handler,
+        *,
+        shortcut: str | None = None,
+        status_tip: str,
+    ) -> QAction:
+        action = QAction(text, self)
+        action.setObjectName(object_name)
+        action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        action.setMenuRole(QAction.MenuRole.NoRole)
+        if shortcut is not None:
+            action.setShortcut(QKeySequence(shortcut))
+        action.setStatusTip(status_tip)
+        action.setToolTip(status_tip)
+        action.triggered.connect(handler)
+        return action
+
+    def _create_menus(self) -> None:
+        self._file_menu = self._menu_bar.addMenu("&File")
+        self._file_menu.setObjectName("menuFile")
+        self._file_menu.addAction(self._import_cards_action)
+        self._file_menu.addAction(self._export_cards_action)
+        self._file_menu.addSeparator()
+        self._file_menu.addAction(self._save_cards_action)
+        self._file_menu.addSeparator()
+        self._file_menu.addAction(self._close_card_list_action)
+
+        self._edit_menu = self._menu_bar.addMenu("&Edit")
+        self._edit_menu.setObjectName("menuEdit")
+        self._edit_menu.addAction(self._add_card_action)
+        self._edit_menu.addAction(self._update_card_action)
+        self._edit_menu.addSeparator()
+        self._edit_menu.addAction(self._enable_all_action)
+
+        self._tools_menu = self._menu_bar.addMenu("&Tools")
+        self._tools_menu.setObjectName("menuTools")
+        self._tools_menu.addAction(self._suggest_cards_action)
+        self._tools_menu.addAction(self._cancel_suggest_action)
 
     @property
     def is_dirty(self) -> bool:
@@ -232,6 +335,13 @@ class CardListView(QDialog):
             f"Protected: {result.protected}\n"
             f"Skipped: {result.skipped}",
         )
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            event.accept()
+            self.close()
+            return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:
         if self._save_pending or self._save_runner is not None:
@@ -387,6 +497,7 @@ class CardListView(QDialog):
             self,
             card_lookup=self._model.card_by_index,
             card_bounds=self._model.card_index_bounds,
+            additional_reserved_image_names=(self._model.pending_card_image_names),
         )
         dialog.setModal(True)
         dialog.saved.connect(self._card_saved)
@@ -498,35 +609,61 @@ class CardListView(QDialog):
         )
         self._suggest_runner = runner
         self._refresh_action_states()
-        self._cancel_suggest_button.show()
         # Candidate selection belongs to the service because it depends on
         # semantic field applicability. Stay indeterminate until the service
         # reports the post-filter candidate count.
         self._pgb_progress.setRange(0, 0)
         self._pgb_progress.setValue(0)
+        self._pgb_progress.setEnabled(True)
         self._pgb_progress.show()
-        runner.signals.progress.connect(self._suggest_progress)
-        runner.signals.succeeded.connect(self._suggest_succeeded)
-        runner.signals.failed.connect(self._task_failed)
-        runner.signals.finished.connect(self._suggest_finished)
+        runner.signals.progress.connect(
+            lambda processed, total: self._suggest_progress(
+                processed,
+                total,
+                runner=runner,
+            )
+        )
+        runner.signals.succeeded.connect(
+            lambda result: self._suggest_succeeded(result, runner=runner)
+        )
+        runner.signals.failed.connect(
+            lambda error: self._suggest_failed(error, runner=runner)
+        )
+        runner.signals.finished.connect(lambda: self._suggest_finished(runner=runner))
         self._thread_pool.start(runner)
 
-    def _suggest_progress(self, processed: int, total: int) -> None:
+    def _suggest_progress(
+        self,
+        processed: int,
+        total: int,
+        *,
+        runner: CancellableProgressTaskRunner | None = None,
+    ) -> None:
+        if runner is not None and self._suggest_runner is not runner:
+            return
         if total <= 0:
             self._pgb_progress.setRange(0, 0)
             return
         self._pgb_progress.setRange(0, total)
         self._pgb_progress.setValue(processed)
 
-    def _suggest_succeeded(self, result: BulkSuggestionResult) -> None:
-        if self._closing or self._close_after_save or self._reject_after_suggest:
+    def _suggest_succeeded(
+        self,
+        result: BulkSuggestionResult,
+        *,
+        runner: CancellableProgressTaskRunner | None = None,
+    ) -> None:
+        if runner is not None and self._suggest_runner is not runner:
+            return
+        if self._closing or self._reject_after_suggest:
             return
         selected = self._selected_card_index()
         self._model.reset_from_project(result.cards)
-        if result.resolved:
-            self._set_dirty(True)
+        self._set_dirty(self._model.has_dirty_cards())
         if selected is not None:
             self._select_card(selected)
+        if self._close_after_save:
+            return
         QMessageBox.information(
             self,
             "Suggest Cards",
@@ -544,13 +681,29 @@ class CardListView(QDialog):
             f"Cancelled: {'yes' if result.cancelled else 'no'}",
         )
 
+    def _suggest_failed(
+        self,
+        error: TaskError,
+        *,
+        runner: CancellableProgressTaskRunner | None = None,
+    ) -> None:
+        if runner is not None and self._suggest_runner is not runner:
+            return
+        self._task_failed(error)
+
     def _cancel_suggest(self) -> None:
         if self._suggest_runner is not None:
             self._suggest_runner.cancel()
 
-    def _suggest_finished(self) -> None:
+    def _suggest_finished(
+        self,
+        *,
+        runner: CancellableProgressTaskRunner | None = None,
+    ) -> None:
+        if runner is not None and self._suggest_runner is not runner:
+            return
         self._suggest_runner = None
-        self._cancel_suggest_button.hide()
+        self._refresh_action_states()
         self._pgb_progress.hide()
         if self._close_after_save:
             self._save()
@@ -558,19 +711,20 @@ class CardListView(QDialog):
             self._reject_after_suggest = False
             self._closing = True
             self.reject()
-        else:
-            self._refresh_action_states()
 
     def _save(self) -> None:
         if self._model_mutation_blocked():
             return
         self._save_pending = True
-        self._notify_project_save_state()
-        self._refresh_action_states()
         self._pgb_progress.setRange(0, 0)
         self._pgb_progress.setValue(0)
+        self._pgb_progress.setEnabled(True)
         self._pgb_progress.show()
-        QTimer.singleShot(0, self._prepare_save)
+        self._notify_project_save_state()
+        self._refresh_action_states()
+        # Leave one display frame for the indeterminate bar and interaction
+        # lock to paint before even the lightweight snapshot handoff begins.
+        QTimer.singleShot(16, self._prepare_save)
 
     def _prepare_save(self) -> None:
         if not self._save_pending:
@@ -584,8 +738,8 @@ class CardListView(QDialog):
             return
         runner: TaskRunner | None = None
         try:
-            changes = list(self._model.dirty_cards())
-            if not changes:
+            save_sources = self._model.dirty_card_save_sources()
+            if not save_sources:
                 self._save_pending = False
                 self._notify_project_save_state()
                 self._refresh_action_states()
@@ -596,15 +750,13 @@ class CardListView(QDialog):
                     self.accept()
                 return
             selected = self._selected_card_index()
-            runner = TaskRunner(
-                lambda: self._service.save_card_changes(self._manifest, changes)
-            )
+            runner = TaskRunner(lambda: self._save_card_sources(save_sources))
             self._save_pending = False
             self._save_runner = runner
             self._notify_project_save_state()
             self._active_runners.add(runner)
             runner.signals.succeeded.connect(
-                lambda _result: self._save_succeeded(changes, selected)
+                lambda changes: self._save_succeeded(changes, selected)
             )
             runner.signals.failed.connect(self._save_failed)
             runner.signals.finished.connect(lambda: self._save_finished(runner))
@@ -622,14 +774,28 @@ class CardListView(QDialog):
             self._pgb_progress.hide()
             QMessageBox.critical(self, "Card List Error", str(error))
 
+    def _save_card_sources(
+        self,
+        save_sources: tuple[CardEditDraft, ...],
+    ) -> tuple[CardEditDraft, ...]:
+        """Clone the locked model snapshot and persist it off the GUI thread."""
+
+        changes = tuple(card.clone() for card in save_sources)
+        self._service.save_card_changes(self._manifest, changes)
+        return changes
+
     def _save_succeeded(
         self,
-        changes: list[CardEditDraft],
+        changes: tuple[CardEditDraft, ...],
         selected_card_index: int | None,
     ) -> None:
         for card in changes:
-            self._model.update_card(card)
-        self._set_dirty(False)
+            card.dirty = False
+            card.is_new = False
+            card.large_image_source = None
+            card.small_image_source = None
+        self._model.apply_saved_cards(changes)
+        self._set_dirty(self._model.has_dirty_cards())
         if selected_card_index is not None:
             self._select_card(selected_card_index)
         QMessageBox.information(
@@ -663,8 +829,11 @@ class CardListView(QDialog):
         return self._model.card_at(source.row())
 
     def _selected_card_index(self) -> int | None:
-        card = self._selected_card()
-        return None if card is None else card.card_index
+        rows = self._table.selectionModel().selectedRows()
+        if len(rows) != 1:
+            return None
+        source = self._proxy_model.mapToSource(rows[0])
+        return self._model.card_index_at(source.row())
 
     def _select_card(self, card_index: int) -> bool:
         row = self._model.row_for_card_index(card_index)
@@ -695,9 +864,6 @@ class CardListView(QDialog):
 
     def _set_loading(self, loading: bool) -> None:
         self._loading = loading
-        self._table.setEnabled(not loading)
-        self._unused_filter_button.setEnabled(not loading)
-        self._display_language.setEnabled(not loading)
         self._refresh_action_states()
 
     def _model_mutation_blocked(self) -> bool:
@@ -717,12 +883,28 @@ class CardListView(QDialog):
             return
         blocked = self._model_mutation_blocked()
         selected = self._table.selectionModel().selectedRows()
-        self._add_button.setEnabled(not blocked)
-        self._update_button.setEnabled(not blocked and len(selected) == 1)
-        self._import_button.setEnabled(not blocked)
-        self._enable_all_button.setEnabled(not blocked)
-        self._suggest_button.setEnabled(not blocked)
-        self._save_button.setEnabled(self._dirty and not blocked)
+        suggest_active = self._suggest_runner is not None
+        save_busy = self._save_pending or self._save_runner is not None
+        self._add_card_action.setEnabled(not blocked)
+        self._update_card_action.setEnabled(not blocked and len(selected) == 1)
+        self._import_cards_action.setEnabled(not blocked)
+        self._enable_all_action.setEnabled(not blocked)
+        self._suggest_cards_action.setEnabled(not blocked)
+        self._save_cards_action.setEnabled(self._dirty and not blocked)
+        self._cancel_suggest_action.setVisible(suggest_active)
+        self._cancel_suggest_action.setEnabled(suggest_active)
+        self._export_cards_action.setEnabled(not save_busy)
+        self._close_card_list_action.setEnabled(not save_busy)
+        self._menu_bar.setEnabled(not save_busy)
+        view_controls_enabled = not self._loading and not save_busy
+        self._table.setEnabled(view_controls_enabled)
+        self._unused_filter_button.setEnabled(view_controls_enabled)
+        self._display_language.setEnabled(view_controls_enabled)
+        self._enable_all_button.setEnabled(not blocked and view_controls_enabled)
+        if save_busy:
+            self.setCursor(Qt.CursorShape.WaitCursor)
+        else:
+            self.unsetCursor()
 
     def _defer_reject_until_suggest_finishes(self) -> bool:
         if self._suggest_runner is None:

@@ -3,12 +3,12 @@ from __future__ import annotations
 import logging
 
 from PySide6.QtCore import Qt, QThreadPool, Signal
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
     QMainWindow,
     QMessageBox,
     QProgressBar,
-    QPushButton,
     QSizePolicy,
     QSplitter,
     QTreeWidget,
@@ -49,6 +49,7 @@ class ProjectView(QMainWindow):
 
         self.setWindowTitle(f"{APPLICATION_NAME} - {manifest.name}")
         self.setCentralWidget(load_ui(ui_path("project_window.ui"), self))
+        self.setMinimumSize(1100, 700)
         self.resize(1280, 800)
 
         self._tree = self.findChild(QTreeWidget, "treeFiles")
@@ -56,24 +57,102 @@ class ProjectView(QMainWindow):
         self._editor_host = self.findChild(QWidget, "editorHost")
         self._editor_layout = self._editor_host.layout()
         self._pgb_progress = self.findChild(QProgressBar, "pgbProgress")
-        self._export_button = self.findChild(QPushButton, "btnExportFiles")
-        self._build_button = self.findChild(QPushButton, "btnBuild")
-        self._build_and_run_button = self.findChild(QPushButton, "btnBuildAndRun")
-        self._save_file_button = self.findChild(QPushButton, "btnSaveFile")
-        self._card_list_button = self.findChild(QPushButton, "btnCardList")
+        content_layout = self.centralWidget().layout()
+        content_layout.setStretch(0, 1)
+        content_layout.setStretch(1, 0)
         self._splitter.setSizes([280, 1000])
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
 
+        self._create_actions()
+        self._create_menus()
         self._tree.itemClicked.connect(self._open_tree_item)
-        self._save_file_button.clicked.connect(self._save_current_file)
-        self._card_list_button.clicked.connect(self._open_card_list)
-        self._export_button.clicked.connect(self._export_files)
-        self._build_button.clicked.connect(self._pack_project)
-        self._build_and_run_button.clicked.connect(self._run_game)
-        self.findChild(QPushButton, "btnCloseProject").clicked.connect(self.close)
-        self._configure_build_and_run_button()
+        self._configure_run_action()
         self._populate_tree()
+        self._refresh_artifact_action_states()
+
+    def _create_actions(self) -> None:
+        self._save_current_file_action = self._new_action(
+            "actionSaveCurrentFile",
+            "Save Current File",
+            self._save_current_file,
+            shortcut="Ctrl+S",
+            status_tip="Save changes in the active project file.",
+        )
+        self._export_files_action = self._new_action(
+            "actionExportFiles",
+            "Export Files…",
+            self._export_files,
+            shortcut="Ctrl+Shift+E",
+            status_tip="Export reconstructed project files to a selected folder.",
+        )
+        self._close_project_action = self._new_action(
+            "actionCloseProject",
+            "Close Project",
+            self.close,
+            shortcut="Ctrl+W",
+            status_tip="Close the current project.",
+        )
+        self._card_list_action = self._new_action(
+            "actionCardList",
+            "Card List",
+            self._open_card_list,
+            status_tip="Open the combined card editor.",
+        )
+        self._build_action = self._new_action(
+            "actionBuild",
+            "Build",
+            self._pack_project,
+            shortcut="Ctrl+Shift+B",
+            status_tip="Build runnable game files from the current project.",
+        )
+        self._run_action = self._new_action(
+            "actionRun",
+            "Run",
+            self._run_game,
+            shortcut="F5",
+            status_tip="Launch the executable already built in the project bin folder.",
+        )
+
+    def _new_action(
+        self,
+        object_name: str,
+        text: str,
+        handler,
+        *,
+        shortcut: str | None = None,
+        status_tip: str,
+    ) -> QAction:
+        action = QAction(text, self)
+        action.setObjectName(object_name)
+        action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        action.setMenuRole(QAction.MenuRole.NoRole)
+        if shortcut is not None:
+            action.setShortcut(QKeySequence(shortcut))
+        action.setStatusTip(status_tip)
+        action.setToolTip(status_tip)
+        action.triggered.connect(handler)
+        return action
+
+    def _create_menus(self) -> None:
+        menu_bar = self.menuBar()
+        menu_bar.setObjectName("menuBar")
+
+        self._file_menu = menu_bar.addMenu("&File")
+        self._file_menu.setObjectName("menuFile")
+        self._file_menu.addAction(self._save_current_file_action)
+        self._file_menu.addAction(self._export_files_action)
+        self._file_menu.addSeparator()
+        self._file_menu.addAction(self._close_project_action)
+
+        self._tools_menu = menu_bar.addMenu("&Tools")
+        self._tools_menu.setObjectName("menuTools")
+        self._tools_menu.addAction(self._card_list_action)
+
+        self._build_menu = menu_bar.addMenu("&Build")
+        self._build_menu.setObjectName("menuBuild")
+        self._build_menu.addAction(self._build_action)
+        self._build_menu.addAction(self._run_action)
 
     def closeEvent(self, event) -> None:
         if self._pack_in_progress or self._export_in_progress:
@@ -139,11 +218,13 @@ class ProjectView(QMainWindow):
             file_item.setData(0, Qt.UserRole, resource_id)
         self._tree.expandToDepth(1)
 
-    def _configure_build_and_run_button(self) -> None:
+    def _configure_run_action(self) -> None:
         has_executable = self._manifest.executable is not None
-        self._build_and_run_button.setEnabled(has_executable)
-        self._build_and_run_button.setToolTip(
-            "" if has_executable else "This project does not contain an executable."
+        self._run_action.setEnabled(has_executable)
+        self._run_action.setToolTip(
+            self._run_action.statusTip()
+            if has_executable
+            else "This project does not contain an executable."
         )
 
     def _open_tree_item(self, item: QTreeWidgetItem) -> None:
@@ -343,17 +424,19 @@ class ProjectView(QMainWindow):
             and not self._run_in_progress
             and not project_mutation_busy
         )
-        self._export_button.setEnabled(artifact_actions_enabled)
-        self._build_button.setEnabled(artifact_actions_enabled)
-        self._build_and_run_button.setEnabled(
+        self._export_files_action.setEnabled(artifact_actions_enabled)
+        self._build_action.setEnabled(artifact_actions_enabled)
+        self._run_action.setEnabled(
             self._manifest.executable is not None
             and not artifact_busy
             and not self._run_in_progress
         )
-        self._save_file_button.setEnabled(
-            not artifact_busy and not project_mutation_busy
+        self._save_current_file_action.setEnabled(
+            self._current_editor is not None
+            and not artifact_busy
+            and not project_mutation_busy
         )
-        self._card_list_button.setEnabled(
+        self._card_list_action.setEnabled(
             not artifact_busy and not project_mutation_busy
         )
         self._tree.setEnabled(not artifact_busy and not project_mutation_busy)

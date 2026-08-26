@@ -602,6 +602,57 @@ global cache lock across network I/O. Do not cache a failed image fetch as a
 success, remove every in-flight entry in a `finally` path, and give waiters a
 finite timeout.
 
+## Card Detail single-row Save
+
+Card Detail and Card List both enter through
+`CardService.save_card_changes()`, but they do not pay the same persistence
+cost. Card List and untrusted/new drafts use the composite-table batch path. A
+clean existing Card Detail draft supplies its original baseline and may use the
+repository's single-row plan.
+
+The repository must inspect every participating physical table before writing
+anything. Card Index is a logical row locator only after header, row-count,
+catalog identity, indexed-text reserved-state, and unchanged-value checks pass.
+The connection owns UTF-8-SIG CSV inspection and sequential row rewriting with
+Python's `csv` module; the service never receives a path or serialization
+detail. Row writes use same-directory temporary files and atomic replacement
+inside the existing project staging clone. A stale baseline or malformed table
+fails rather than falling back to a potentially destructive batch rewrite.
+
+Map normalized changed fields to physical resources once. Multiple changed
+fields in `card_properties`, one localized name/description table, or one
+catalog must produce at most one row patch for that resource. A true no-op must
+skip staging. New cards, dirty/untrusted baselines, and Card List Save must not
+loop this API once per card.
+
+The reproducible harness is:
+
+```powershell
+.\.venv\Scripts\python.exe benchmarks\benchmark_card_detail_save.py --records 1115 --repeat 3
+.\.venv\Scripts\python.exe benchmarks\benchmark_card_detail_save.py --records 4095 --repeat 1
+```
+
+It reports elapsed time, DataFrame-backed table I/O, lightweight inspections,
+row rewrites, composite reads/writes, manifest writes, and Card List reloads.
+Do not describe zero DataFrame table I/O as zero in-memory pandas objects: the
+property projection may still construct a small DataFrame without reading or
+rewriting a table through pandas.
+
+The 2026-08-26 Windows/Python 3.13 synthetic six-language measurements were:
+
+| Records | Strategy | Median time | Speedup | DataFrame reads/writes | CSV inspections/row rewrites |
+|---:|---|---:|---:|---:|---:|
+| 1115 | composite batch, 3 runs | 4.073 s | baseline | 25 / 18 | 0 / 0 |
+| 1115 | trusted single row, 3 runs | 0.155 s | 26.23x | 0 / 0 | 16 / 1 |
+| 4095 | composite batch, 1 run | 16.159 s | baseline | 25 / 18 | 0 / 0 |
+| 4095 | trusted single row, 1 run | 0.359 s | 45.06x | 0 / 0 | 16 / 1 |
+
+Both strategies performed one manifest write and one staging commit. Each batch
+performed one composite card read/write; the single-row runs performed neither
+and triggered no Card List reload. These figures compare the two current
+correctness paths on identical fixture copies; they are reproducible engineering
+evidence, not a guarantee for every disk or antivirus configuration.
+
 ## Card image batch Save
 
 Card Detail and Card List must both call `CardService.save_card_changes()` and
@@ -611,10 +662,11 @@ wrapper around the batch implementation.
 
 For each batch:
 
-1. validate every plain BMP filename, complete large/mini pair, and duplicate
-   case-insensitively before mutation;
+1. validate every plain BMP filename, then coalesce case-insensitive duplicate
+   targets in source order; the latest nonempty large payload and latest
+   nonempty mini payload win independently;
 2. read the existing image inventory once, including manifest, both catalogs,
-   both workspace folders, and names duplicated within the batch;
+   both workspace folders, and case-folded names within the batch;
 3. prepare all outputs, plan all records and orders, and validate the planned
    manifest before changing the live staging manifest;
 4. write distinct staging destinations, validate that every planned physical
@@ -634,6 +686,10 @@ New image records use the manifest's case-preserved `Data.dat` name,
 `file_kind="image"`, `storage_format="binary"`, no language, nonvirtual physical
 workspace paths, and `compressed=False`. Replacement reuses the existing record
 without changing its compression state or creating a duplicate record.
+Multiple catalog rows may reference the same case-folded name only when one
+complete validated physical pair exists. Reject partial pairs, missing files,
+wrong source/kind/storage, virtual/generated records, and namespace collisions;
+do not weaken general manifest path uniqueness.
 
 When a batch adds new physical files, obtain the actual case-preserved
 `Data.dat` name from the repository and select its records case-insensitively.
@@ -767,6 +823,18 @@ then defer snapshot preparation through the Qt event loop. Add Card must open a
 disabled initialization dialog before its retained worker loads the draft, and
 close handling must wait for that worker's callbacks.
 
+Treat `_save_pending` and the retained `_save_runner` as the Card List model's
+mutation fence. Every new user action, timer, signal, integration hook, or
+background completion that can change a model-owned `CardEditDraft` must enter
+on the GUI thread and use the same blocked-state contract; it must reject or
+defer mutation until Save finishes. Do not infer safety from disabled widgets,
+because programmatic writers can bypass them. When a future workflow genuinely
+needs concurrent writes, first replace the current reference handoff with an
+immutable GUI-thread snapshot or a thread-safe snapshot/generation protocol.
+Add a regression that attempts the new mutation during both pending and running
+Save, verifies that the persisted snapshot is coherent, and verifies that a
+stale completion cannot overwrite the reconciled model.
+
 Evidence labels used for this area are: **Confirmed** for indexed-text and
 large/mini selector regression vectors; **Audited** for current `card_sort`
 mechanics; **Inferred** for NFKD/case-fold intent; and **Unresolved** for exact
@@ -813,6 +881,18 @@ UI value.
 
 ## Validation checklist
 
+For Card List Save or busy-state changes, also run a native Windows smoke test
+with a representative project or test seam that keeps the worker active long
+enough to observe the UI; do not add a production sleep. Verify in the first
+visible frame after selecting Save that the indeterminate marquee is visible
+and moving, the complete Card List surface is locked, and the wait cursor is
+active. While persistence runs, uncover or move the window and confirm that it
+continues repainting without Windows reporting `Not Responding`. Verify that
+success and an injected failure both restore the controls, cursor, progress
+state, and retry behavior. Record the Windows, Python, Qt, and build versions
+with the result. Offscreen tests establish state transitions, the event-loop
+yield, and timer liveness, but do not count as native marquee-paint verification.
+
 Before considering a change complete:
 
 1. Run `compileall`.
@@ -823,6 +903,8 @@ Before considering a change complete:
 6. Pack the project.
 7. Reopen the packed containers and compare entry count, paths, order, and decompressed payloads.
 8. Launch the packed executable when the change affects runtime game data.
+9. Run and record the native Card List Save smoke test when the change affects
+   Save concurrency, progress, busy-state, or model reconciliation.
 
 For executable work, record static binary verification, native Windows
 resource/API verification, and actual game runtime as separate results. Python

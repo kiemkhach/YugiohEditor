@@ -157,6 +157,21 @@ class ProjectTableFixture:
 
 
 class RepositoryTableTests(unittest.TestCase):
+    def test_unique_generated_image_reference_requires_complete_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, repository = ProjectTableFixture.build(Path(directory))
+            cards = repository.get_table("cards")
+            cards.at[1, "image_name"] = "usr404.bmp"
+            original_ids = repository.get_table("card_ids")
+
+            with self.assertRaisesRegex(ValueError, "complete physical card/mini pair"):
+                repository.save_table("cards", cards)
+
+            pd.testing.assert_frame_equal(
+                repository.get_table("card_ids"),
+                original_ids,
+            )
+
     def test_version_two_properties_and_passcodes_migrate_once_to_schema_four(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -696,17 +711,46 @@ class RepositoryTableTests(unittest.TestCase):
                 [-1, 2],
             )
 
-    def test_duplicate_custom_image_names_are_rejected_before_table_writes(self):
+    def test_shared_custom_image_name_requires_and_reuses_one_complete_pair(self):
         with tempfile.TemporaryDirectory() as directory:
-            _, repository = ProjectTableFixture.build(Path(directory))
+            manifest, repository = ProjectTableFixture.build(Path(directory))
             cards = repository.get_table("cards")
             cards["image_name"] = ["CUSTOM0001.bmp", "custom0001.BMP"]
             original_ids = repository.get_table("card_ids")
-            with self.assertRaisesRegex(ValueError, "must be unique"):
+            with self.assertRaisesRegex(ValueError, "complete physical card/mini pair"):
                 repository.save_table("cards", cards)
             pd.testing.assert_frame_equal(
                 repository.get_table("card_ids"),
                 original_ids,
+            )
+
+            source = Path(directory) / "shared.png"
+            Image.new("RGB", (10, 10), "teal").save(source)
+            repository.add_named_card_images(
+                "custom0001.BMP",
+                source,
+                source,
+            )
+            repository.save_table("cards", cards)
+
+            for image_variant in CardImageVariant:
+                catalog = repository.get_table(
+                    "card_catalog",
+                    image_variant=image_variant,
+                )
+                self.assertEqual(
+                    [value.casefold() for value in catalog["image_name"]],
+                    ["custom0001.bmp", "custom0001.bmp"],
+                )
+            records = [
+                record
+                for record in manifest.files
+                if Path(record.relative_path).name.casefold() == "custom0001.bmp"
+            ]
+            self.assertEqual(len(records), 2)
+            self.assertEqual(
+                len({record.relative_path.casefold() for record in records}),
+                2,
             )
 
 
@@ -1462,35 +1506,62 @@ class ProjectRepositoryResourceTests(unittest.TestCase):
             ],
         )
 
-    def test_named_card_image_batch_validates_all_inputs_before_mutation(self):
+    def test_named_card_image_batch_coalesces_case_insensitive_names_last_wins(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest, repository = ProjectTableFixture.build(root / "project")
-            source = root / "source.png"
-            Image.new("RGB", (10, 10), "purple").save(source)
+            first_source = root / "first.png"
+            last_source = root / "last.png"
+            Image.new("RGB", (10, 10), "purple").save(first_source)
+            Image.new("RGB", (10, 10), "orange").save(last_source)
+
+            repository.add_named_card_images_batch(
+                (
+                    NamedCardImagePair(
+                        "usr000.bmp",
+                        first_source,
+                        first_source,
+                    ),
+                    NamedCardImagePair(
+                        "USR000.BMP",
+                        last_source,
+                        last_source,
+                    ),
+                )
+            )
+
+            records = [
+                record
+                for record in manifest.files
+                if Path(record.relative_path).name.casefold() == "usr000.bmp"
+            ]
+            self.assertEqual(len(records), 2)
+            self.assertEqual(
+                len({record.relative_path.casefold() for record in records}),
+                2,
+            )
+            self.assertTrue(
+                all(
+                    Path(record.relative_path).name == "USR000.BMP"
+                    for record in records
+                )
+            )
+            large, mini = repository.read_card_images("usr000.bmp")
+            self.assertEqual(Image.open(BytesIO(large)).getpixel((0, 0)), (255, 165, 0))
+            self.assertEqual(Image.open(BytesIO(mini)).getpixel((0, 0)), (255, 165, 0))
+
             original_files = list(manifest.files)
             original_orders = [record.order for record in manifest.files]
 
-            with self.assertRaisesRegex(ValueError, "Duplicate card image name"):
+            with self.assertRaisesRegex(ValueError, "requires a complete pair"):
                 repository.add_named_card_images_batch(
-                    (
-                        NamedCardImagePair("usr000.bmp", source, source),
-                        NamedCardImagePair("USR000.BMP", source, source),
-                    )
+                    (NamedCardImagePair("usr002.bmp", None, last_source),)
                 )
-
             self.assertEqual(manifest.files, original_files)
             self.assertEqual(
                 [record.order for record in manifest.files],
                 original_orders,
             )
-            self.assertFalse(repository.exists("data/card/usr000.bmp"))
-            self.assertFalse(repository.exists("data/mini/usr000.bmp"))
-
-            with self.assertRaisesRegex(ValueError, "requires a complete pair"):
-                repository.add_named_card_images_batch(
-                    (NamedCardImagePair("usr002.bmp", None, source),)
-                )
             self.assertFalse(repository.exists("data/card/usr002.bmp"))
 
     def test_named_card_image_batch_rejects_catalog_only_name_conflict(self):
@@ -1615,6 +1686,43 @@ class ProjectRepositoryResourceTests(unittest.TestCase):
                 b"existing",
             )
             self.assertFalse(repository.exists("data/mini/usr000.bmp"))
+
+    def test_card_image_pair_inspection_rejects_partial_and_wrong_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, repository = ProjectTableFixture.build(root / "project")
+            source = root / "source.png"
+            Image.new("RGB", (10, 10), "purple").save(source)
+            payload = repository.prepare_image_bytes(source)
+            partial = ProjectFileRecord(
+                source_file="Data.dat",
+                relative_path="card/usr410.bmp",
+                workspace_path="data/card/usr410.bmp",
+                file_kind="image",
+                storage_format="binary",
+                order=len(manifest.files),
+            )
+            manifest.files.append(partial)
+            repository.write_image(partial.workspace_path, payload)
+
+            with self.assertRaisesRegex(ValueError, "only one physical variant"):
+                repository.card_image_pair_exists("USR410.BMP")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, repository = ProjectTableFixture.build(root / "project")
+            source = root / "source.png"
+            Image.new("RGB", (10, 10), "teal").save(source)
+            repository.add_named_card_images("usr411.bmp", source, source)
+            large = next(
+                record
+                for record in manifest.files
+                if record.relative_path.casefold() == "card/usr411.bmp"
+            )
+            large.file_kind = "binary"
+
+            with self.assertRaisesRegex(ValueError, "image/binary metadata"):
+                repository.card_image_pair_exists("usr411.bmp")
 
     def test_compatibility_resource_wrappers_and_table_errors(self):
         with tempfile.TemporaryDirectory() as directory:

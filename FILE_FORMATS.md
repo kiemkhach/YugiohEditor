@@ -947,12 +947,15 @@ different keys remain concurrent, and waiters use a finite timeout. Card List
 disables model mutations for the run, defers close until cancellation cleanup,
 and serializes Save requests against its retained repository.
 
-Saving from Card Detail or Card List uses one common service transaction and
-one repository image batch. The batch inventories manifest, catalogs, and
+Saving from Card Detail or Card List enters the same service transaction. A
+trusted existing-card edit uses a strictly preflighted single-row strategy;
+new cards, Card List batches, and untrusted edits use the composite-table
+strategy. Both operate in one staging clone and use the same repository image
+batch when image work exists. That batch inventories manifest, catalogs, and
 workspace once; validates all names and complete pairs before mutation; writes
-both image variants; updates both catalogs; and gives final manifest ownership
-to the staging save. `project.json`, catalogs, logical card tables, and physical
-images commit together or not at all.
+both image variants; updates the required catalog rows; and gives final manifest
+ownership to the staging save. `project.json`, catalogs, logical card tables,
+and physical images commit together or not at all.
 
 ## Media, text, and raw resources
 
@@ -986,6 +989,14 @@ and LZSS is not invoked for them. Replacing an existing image retains its
 manifest record, path, and original compression state. A replacement-only Save
 does not replan order; when the same Save also adds physical files, the existing
 record participates in the complete `Data.dat` alphabetical replan below.
+
+Staged image targets are keyed by case-insensitive canonical filename. When
+several drafts target the same pair, the last staged nonempty large payload and
+the last staged nonempty mini payload win independently. The result is still
+exactly one `card/` record and one `mini/` record. Several card rows may refer
+to that valid pair, but a partial pair, duplicate manifest record, wrong file
+kind, generated/virtual record, noncanonical path, or missing workspace file is
+rejected before the staging clone is committed.
 
 After adding one or more new physical files, record order is replanned as
 follows:
@@ -1214,10 +1225,13 @@ that every physical record points to an existing workspace file.
 
 ### Structured workspace files
 
-Tables and lists are stored as UTF-8-with-BOM CSV through pandas. The workspace
-filename may retain its original `.bin`, `.ydc`, or `.txt` extension because
-`storage_format` and the repository's matched config rule define the project
-representation.
+Tables and lists are stored as UTF-8-with-BOM CSV. Composite and batch table
+operations use pandas. The trusted existing-card Save path instead inspects the
+same CSV contracts with Python's sequential CSV reader and atomically rewrites
+only the validated affected rows, avoiding a full composite-table load. The
+workspace filename may retain its original `.bin`, `.ydc`, or `.txt` extension
+because `storage_format` and the repository's matched config rule define the
+project representation.
 
 Services access structured card data by logical name:
 
@@ -1259,12 +1273,15 @@ and `region/`. Virtual resources are included. Export creates or overwrites only
 its managed files and never removes the selected destination tree.
 
 Card edits use the same transaction boundary. The project is cloned to staging,
-all new/replacement large and mini images are applied in one batch, logical
-cards and both catalogs are saved, the final manifest is validated and written
-once, and only then is staging atomically committed. New image records default
-to `compressed=false`; existing replacements retain their metadata. Any failure
-before or during commit leaves the original workspace and its `project.json`
-unchanged.
+all coalesced new/replacement large and mini images are applied in one batch,
+affected logical card changes and required catalog rows are saved, the final
+manifest is validated and written once, and only then is staging atomically
+committed. The single-row strategy preflights every participating table's
+headers, row count, row identity, reserved state, and catalog alignment before
+any rewrite. New
+image records default to `compressed=false`; existing replacements retain their
+metadata. Any failure before or during commit leaves the original workspace and
+its `project.json` unchanged.
 
 ## Packaged application resource
 

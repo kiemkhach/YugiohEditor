@@ -162,10 +162,17 @@ class ArchitectureTests(unittest.TestCase):
             ProjectRepository,
         )
 
-        for name in ("list_tables", "has_table", "get_table", "save_table"):
+        for name in (
+            "list_tables",
+            "has_table",
+            "get_table",
+            "save_table",
+            "plan_existing_card_update",
+            "apply_existing_card_update",
+        ):
             self.assertTrue(callable(getattr(ProjectRepository, name, None)))
 
-    def test_card_service_uses_composite_table(self):
+    def test_card_service_uses_repository_card_persistence_contracts(self):
         source = (ROOT / "services" / "card_service.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         table_calls = [
@@ -183,6 +190,13 @@ class ArchitectureTests(unittest.TestCase):
         ]
         self.assertIn(("get_table", "cards"), table_calls)
         self.assertIn(("save_table", "cards"), table_calls)
+        repository_calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("plan_existing_card_update", repository_calls)
+        self.assertIn("apply_existing_card_update", repository_calls)
         string_literals = {
             node.value
             for node in ast.walk(tree)

@@ -17,18 +17,20 @@ PYSIDE_AVAILABLE = importlib.util.find_spec("PySide6") is not None
 
 if PYSIDE_AVAILABLE:
     from PySide6.QtCore import QEvent, QPoint, QSettings, Qt, QThread
-    from PySide6.QtGui import QIcon
+    from PySide6.QtGui import QAction, QIcon, QKeySequence
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
         QFileDialog,
         QFormLayout,
-        QHBoxLayout,
         QHeaderView,
         QLineEdit,
+        QMenu,
         QMessageBox,
         QPushButton,
+        QSizePolicy,
         QTableView,
+        QToolBar,
         QTreeWidgetItem,
         QWidget,
     )
@@ -839,8 +841,10 @@ class UiLoadingTests(unittest.TestCase):
                     )
                     editor.deleteLater()
 
-    def test_project_view_enables_run_only_for_manifest_executable(self):
+    def test_project_view_menu_actions_are_canonical_without_toolbar(self):
         with tempfile.TemporaryDirectory() as directory:
+            project_service = Mock(spec=ProjectService)
+            project_service.list_visible_resources.return_value = []
             empty_manifest = ProjectManifest(
                 "Empty",
                 directory,
@@ -848,16 +852,15 @@ class UiLoadingTests(unittest.TestCase):
             )
             empty_view = ProjectView(
                 empty_manifest,
-                ProjectService(),
-                CardService(),
+                project_service,
+                Mock(spec=CardService),
             )
-            self.assertFalse(
-                empty_view.findChild(QPushButton, "btnBuildAndRun").isEnabled()
-            )
+            self.assertFalse(empty_view._run_action.isEnabled())
             self.assertEqual(
-                empty_view.findChild(QPushButton, "btnBuildAndRun").toolTip(),
+                empty_view._run_action.toolTip(),
                 "This project does not contain an executable.",
             )
+            self.assertFalse(empty_view._save_current_file_action.isEnabled())
             empty_view.deleteLater()
 
             manifest = ProjectManifest(
@@ -869,25 +872,177 @@ class UiLoadingTests(unittest.TestCase):
                     relative_path="mai/mai_pc.exe",
                 ),
             )
-            view = ProjectView(manifest, ProjectService(), CardService())
-            self.assertTrue(view.findChild(QPushButton, "btnBuildAndRun").isEnabled())
-            export_button = view.findChild(QPushButton, "btnExportFiles")
-            build_button = view.findChild(QPushButton, "btnBuild")
-            toolbar = view.findChild(QHBoxLayout, "toolbarLayout")
-            self.assertEqual(export_button.text(), "Export Files")
+            view = ProjectView(manifest, project_service, Mock(spec=CardService))
+            self.assertTrue(view._run_action.isEnabled())
+
             self.assertEqual(
-                toolbar.indexOf(export_button) + 1, toolbar.indexOf(build_button)
+                [action.text().replace("&", "") for action in view.menuBar().actions()],
+                ["File", "Tools", "Build"],
             )
-            self.assertEqual(view.findChild(QPushButton, "btnBuild").text(), "Build")
+            self.assertEqual(len(view.menuBar().actions()), 3)
             self.assertEqual(
-                view.findChild(QPushButton, "btnBuildAndRun").text(),
-                "Run",
+                [
+                    None if action.isSeparator() else action.text()
+                    for action in view._file_menu.actions()
+                ],
+                ["Save Current File", "Export Files…", None, "Close Project"],
             )
             self.assertEqual(
-                view.findChild(QPushButton, "btnBuildAndRun").toolTip(), ""
+                [action.text() for action in view._tools_menu.actions()],
+                ["Card List"],
             )
-            self.assertIsNone(view.findChild(QPushButton, "btnPack"))
-            self.assertIsNone(view.findChild(QPushButton, "btnRun"))
+            self.assertEqual(
+                [action.text() for action in view._build_menu.actions()],
+                ["Build", "Run"],
+            )
+            self.assertEqual(view.findChildren(QToolBar), [])
+            self.assertIs(view._file_menu.actions()[0], view._save_current_file_action)
+            self.assertIs(view._tools_menu.actions()[0], view._card_list_action)
+            self.assertIs(view.findChild(QMenu, "menuFile"), view._file_menu)
+            self.assertIs(view.findChild(QMenu, "menuTools"), view._tools_menu)
+            self.assertIs(view.findChild(QMenu, "menuBuild"), view._build_menu)
+            expected_names = {
+                "actionSaveCurrentFile": view._save_current_file_action,
+                "actionExportFiles": view._export_files_action,
+                "actionCloseProject": view._close_project_action,
+                "actionCardList": view._card_list_action,
+                "actionBuild": view._build_action,
+                "actionRun": view._run_action,
+            }
+            for object_name, action in expected_names.items():
+                self.assertIs(view.findChild(QAction, object_name), action)
+                self.assertIs(action.parent(), view)
+            self.assertTrue(
+                all(
+                    action.statusTip()
+                    for action in (
+                        view._save_current_file_action,
+                        view._export_files_action,
+                        view._close_project_action,
+                        view._card_list_action,
+                        view._build_action,
+                        view._run_action,
+                    )
+                )
+            )
+            self.assertEqual(
+                view._run_action.toolTip(),
+                view._run_action.statusTip(),
+            )
+            for object_name in (
+                "btnCardList",
+                "btnSaveFile",
+                "btnExportFiles",
+                "btnBuild",
+                "btnBuildAndRun",
+                "btnCloseProject",
+            ):
+                self.assertIsNone(view.findChild(QPushButton, object_name))
+
+            future_tool = QAction("Future Tool", view)
+            view._tools_menu.addAction(future_tool)
+            self.assertEqual(
+                view._tools_menu.actions(),
+                [view._card_list_action, future_tool],
+            )
+            view.deleteLater()
+
+    def test_project_content_layout_expands_splitter_and_keeps_progress_compact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Mock(spec=ProjectService)
+            service.list_visible_resources.return_value = []
+            view = ProjectView(
+                ProjectManifest("Layout", directory, version_prefix="mai"),
+                service,
+                Mock(spec=CardService),
+            )
+            content_layout = view.centralWidget().layout()
+            self.assertEqual(content_layout.stretch(0), 1)
+            self.assertEqual(content_layout.stretch(1), 0)
+            self.assertEqual(
+                view._splitter.sizePolicy().verticalPolicy(),
+                QSizePolicy.Policy.Expanding,
+            )
+            self.assertEqual(
+                view._pgb_progress.sizePolicy().verticalPolicy(),
+                QSizePolicy.Policy.Fixed,
+            )
+            self.assertEqual(view._pgb_progress.maximumHeight(), 24)
+
+            view.resize(1100, 700)
+            view.show()
+            self.application.processEvents()
+            compact_height = view._splitter.height()
+            self.assertEqual(view._tree.height(), view._editor_host.height())
+
+            view.resize(1100, 900)
+            self.application.processEvents()
+            self.assertGreaterEqual(view._splitter.height(), compact_height + 190)
+
+            view._pgb_progress.show()
+            self.application.processEvents()
+            self.assertLessEqual(view._pgb_progress.height(), 24)
+            self.assertGreater(view._splitter.height(), view._pgb_progress.height())
+            view.close()
+            view.deleteLater()
+
+    def test_project_action_shortcuts_are_window_scoped_and_unique(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Mock(spec=ProjectService)
+            service.list_visible_resources.return_value = []
+            view = ProjectView(
+                ProjectManifest(
+                    "Shortcuts",
+                    directory,
+                    version_prefix="mai",
+                    executable=ExecutableManifest(
+                        source_name="joey_pc.exe",
+                        relative_path="mai/mai_pc.exe",
+                    ),
+                ),
+                service,
+                Mock(spec=CardService),
+            )
+            expected = {
+                view._save_current_file_action: "Ctrl+S",
+                view._export_files_action: "Ctrl+Shift+E",
+                view._close_project_action: "Ctrl+W",
+                view._build_action: "Ctrl+Shift+B",
+                view._run_action: "F5",
+            }
+            self.assertTrue(view._card_list_action.shortcut().isEmpty())
+            for action, shortcut in expected.items():
+                self.assertEqual(action.shortcut(), QKeySequence(shortcut))
+                self.assertEqual(
+                    action.shortcutContext(),
+                    Qt.ShortcutContext.WindowShortcut,
+                )
+                self.assertNotIn("\t", action.text())
+            portable = [
+                action.shortcut().toString(QKeySequence.SequenceFormat.PortableText)
+                for action in expected
+            ]
+            self.assertEqual(len(portable), len(set(portable)))
+            view.deleteLater()
+
+    def test_project_save_action_requires_an_editor_and_dispatches_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Mock(spec=ProjectService)
+            service.list_visible_resources.return_value = []
+            view = ProjectView(
+                ProjectManifest("Save action", directory, version_prefix="mai"),
+                service,
+                Mock(spec=CardService),
+            )
+            self.assertFalse(view._save_current_file_action.isEnabled())
+            editor = Mock()
+            editor.is_project_mutation_in_progress = False
+            view._current_editor = editor
+            view._refresh_artifact_action_states()
+            self.assertTrue(view._save_current_file_action.isEnabled())
+            with patch.object(QMessageBox, "information"):
+                view._save_current_file_action.trigger()
+            editor.save.assert_called_once_with()
             view.deleteLater()
 
     def test_image_editor_exposes_retained_replace_mutation_state(self):
@@ -988,13 +1143,13 @@ class UiLoadingTests(unittest.TestCase):
             )
             view = ProjectView(manifest, service, CardService())
             view.show()
-            run_button = view.findChild(QPushButton, "btnBuildAndRun")
+            run_action = view._run_action
 
             with (
                 patch.object(QMessageBox, "information") as information,
                 patch.object(QMessageBox, "critical") as critical,
             ):
-                run_button.click()
+                run_action.trigger()
                 self.assertTrue(view._pgb_progress.isVisible())
                 self.assertTrue(self.wait_until(lambda: not view._active_runners))
 
@@ -1036,11 +1191,11 @@ class UiLoadingTests(unittest.TestCase):
             )
             view = ProjectView(manifest, service, CardService())
             view.show()
-            export_button = view.findChild(QPushButton, "btnExportFiles")
-            build_button = view.findChild(QPushButton, "btnBuild")
-            run_button = view.findChild(QPushButton, "btnBuildAndRun")
-            save_button = view.findChild(QPushButton, "btnSaveFile")
-            card_list_button = view.findChild(QPushButton, "btnCardList")
+            export_action = view._export_files_action
+            build_action = view._build_action
+            run_action = view._run_action
+            save_action = view._save_current_file_action
+            card_list_action = view._card_list_action
             card_list = Mock()
             card_list.is_project_save_in_progress = False
             view._card_list_view = card_list
@@ -1054,20 +1209,20 @@ class UiLoadingTests(unittest.TestCase):
                 patch.object(QMessageBox, "information") as information,
                 patch.object(QMessageBox, "critical") as critical,
             ):
-                export_button.click()
+                export_action.trigger()
                 self.assertTrue(self.wait_until(started.is_set))
-                export_button.click()
+                export_action.trigger()
                 self.assertTrue(view._export_in_progress)
-                self.assertFalse(export_button.isEnabled())
-                self.assertFalse(build_button.isEnabled())
-                self.assertFalse(run_button.isEnabled())
-                self.assertFalse(save_button.isEnabled())
-                self.assertFalse(card_list_button.isEnabled())
+                self.assertFalse(export_action.isEnabled())
+                self.assertFalse(build_action.isEnabled())
+                self.assertFalse(run_action.isEnabled())
+                self.assertFalse(save_action.isEnabled())
+                self.assertFalse(card_list_action.isEnabled())
                 self.assertFalse(view._tree.isEnabled())
                 self.assertFalse(view._editor_host.isEnabled())
                 card_list.setEnabled.assert_called_with(False)
                 self.assertTrue(view._pgb_progress.isVisible())
-                view.close()
+                view._close_project_action.trigger()
                 self.application.processEvents()
                 self.assertTrue(view.isVisible())
                 release.set()
@@ -1091,11 +1246,11 @@ class UiLoadingTests(unittest.TestCase):
             )
             self.assertEqual(information.call_count, 2)
             critical.assert_not_called()
-            self.assertTrue(export_button.isEnabled())
-            self.assertTrue(build_button.isEnabled())
-            self.assertTrue(run_button.isEnabled())
-            self.assertTrue(save_button.isEnabled())
-            self.assertTrue(card_list_button.isEnabled())
+            self.assertTrue(export_action.isEnabled())
+            self.assertTrue(build_action.isEnabled())
+            self.assertTrue(run_action.isEnabled())
+            self.assertFalse(save_action.isEnabled())
+            self.assertTrue(card_list_action.isEnabled())
             self.assertTrue(view._tree.isEnabled())
             self.assertTrue(view._editor_host.isEnabled())
             card_list.setEnabled.assert_called_with(True)
@@ -1188,7 +1343,7 @@ class UiLoadingTests(unittest.TestCase):
 
             def choose_replacement(*_args):
                 card_list.set_external_project_mutation_blocked.assert_called_with(True)
-                self.assertFalse(view.findChild(QPushButton, "btnBuild").isEnabled())
+                self.assertFalse(view._build_action.isEnabled())
                 return str(Path(directory) / "replacement.bmp"), ""
 
             with patch.object(
@@ -1263,7 +1418,7 @@ class UiLoadingTests(unittest.TestCase):
 
             self.assertFalse(view._editor_host.isEnabled())
             self.assertFalse(view._tree.isEnabled())
-            self.assertFalse(view.findChild(QPushButton, "btnBuild").isEnabled())
+            self.assertFalse(view._build_action.isEnabled())
             with patch.object(QFileDialog, "getOpenFileName") as chooser:
                 editor.replace_button.click()
             chooser.assert_not_called()
@@ -1272,7 +1427,7 @@ class UiLoadingTests(unittest.TestCase):
             card_list._notify_project_save_state()
             self.assertTrue(view._editor_host.isEnabled())
             self.assertTrue(view._tree.isEnabled())
-            self.assertTrue(view.findChild(QPushButton, "btnBuild").isEnabled())
+            self.assertTrue(view._build_action.isEnabled())
             card_list._closing = True
             card_list.reject()
             view._card_list_view = None
@@ -1293,9 +1448,9 @@ class UiLoadingTests(unittest.TestCase):
                 ),
             )
             view = ProjectView(manifest, service, CardService())
-            run_button = view.findChild(QPushButton, "btnBuildAndRun")
-            export_button = view.findChild(QPushButton, "btnExportFiles")
-            build_button = view.findChild(QPushButton, "btnBuild")
+            run_action = view._run_action
+            export_action = view._export_files_action
+            build_action = view._build_action
 
             with patch.object(view, "_run_task") as run_task:
                 view._run_game()
@@ -1303,15 +1458,15 @@ class UiLoadingTests(unittest.TestCase):
 
             self.assertEqual(run_task.call_count, 1)
             self.assertTrue(view._run_in_progress)
-            self.assertFalse(run_button.isEnabled())
-            self.assertFalse(export_button.isEnabled())
-            self.assertFalse(build_button.isEnabled())
+            self.assertFalse(run_action.isEnabled())
+            self.assertFalse(export_action.isEnabled())
+            self.assertFalse(build_action.isEnabled())
 
             view._on_run_finished()
             self.assertFalse(view._run_in_progress)
-            self.assertTrue(run_button.isEnabled())
-            self.assertTrue(export_button.isEnabled())
-            self.assertTrue(build_button.isEnabled())
+            self.assertTrue(run_action.isEnabled())
+            self.assertTrue(export_action.isEnabled())
+            self.assertTrue(build_action.isEnabled())
             view.deleteLater()
 
     def test_project_view_export_cancel_and_failure_leave_ui_usable(self):
@@ -1325,15 +1480,15 @@ class UiLoadingTests(unittest.TestCase):
             )
             view = ProjectView(manifest, service, CardService())
             view.show()
-            export_button = view.findChild(QPushButton, "btnExportFiles")
-            build_button = view.findChild(QPushButton, "btnBuild")
+            export_action = view._export_files_action
+            build_action = view._build_action
 
             with patch.object(
                 QFileDialog,
                 "getExistingDirectory",
                 return_value="",
             ):
-                export_button.click()
+                export_action.trigger()
             service.export_project_files.assert_not_called()
             self.assertFalse(view._export_in_progress)
 
@@ -1349,7 +1504,7 @@ class UiLoadingTests(unittest.TestCase):
                 patch.object(QMessageBox, "critical") as critical,
                 self.assertLogs(level="ERROR"),
             ):
-                export_button.click()
+                export_action.trigger()
                 self.assertTrue(self.wait_until(lambda: not view._export_in_progress))
 
             service.export_project_files.assert_called_once_with(manifest, directory)
@@ -1358,8 +1513,8 @@ class UiLoadingTests(unittest.TestCase):
                 "Export Files Failed",
                 "The export destination is invalid.",
             )
-            self.assertTrue(export_button.isEnabled())
-            self.assertTrue(build_button.isEnabled())
+            self.assertTrue(export_action.isEnabled())
+            self.assertTrue(build_action.isEnabled())
             self.assertFalse(view._pgb_progress.isVisible())
             self.assertEqual(view._active_runners, {})
             view.close()
@@ -1383,14 +1538,14 @@ class UiLoadingTests(unittest.TestCase):
             )
             view = ProjectView(manifest, service, CardService())
             view.show()
-            run_button = view.findChild(QPushButton, "btnBuildAndRun")
+            run_action = view._run_action
 
             with (
                 self.assertLogs(level="ERROR"),
                 patch.object(QMessageBox, "information") as information,
                 patch.object(QMessageBox, "critical") as critical,
             ):
-                run_button.click()
+                run_action.trigger()
                 self.assertTrue(view._pgb_progress.isVisible())
                 self.assertTrue(self.wait_until(lambda: not view._active_runners))
 
@@ -1426,7 +1581,7 @@ class UiLoadingTests(unittest.TestCase):
             )
             view = ProjectView(manifest, service, CardService())
             view.show()
-            pack_button = view.findChild(QPushButton, "btnBuild")
+            pack_action = view._build_action
             callback_threads = []
 
             def show_success(*_args):
@@ -1436,15 +1591,15 @@ class UiLoadingTests(unittest.TestCase):
                 patch.object(QMessageBox, "information", side_effect=show_success),
                 patch.object(QMessageBox, "critical") as critical,
             ):
-                pack_button.click()
-                self.assertFalse(pack_button.isEnabled())
+                pack_action.trigger()
+                self.assertFalse(pack_action.isEnabled())
                 self.assertTrue(view._pgb_progress.isVisible())
                 self.assertTrue(self.wait_until(lambda: not view._pack_in_progress))
 
             service.pack_project.assert_called_once_with(manifest)
             self.assertNotEqual(worker_threads[0], self.application.thread())
             self.assertEqual(callback_threads[0], self.application.thread())
-            self.assertTrue(pack_button.isEnabled())
+            self.assertTrue(pack_action.isEnabled())
             self.assertFalse(view._pgb_progress.isVisible())
             self.assertEqual(view._active_runners, {})
             self.assertTrue(view.isVisible())
@@ -1462,14 +1617,14 @@ class UiLoadingTests(unittest.TestCase):
                 version_prefix="mai",
             )
             view = ProjectView(manifest, service, CardService())
-            pack_button = view.findChild(QPushButton, "btnBuild")
+            pack_action = view._build_action
 
             with patch.object(view, "_run_task") as run_task:
-                pack_button.click()
-                pack_button.click()
+                pack_action.trigger()
+                pack_action.trigger()
 
             self.assertEqual(run_task.call_count, 1)
-            self.assertFalse(pack_button.isEnabled())
+            self.assertFalse(pack_action.isEnabled())
             view.deleteLater()
 
     def test_project_view_pack_error_has_resource_context_and_can_retry(self):
@@ -1495,13 +1650,13 @@ class UiLoadingTests(unittest.TestCase):
             )
             view = ProjectView(manifest, service, CardService())
             view.show()
-            pack_button = view.findChild(QPushButton, "btnBuild")
+            pack_action = view._build_action
 
             with (
                 self.assertLogs(level="ERROR") as logs,
                 patch.object(QMessageBox, "critical") as critical,
             ):
-                pack_button.click()
+                pack_action.trigger()
                 self.assertTrue(self.wait_until(lambda: not view._pack_in_progress))
 
             critical.assert_called_once_with(
@@ -1514,7 +1669,7 @@ class UiLoadingTests(unittest.TestCase):
             self.assertIn("Background task failed", log_output)
             self.assertIn("card_id.bin", log_output)
             self.assertNotIn("QThread: Destroyed", log_output)
-            self.assertTrue(pack_button.isEnabled())
+            self.assertTrue(pack_action.isEnabled())
             self.assertFalse(view._pgb_progress.isVisible())
             self.assertEqual(view._active_runners, {})
             self.assertTrue(view.isVisible())
@@ -1522,7 +1677,7 @@ class UiLoadingTests(unittest.TestCase):
             service.pack_project.side_effect = None
             service.pack_project.return_value = Path(directory) / "bin"
             with patch.object(QMessageBox, "information"):
-                pack_button.click()
+                pack_action.trigger()
                 self.assertTrue(self.wait_until(lambda: not view._pack_in_progress))
             self.assertEqual(service.pack_project.call_count, 2)
             view.close()
@@ -1564,12 +1719,12 @@ class UiLoadingTests(unittest.TestCase):
             )
             view = ProjectView(manifest, service, CardService())
             view.show()
-            pack_button = view.findChild(QPushButton, "btnBuild")
+            pack_action = view._build_action
 
             with patch.object(QMessageBox, "information") as information:
-                pack_button.click()
+                pack_action.trigger()
                 self.assertTrue(self.wait_until(started.is_set))
-                view.close()
+                view._close_project_action.trigger()
                 self.application.processEvents()
                 self.assertTrue(view.isVisible())
                 self.assertTrue(view._pack_in_progress)

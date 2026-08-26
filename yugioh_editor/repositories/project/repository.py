@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import partial
@@ -33,6 +33,10 @@ from yugioh_editor.common.constants import (
     PROJECT_ICON_FILE_NAME,
     normalize_language_code,
 )
+from yugioh_editor.common.joey_card_capacity import (
+    JoeyCardCapacityError,
+    validate_joey_edit_topology,
+)
 from yugioh_editor.common.subfile_rules_config import SUBFILE_RULE_CONFIGS
 from yugioh_editor.common.worker_limits import (
     estimate_available_memory_bytes,
@@ -48,7 +52,10 @@ from yugioh_editor.models.entities import (
 )
 from yugioh_editor.repositories.game.subfile_rule import SubfileRule
 from yugioh_editor.repositories.game.subfile_rule_factory import SubfileRuleFactory
-from yugioh_editor.repositories.project.connection import ProjectFolderConnection
+from yugioh_editor.repositories.project.connection import (
+    CsvTableInspection,
+    ProjectFolderConnection,
+)
 
 
 def normalize_project_path(value: str | Path) -> PurePosixPath:
@@ -86,6 +93,63 @@ class _PreparedCardImagePair:
     image_name: str
     large_payload: bytes
     mini_payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _CardImagePairRecords:
+    large: ProjectFileRecord
+    mini: ProjectFileRecord
+
+
+@dataclass(frozen=True, slots=True)
+class _CardCsvRowPatch:
+    resource_name: str
+    workspace_path: str
+    expected_columns: tuple[str, ...]
+    expected_row_count: int | None
+    row_index: int
+    expected_values: tuple[tuple[str, str], ...]
+    updated_values: tuple[tuple[str, str], ...]
+    catalog_variant: CardImageVariant | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExistingCardUpdatePlan:
+    card_index: int
+    patches: tuple[_CardCsvRowPatch, ...]
+
+    @property
+    def resource_names(self) -> tuple[str, ...]:
+        return tuple(patch.resource_name for patch in self.patches)
+
+
+_CARD_PROPERTY_LOGICAL_FIELDS = frozenset(
+    {
+        "attack",
+        "defense",
+        "monster_type_code",
+        "monster_type",
+        "card_category_code",
+        "card_category",
+        "attribute_code",
+        "attribute",
+        "level",
+    }
+)
+_CARD_CATALOG_COLUMNS = ("name", "index", "card_id", "image_name", "note")
+_CARD_LOGICAL_FIELD_GROUPS = {
+    "card_id": "card_ids",
+    "passcode": "card_passcodes",
+    "pack": "card_packs",
+    **{field_name: "card_properties" for field_name in _CARD_PROPERTY_LOGICAL_FIELDS},
+    **{f"name_{language}": f"card_names:{language}" for language in LANGUAGE_PREFIXES},
+    **{
+        f"desc_{language}": f"card_descriptions:{language}"
+        for language in LANGUAGE_PREFIXES
+    },
+    "image_name": "card_catalogs",
+    "note": "card_catalogs",
+}
 
 
 class ProjectRepository:
@@ -154,6 +218,7 @@ class ProjectRepository:
         self._connection.commit_staging_root(staging._connection)
 
     def discard(self) -> None:
+        self._pending_card_catalogs.clear()
         self._connection.discard_root()
 
     def begin_pack(self) -> ProjectRepository:
@@ -473,6 +538,350 @@ class ProjectRepository:
             raise ValueError(f"Table '{table_name}' is read-only.")
         handler.writer(table.copy(), **parameters)
 
+    def plan_existing_card_update(
+        self,
+        before: Mapping[str, object],
+        after: Mapping[str, object],
+        *,
+        include_catalogs: bool = False,
+    ) -> ExistingCardUpdatePlan:
+        """Validate physical card topology and build a guarded one-row plan."""
+
+        before_values = dict(before)
+        after_values = dict(after)
+        before_index = int(before_values["card_index"])
+        after_index = int(after_values["card_index"])
+        before_id = int(before_values["card_id"])
+        after_id = int(after_values["card_id"])
+        if before_index != after_index:
+            raise ValueError(
+                "Card index is immutable for an existing-card row update: "
+                f"expected {before_index}, got {after_index}."
+            )
+        if before_id != after_id:
+            raise ValueError(
+                f"Card ID is immutable for index {before_index}: "
+                f"expected {before_id}, got {after_id}."
+            )
+
+        fixed_specs = (
+            ("card_ids", ("value",)),
+            ("card_passcodes", ("value",)),
+            ("card_packs", ("value",)),
+            ("card_properties", tuple(CARD_PROPERTY_COLUMNS)),
+        )
+        fixed: dict[str, tuple[ProjectFileRecord, object]] = {}
+        id_record, id_inspection = self._inspect_card_physical_table(
+            "card_ids",
+            ("value",),
+        )
+        fixed["card_ids"] = (id_record, id_inspection)
+        card_ids: list[int] = []
+        for row_index, row in enumerate(id_inspection.rows):
+            try:
+                card_ids.append(int(row[0]))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"card_id.bin row {row_index} is not an integer: {row[0]!r}."
+                ) from error
+        try:
+            validate_joey_edit_topology(card_ids)
+        except JoeyCardCapacityError as error:
+            raise ValueError(str(error)) from error
+        row_count = len(card_ids)
+        if not 0 <= before_index < row_count:
+            raise ValueError(
+                f"Card index {before_index} is outside the persisted "
+                f"0..{max(0, row_count - 1)} range."
+            )
+        if card_ids[before_index] != before_id:
+            raise ValueError(
+                f"Stale card baseline at index {before_index}: expected Card ID "
+                f"{before_id}, found {card_ids[before_index]}."
+            )
+        for table_name, columns in fixed_specs[1:]:
+            fixed[table_name] = self._inspect_card_physical_table(
+                table_name,
+                columns,
+                expected_row_count=row_count,
+            )
+
+        localized: dict[tuple[str, str], tuple[ProjectFileRecord, object]] = {}
+        for table_name, columns in (
+            ("card_names", ("value",)),
+            ("card_descriptions", ("text", "is_reserved")),
+        ):
+            handler = self._require_table_handler(table_name)
+            if handler.rule is None:
+                raise RuntimeError(f"{table_name} physical rule is missing.")
+            for language in LANGUAGE_PREFIXES:
+                record = self._physical_table_record(
+                    handler.rule,
+                    {"language": language},
+                    required=False,
+                )
+                if record is None:
+                    continue
+                inspection = self._inspect_record_csv(
+                    record,
+                    columns,
+                    expected_row_count=row_count,
+                )
+                localized[(table_name, language)] = (record, inspection)
+                if table_name == "card_descriptions":
+                    self._validate_description_inspection(record, inspection)
+
+        changed_fields = {
+            field_name
+            for field_name in set(before_values).union(after_values)
+            if before_values.get(field_name) != after_values.get(field_name)
+        }
+        if "card_index" in changed_fields or "card_id" in changed_fields:
+            raise ValueError("Existing-card identity fields cannot be changed.")
+        unsupported_fields = sorted(
+            changed_fields.difference(_CARD_LOGICAL_FIELD_GROUPS).difference(
+                {"card_index"}
+            )
+        )
+        if unsupported_fields:
+            raise ValueError(
+                "Unsupported logical card update field: " + unsupported_fields[0]
+            )
+        changed_groups = {
+            _CARD_LOGICAL_FIELD_GROUPS[field_name]
+            for field_name in changed_fields
+            if field_name in _CARD_LOGICAL_FIELD_GROUPS
+        }
+
+        patches: list[_CardCsvRowPatch] = []
+        retained_catalogs: dict[CardImageVariant, pd.DataFrame] = {}
+
+        def add_patch(
+            record: ProjectFileRecord,
+            columns: tuple[str, ...],
+            expected: Mapping[str, object],
+            updated: Mapping[str, object],
+            *,
+            physical_row: int = before_index,
+            expected_count: int | None = row_count,
+            catalog_variant: CardImageVariant | None = None,
+        ) -> None:
+            if record.workspace_path is None:
+                raise ValueError(
+                    f"Physical table has no workspace path: {record.relative_path}"
+                )
+            patches.append(
+                _CardCsvRowPatch(
+                    resource_name=record.relative_path,
+                    workspace_path=record.workspace_path,
+                    expected_columns=columns,
+                    expected_row_count=expected_count,
+                    row_index=physical_row,
+                    expected_values=tuple(
+                        (str(key), self._csv_scalar(value))
+                        for key, value in expected.items()
+                    ),
+                    updated_values=tuple(
+                        (str(key), self._csv_scalar(value))
+                        for key, value in updated.items()
+                    ),
+                    catalog_variant=catalog_variant,
+                )
+            )
+
+        projected_before: dict[str, pd.DataFrame] = {}
+        projected_after: dict[str, pd.DataFrame] = {}
+        if changed_groups.intersection(
+            {"card_ids", "card_passcodes", "card_packs", "card_properties"}
+        ):
+            projected_before = self._project_card_fixed_tables(
+                pd.DataFrame.from_records([before_values]),
+                diagnostic_row_indexes=(before_index,),
+            )
+            projected_after = self._project_card_fixed_tables(
+                pd.DataFrame.from_records([after_values]),
+                diagnostic_row_indexes=(before_index,),
+            )
+
+        if "card_passcodes" in changed_groups:
+            record, _inspection = fixed["card_passcodes"]
+            add_patch(
+                record,
+                ("value",),
+                projected_before["card_passcodes"].iloc[0].to_dict(),
+                projected_after["card_passcodes"].iloc[0].to_dict(),
+            )
+        if "card_packs" in changed_groups:
+            record, _inspection = fixed["card_packs"]
+            add_patch(
+                record,
+                ("value",),
+                projected_before["card_packs"].iloc[0].to_dict(),
+                projected_after["card_packs"].iloc[0].to_dict(),
+            )
+        if "card_properties" in changed_groups:
+            record, _inspection = fixed["card_properties"]
+            add_patch(
+                record,
+                tuple(CARD_PROPERTY_COLUMNS),
+                projected_before["card_properties"].iloc[0].to_dict(),
+                projected_after["card_properties"].iloc[0].to_dict(),
+            )
+
+        for language in LANGUAGE_PREFIXES:
+            name_field = f"name_{language}"
+            if name_field in changed_fields:
+                item = localized.get(("card_names", language))
+                if item is None:
+                    raise ValueError(
+                        f"Cannot update {name_field}: its physical table is absent."
+                    )
+                record, _inspection = item
+                add_patch(
+                    record,
+                    ("value",),
+                    {"value": before_values.get(name_field, "")},
+                    {"value": after_values.get(name_field, "")},
+                )
+
+            description_field = f"desc_{language}"
+            if description_field not in changed_fields:
+                continue
+            item = localized.get(("card_descriptions", language))
+            if item is None:
+                raise ValueError(
+                    f"Cannot update {description_field}: its physical table is absent."
+                )
+            record, inspection = item
+            persisted = inspection.row(before_index)
+            before_text = self._csv_scalar(before_values.get(description_field, ""))
+            if persisted["text"] != before_text:
+                raise ValueError(
+                    f"Stale card baseline at index {before_index} in "
+                    f"{record.relative_path}: expected text {before_text!r}, "
+                    f"found {persisted['text']!r}."
+                )
+            after_text = self._csv_scalar(after_values.get(description_field, ""))
+            old_reserved = persisted["is_reserved"] == "True"
+            new_reserved = bool(before_index > 0 and not after_text and old_reserved)
+            add_patch(
+                record,
+                ("text", "is_reserved"),
+                persisted,
+                {"text": after_text, "is_reserved": new_reserved},
+            )
+
+        catalogs_affected = bool(
+            include_catalogs
+            or "image_name" in changed_fields
+            or "note" in changed_fields
+            or (before_id >= 0 and "name_eng" in changed_fields)
+        )
+        if catalogs_affected:
+            for variant in CardImageVariant:
+                record, inspection = self._inspect_card_catalog(
+                    variant,
+                    card_ids,
+                )
+                if include_catalogs:
+                    retained_catalogs[variant] = pd.DataFrame.from_records(
+                        inspection.rows,
+                        columns=inspection.columns,
+                    )
+                persisted = inspection.row(before_index)
+                expected_catalog = {
+                    "index": before_index,
+                    "card_id": 0 if before_id < 0 else before_id,
+                    "image_name": before_values.get("image_name", ""),
+                    "note": before_values.get("note", ""),
+                }
+                updated_catalog = {
+                    "index": before_index,
+                    "card_id": 0 if after_id < 0 else after_id,
+                    "image_name": after_values.get("image_name", ""),
+                    "note": after_values.get("note", ""),
+                }
+                if before_id >= 0:
+                    expected_catalog["name"] = before_values.get("name_eng", "")
+                    updated_catalog["name"] = after_values.get("name_eng", "")
+                for field_name, value in expected_catalog.items():
+                    wanted = self._csv_scalar(value)
+                    if persisted[field_name] != wanted:
+                        raise ValueError(
+                            f"Stale {variant.value} card catalog row for card "
+                            f"index {before_index}: {field_name} expected "
+                            f"{wanted!r}, found {persisted[field_name]!r}."
+                        )
+                add_patch(
+                    record,
+                    _CARD_CATALOG_COLUMNS,
+                    expected_catalog,
+                    updated_catalog,
+                    expected_count=row_count,
+                    catalog_variant=variant,
+                )
+
+        if retained_catalogs:
+            self._pending_card_catalogs = retained_catalogs
+        return ExistingCardUpdatePlan(before_index, tuple(patches))
+
+    def apply_existing_card_update(
+        self,
+        plan: ExistingCardUpdatePlan,
+    ) -> tuple[str, ...]:
+        """Apply a preflighted plan while consuming retained image catalogs."""
+
+        if not isinstance(plan, ExistingCardUpdatePlan):
+            raise TypeError("plan must be an ExistingCardUpdatePlan.")
+        pending_catalogs = dict(self._pending_card_catalogs)
+        catalog_patches = {
+            patch.catalog_variant: patch
+            for patch in plan.patches
+            if patch.catalog_variant is not None
+        }
+        written: list[str] = []
+        try:
+            for patch in plan.patches:
+                if patch.catalog_variant is not None:
+                    continue
+                self._connection.rewrite_csv_rows(
+                    patch.workspace_path,
+                    {patch.row_index: dict(patch.updated_values)},
+                    expected_rows={patch.row_index: dict(patch.expected_values)},
+                    expected_columns=patch.expected_columns,
+                    expected_row_count=patch.expected_row_count,
+                )
+                written.append(patch.resource_name)
+
+            if pending_catalogs:
+                if set(pending_catalogs) != set(catalog_patches):
+                    raise ValueError(
+                        "Retained card catalogs do not match the preflighted "
+                        "catalog update plan."
+                    )
+                for variant in CardImageVariant:
+                    patch = catalog_patches[variant]
+                    frame = pending_catalogs[variant].reset_index(drop=True).copy()
+                    self._apply_catalog_dataframe_patch(frame, patch)
+                    self._save_card_catalog(frame, image_variant=variant)
+                    written.append(patch.resource_name)
+            else:
+                for variant in CardImageVariant:
+                    patch = catalog_patches.get(variant)
+                    if patch is None:
+                        continue
+                    self._connection.rewrite_csv_rows(
+                        patch.workspace_path,
+                        {patch.row_index: dict(patch.updated_values)},
+                        expected_rows={patch.row_index: dict(patch.expected_values)},
+                        expected_columns=patch.expected_columns,
+                        expected_row_count=patch.expected_row_count,
+                    )
+                    written.append(patch.resource_name)
+        finally:
+            self._pending_card_catalogs.clear()
+        return tuple(written)
+
     def get_resource(
         self,
         resource: ProjectFileRecord | str,
@@ -654,7 +1063,12 @@ class ProjectRepository:
         }
         catalogs: dict[CardImageVariant, pd.DataFrame] = {}
         for variant in CardImageVariant:
-            catalog = self._get_card_catalog(image_variant=variant)
+            retained = self._pending_card_catalogs.get(variant)
+            catalog = (
+                retained.copy()
+                if retain_catalogs and retained is not None
+                else self._get_card_catalog(image_variant=variant)
+            )
             catalogs[variant] = catalog
             if "image_name" in catalog:
                 names.update(
@@ -672,22 +1086,43 @@ class ProjectRepository:
         return names
 
     def card_image_pair_exists(self, image_name: str) -> bool:
-        """Return whether both physical variants exist; reject a partial pair."""
+        """Return whether one complete, valid physical image pair exists."""
 
-        records = tuple(
-            self._find_record(
-                f"{folder}/{image_name}",
-                required=False,
-                logical_source="data.dat",
-            )
-            for folder in ("card", "mini")
+        return self._inspect_card_image_pair(image_name) is not None
+
+    def existing_card_image_pair_keys(
+        self,
+        image_names: Iterable[str],
+    ) -> frozenset[str]:
+        """Return case-folded names backed by complete physical image pairs."""
+
+        return frozenset(
+            key
+            for key, records in self._inspect_card_image_pairs(image_names).items()
+            if records is not None
         )
-        present = tuple(record is not None for record in records)
-        if present[0] != present[1]:
-            raise ValueError(
-                f"Card image {image_name!r} has only one physical variant."
-            )
-        return all(present)
+
+    def validate_card_image_references(
+        self,
+        image_names: Iterable[str],
+    ) -> None:
+        """Require generated/custom catalog names to resolve to physical pairs."""
+
+        managed_image_names: dict[str, str] = {}
+        for value in image_names:
+            image_name = str(value)
+            key = image_name.casefold()
+            if key.startswith("custom") or CARD_IMAGE_NAME_PATTERN.fullmatch(key):
+                managed_image_names[key] = image_name
+        existing_pair_keys = self.existing_card_image_pair_keys(
+            managed_image_names.values()
+        )
+        for key, image_name in managed_image_names.items():
+            if key not in existing_pair_keys:
+                raise ValueError(
+                    f"Card image {image_name!r} requires a "
+                    "complete physical card/mini pair."
+                )
 
     def add_named_card_images(
         self,
@@ -716,38 +1151,23 @@ class ProjectRepository:
     ) -> tuple[ProjectFileRecord, ...]:
         """Add card image pairs with one inventory, order plan, and manifest update."""
 
-        requested = tuple(images)
+        requested = self._coalesce_named_card_image_pairs(images)
         if not requested:
             return ()
 
         started = perf_counter()
         manifest = self._require_manifest()
         manifest.validate()
-        normalized_batch_names: set[str] = set()
-        for item in requested:
-            if not isinstance(item, NamedCardImagePair):
-                raise TypeError(
-                    "Card image batch items must be NamedCardImagePair values."
-                )
-            if item.large_source is None or item.mini_source is None:
-                raise ValueError(
-                    f"Card image {item.image_name!r} requires a complete pair."
-                )
-            image_name = str(item.image_name)
-            normalized_path = image_name.replace("\\", "/")
-            if (
-                not image_name
-                or image_name != image_name.strip()
-                or "/" in normalized_path
-                or not image_name.casefold().endswith(".bmp")
-            ):
-                raise ValueError(
-                    f"Card image name must be a plain BMP filename: {image_name!r}"
-                )
-            normalized_name = image_name.casefold()
-            if normalized_name in normalized_batch_names:
-                raise ValueError(f"Duplicate card image name in batch: {image_name}")
-            normalized_batch_names.add(normalized_name)
+        existing_pair_keys = self.existing_card_image_pair_keys(
+            item.image_name for item in requested
+        )
+        existing_pairs = [
+            item.image_name
+            for item in requested
+            if item.image_name.casefold() in existing_pair_keys
+        ]
+        if existing_pairs:
+            raise ValueError(f"Card image name already exists: {existing_pairs[0]}")
 
         inventory_started = perf_counter()
         existing_names = {
@@ -762,6 +1182,7 @@ class ProjectRepository:
             if item.image_name.casefold() in existing_names
         ]
         if conflicts:
+            self._pending_card_catalogs.clear()
             raise ValueError(f"Card image name already exists: {conflicts[0]}")
 
         source_file = self.get_game_file_name("data.dat")
@@ -873,6 +1294,15 @@ class ProjectRepository:
                 record.order = planned_orders[id(record)]
             manifest.files.extend(new_records)
             manifest_mutated = True
+            added_pair_keys = self.existing_card_image_pair_keys(
+                item.image_name for item in requested
+            )
+            for item in requested:
+                if item.image_name.casefold() not in added_pair_keys:
+                    raise ValueError(
+                        f"New card image {item.image_name!r} did not create "
+                        "exactly one complete pair."
+                    )
             write_duration = perf_counter() - write_started
             if save_manifest:
                 manifest_started = perf_counter()
@@ -955,26 +1385,50 @@ class ProjectRepository:
         *,
         mini: bool = False,
     ) -> None:
-        folder = "mini" if mini else "card"
-        record = next(
-            (
-                item
-                for item in self._require_manifest().files
-                if self._path_matches_suffix(
-                    item.relative_path,
-                    f"{folder}/{image_name}",
+        self.replace_card_images(
+            image_name,
+            large_source=None if mini else source,
+            mini_source=source if mini else None,
+        )
+
+    def replace_card_images(
+        self,
+        image_name: str,
+        *,
+        large_source: str | Path | bytes | None = None,
+        mini_source: str | Path | bytes | None = None,
+    ) -> None:
+        """Replace supplied variants of one validated pair without metadata churn."""
+
+        if large_source is None and mini_source is None:
+            return
+        records = self._inspect_card_image_pair(image_name)
+        if records is None:
+            raise KeyError(f"Card image pair was not found: {image_name}")
+        prepared: list[tuple[ProjectFileRecord, bytes]] = []
+        if large_source is not None:
+            prepared.append((records.large, self.prepare_image_bytes(large_source)))
+        if mini_source is not None:
+            mini_path = records.mini.workspace_path
+            if mini_path is None:  # Guarded by _inspect_card_image_pair.
+                raise ValueError(
+                    f"Mini card image {image_name!r} has no workspace path."
                 )
-            ),
-            None,
-        )
-        if record is None or record.workspace_path is None:
-            raise KeyError(f"Card image was not found: {folder}/{image_name}")
-        size = self._connection.image_size(record.workspace_path) if mini else None
-        self._connection.convert_image_to_bmp(
-            source,
-            record.workspace_path,
-            size=size,
-        )
+            prepared.append(
+                (
+                    records.mini,
+                    self.prepare_image_bytes(
+                        mini_source,
+                        size=self._connection.image_size(mini_path),
+                    ),
+                )
+            )
+        for record, payload in prepared:
+            if record.workspace_path is None:  # Guarded by pair inspection.
+                raise ValueError(
+                    f"Card image {record.relative_path!r} has no workspace path."
+                )
+            self._connection.write_image(record.workspace_path, payload)
 
     def exists(self, path: str | Path) -> bool:
         return self._connection.exists(path)
@@ -1216,8 +1670,17 @@ class ProjectRepository:
         *,
         warn_legacy: bool,
         legacy_schema: bool = False,
+        diagnostic_row_indexes: Sequence[int] | None = None,
     ) -> pd.DataFrame:
         frame = table.reset_index(drop=True).copy()
+        if diagnostic_row_indexes is None:
+            diagnostics = tuple(range(len(frame)))
+        else:
+            diagnostics = tuple(int(value) for value in diagnostic_row_indexes)
+            if len(diagnostics) != len(frame):
+                raise ValueError(
+                    "diagnostic_row_indexes must match the property row count."
+                )
         legacy_changes: set[str] = set()
         if "monster_type" not in frame and "card_type" in frame:
             frame["monster_type"] = frame["card_type"]
@@ -1250,9 +1713,10 @@ class ProjectRepository:
         attribute_codes: list[int] = []
         attribute_labels: list[str] = []
         for row_index, row in frame.iterrows():
+            diagnostic_row_index = diagnostics[row_index]
             class_code, class_label = ProjectRepository._normalize_property_pair(
                 row,
-                row_index=row_index,
+                row_index=diagnostic_row_index,
                 code_field="monster_type_code",
                 label_field="monster_type",
                 labels=MONSTER_TYPE_LABELS,
@@ -1263,7 +1727,7 @@ class ProjectRepository:
                 if legacy_schema
                 else ProjectRepository._normalize_property_pair(
                     row,
-                    row_index=row_index,
+                    row_index=diagnostic_row_index,
                     code_field="attribute_code",
                     label_field="attribute",
                     labels=ATTRIBUTE_LABELS,
@@ -1284,7 +1748,7 @@ class ProjectRepository:
             else:
                 detail_code = ProjectRepository._normalize_property_pair(
                     row,
-                    row_index=row_index,
+                    row_index=diagnostic_row_index,
                     code_field="card_category_code",
                     label_field="card_category",
                     labels=ProjectRepository._detail_labels(class_code),
@@ -1462,6 +1926,152 @@ class ProjectRepository:
             raise KeyError(f"Required project resource was not found: {relative_path}")
         return None
 
+    def _inspect_card_physical_table(
+        self,
+        table_name: str,
+        columns: tuple[str, ...],
+        *,
+        expected_row_count: int | None = None,
+    ) -> tuple[ProjectFileRecord, CsvTableInspection]:
+        handler = self._require_table_handler(table_name)
+        if handler.rule is None:
+            raise RuntimeError(f"{table_name} physical rule is missing.")
+        record = self._physical_table_record(handler.rule, {})
+        return record, self._inspect_record_csv(
+            record,
+            columns,
+            expected_row_count=expected_row_count,
+        )
+
+    def _inspect_record_csv(
+        self,
+        record: ProjectFileRecord,
+        columns: tuple[str, ...],
+        *,
+        expected_row_count: int | None,
+    ) -> CsvTableInspection:
+        if record.workspace_path is None:
+            raise ValueError(
+                f"Physical table has no workspace path: {record.relative_path}"
+            )
+        return self._connection.inspect_csv_table(
+            record.workspace_path,
+            expected_columns=columns,
+            expected_row_count=expected_row_count,
+        )
+
+    @staticmethod
+    def _validate_description_inspection(
+        record: ProjectFileRecord,
+        inspection: CsvTableInspection,
+    ) -> None:
+        for row_index in range(len(inspection.rows)):
+            row = inspection.row(row_index)
+            reserved_value = row["is_reserved"]
+            if reserved_value not in {"True", "False"}:
+                raise ValueError(
+                    f"{record.relative_path} row {row_index}: is_reserved must "
+                    "be the canonical boolean True or False."
+                )
+            if reserved_value == "True" and (row_index == 0 or row["text"]):
+                raise ValueError(
+                    f"{record.relative_path} row {row_index}: an active indexed "
+                    "text row cannot be reserved."
+                )
+
+    def _inspect_card_catalog(
+        self,
+        variant: CardImageVariant,
+        card_ids: Sequence[int],
+    ) -> tuple[ProjectFileRecord, CsvTableInspection]:
+        record = self._find_record(
+            self._card_image_list_path(variant),
+            logical_source="data.dat",
+        )
+        if record is None:
+            raise KeyError(f"Required {variant.value} card catalog is missing.")
+        inspection = self._inspect_record_csv(
+            record,
+            _CARD_CATALOG_COLUMNS,
+            expected_row_count=len(card_ids),
+        )
+        seen_indexes: set[int] = set()
+        for physical_row in range(len(inspection.rows)):
+            row = inspection.row(physical_row)
+            try:
+                explicit_index = int(row["index"])
+                catalog_card_id = int(row["card_id"])
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"{variant.value} card catalog row {physical_row} has an "
+                    "invalid index or card_id."
+                ) from error
+            if explicit_index in seen_indexes:
+                raise ValueError(
+                    f"{variant.value} card catalog has duplicate explicit index "
+                    f"{explicit_index}."
+                )
+            seen_indexes.add(explicit_index)
+            if explicit_index != physical_row:
+                raise ValueError(
+                    f"{variant.value} card catalog is reordered or missing index "
+                    f"{physical_row}: physical row contains index {explicit_index}."
+                )
+            projected_id = 0 if card_ids[physical_row] < 0 else card_ids[physical_row]
+            if catalog_card_id != projected_id:
+                raise ValueError(
+                    f"{variant.value} card catalog index {explicit_index} has "
+                    f"card_id {catalog_card_id}; expected {projected_id}."
+                )
+        return record, inspection
+
+    @staticmethod
+    def _apply_catalog_dataframe_patch(
+        frame: pd.DataFrame,
+        patch: _CardCsvRowPatch,
+    ) -> None:
+        columns = tuple(str(column) for column in frame.columns)
+        if columns != patch.expected_columns:
+            raise ValueError(
+                f"Retained catalog {patch.resource_name} header mismatch: "
+                f"expected {patch.expected_columns!r}, found {columns!r}."
+            )
+        if (
+            patch.expected_row_count is not None
+            and len(frame) != patch.expected_row_count
+        ):
+            raise ValueError(
+                f"Retained catalog {patch.resource_name} has {len(frame)} "
+                f"records; expected {patch.expected_row_count}."
+            )
+        if not 0 <= patch.row_index < len(frame):
+            raise IndexError(
+                f"Catalog row {patch.row_index} is outside {patch.resource_name}."
+            )
+        for field_name, wanted in patch.expected_values:
+            actual = ProjectRepository._csv_scalar(
+                frame.iloc[patch.row_index][field_name]
+            )
+            if actual != wanted:
+                raise ValueError(
+                    f"Stale retained catalog row {patch.row_index} in "
+                    f"{patch.resource_name}: {field_name} expected {wanted!r}, "
+                    f"found {actual!r}."
+                )
+        for field_name, value in patch.updated_values:
+            frame.at[patch.row_index, field_name] = value
+
+    @staticmethod
+    def _csv_scalar(value: object) -> str:
+        if value is None:
+            return ""
+        try:
+            if bool(pd.isna(value)):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(value)
+
     def _resolve_table_pattern(
         self,
         rule: SubfileRule,
@@ -1564,6 +2174,65 @@ class ProjectRepository:
             self._find_record("deck.ydc", logical_source="deck.ydc"),
             table,
             ("card_id",),
+        )
+
+    @classmethod
+    def _project_card_fixed_tables(
+        cls,
+        rows: pd.DataFrame,
+        *,
+        diagnostic_row_indexes: Sequence[int] | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        frame = rows.reset_index(drop=True)
+        return {
+            "card_ids": pd.DataFrame({"value": frame["card_id"].astype(int)}),
+            "card_passcodes": cls._normalize_card_passcodes(
+                pd.DataFrame({"value": frame["passcode"]})
+            ),
+            "card_packs": pd.DataFrame({"value": frame["pack"].astype(str)}),
+            "card_properties": cls._project_card_property_rows(
+                frame,
+                diagnostic_row_indexes=diagnostic_row_indexes,
+            ),
+        }
+
+    @classmethod
+    def _project_card_property_rows(
+        cls,
+        rows: pd.DataFrame,
+        *,
+        diagnostic_row_indexes: Sequence[int] | None = None,
+    ) -> pd.DataFrame:
+        property_columns = (
+            "attack",
+            "defense",
+            "monster_type_code",
+            "monster_type",
+            "card_category_code",
+            "card_category",
+            "attribute_code",
+            "attribute",
+            "level",
+        )
+        frame = rows.reset_index(drop=True)
+        projected = frame[
+            [column for column in property_columns if column in frame]
+        ].copy()
+        for code_column, label_column in (
+            ("monster_type_code", "monster_type"),
+            ("card_category_code", "card_category"),
+            ("attribute_code", "attribute"),
+        ):
+            if code_column not in projected or label_column not in projected:
+                continue
+            has_label = projected[label_column].map(
+                lambda value: bool(str(value).strip())
+            )
+            projected.loc[has_label, code_column] = None
+        return cls._normalize_card_properties(
+            projected,
+            warn_legacy=False,
+            diagnostic_row_indexes=diagnostic_row_indexes,
         )
 
     def _get_cards(
@@ -1675,59 +2344,24 @@ class ProjectRepository:
         missing = sorted(required.difference(frame.columns))
         if missing:
             raise ValueError(f"Cards table is missing columns: {', '.join(missing)}")
-        custom_names = [
-            str(value).casefold()
-            for value in frame.get(
+        self.validate_card_image_references(
+            frame.get(
                 "image_name",
                 pd.Series(dtype=object),
             ).fillna("")
-            if str(value).casefold().startswith("custom")
-            or CARD_IMAGE_NAME_PATTERN.fullmatch(str(value))
-        ]
-        if len(custom_names) != len(set(custom_names)):
-            raise ValueError("Custom card image names must be unique.")
-        passcode_table = self._normalize_card_passcodes(
-            pd.DataFrame({"value": frame["passcode"]})
         )
-        frame["passcode"] = passcode_table["value"].tolist()
-        self.save_table(
+        fixed_tables = self._project_card_fixed_tables(
+            frame,
+            diagnostic_row_indexes=tuple(frame["card_index"].astype(int)),
+        )
+        frame["passcode"] = fixed_tables["card_passcodes"]["value"].tolist()
+        for table_name in (
             "card_ids",
-            pd.DataFrame({"value": frame["card_id"].astype(int)}),
-        )
-        self.save_table("card_passcodes", passcode_table)
-        self.save_table(
+            "card_passcodes",
             "card_packs",
-            pd.DataFrame({"value": frame["pack"].astype(str)}),
-        )
-        property_columns = [
-            "attack",
-            "defense",
-            "monster_type_code",
-            "monster_type",
-            "card_category_code",
-            "card_category",
-            "attribute_code",
-            "attribute",
-            "level",
-        ]
-        property_frame = frame[
-            [column for column in property_columns if column in frame]
-        ].copy()
-        for code_column, label_column in (
-            ("monster_type_code", "monster_type"),
-            ("card_category_code", "card_category"),
-            ("attribute_code", "attribute"),
+            "card_properties",
         ):
-            if code_column in property_frame:
-                has_label = property_frame[label_column].map(
-                    lambda value: bool(str(value).strip())
-                )
-                property_frame.loc[has_label, code_column] = None
-        properties = self._normalize_card_properties(
-            property_frame,
-            warn_legacy=False,
-        )
-        self.save_table("card_properties", properties)
+            self.save_table(table_name, fixed_tables[table_name])
         name_rule = self._table_handlers["card_names"].rule
         description_rule = self._table_handlers["card_descriptions"].rule
         if name_rule is None or description_rule is None:
@@ -1956,6 +2590,214 @@ class ProjectRepository:
             large_payload=self.prepare_image_bytes(item.large_source),
             mini_payload=self.prepare_image_bytes(item.mini_source, size=mini_size),
         )
+
+    @staticmethod
+    def _validate_card_image_name(image_name: object) -> str:
+        normalized = str(image_name)
+        normalized_path = normalized.replace("\\", "/")
+        if (
+            not normalized
+            or normalized != normalized.strip()
+            or "/" in normalized_path
+            or not normalized.casefold().endswith(".bmp")
+        ):
+            raise ValueError(
+                f"Card image name must be a plain BMP filename: {normalized!r}"
+            )
+        return normalized
+
+    def _coalesce_named_card_image_pairs(
+        self,
+        images: Sequence[NamedCardImagePair],
+    ) -> tuple[NamedCardImagePair, ...]:
+        """Coalesce complete duplicate pairs; the last source-order pair wins."""
+
+        coalesced: dict[str, NamedCardImagePair] = {}
+        for item in images:
+            if not isinstance(item, NamedCardImagePair):
+                raise TypeError(
+                    "Card image batch items must be NamedCardImagePair values."
+                )
+            if item.large_source is None or item.mini_source is None:
+                raise ValueError(
+                    f"Card image {item.image_name!r} requires a complete pair."
+                )
+            image_name = self._validate_card_image_name(item.image_name)
+            coalesced[image_name.casefold()] = NamedCardImagePair(
+                image_name=image_name,
+                large_source=item.large_source,
+                mini_source=item.mini_source,
+            )
+        return tuple(coalesced.values())
+
+    def _inspect_card_image_pair(
+        self,
+        image_name: str,
+    ) -> _CardImagePairRecords | None:
+        """Inspect exact card/mini targets and fail closed on corrupt topology."""
+
+        normalized_name = self._validate_card_image_name(image_name)
+        return self._inspect_card_image_pairs((normalized_name,))[
+            normalized_name.casefold()
+        ]
+
+    def _inspect_card_image_pairs(
+        self,
+        image_names: Iterable[str],
+    ) -> dict[str, _CardImagePairRecords | None]:
+        """Inspect many image targets with one manifest traversal."""
+
+        normalized_names: dict[str, str] = {}
+        for image_name in image_names:
+            normalized_name = self._validate_card_image_name(image_name)
+            normalized_names[normalized_name.casefold()] = normalized_name
+        if not normalized_names:
+            return {}
+
+        manifest = self._require_manifest()
+        data_source = self.get_game_file_name("data.dat")
+        matches: dict[
+            str,
+            dict[CardImageVariant, list[ProjectFileRecord]],
+        ] = {
+            key: {variant: [] for variant in CardImageVariant}
+            for key in normalized_names
+        }
+
+        for record in manifest.files:
+            relative_parts = tuple(
+                part.casefold()
+                for part in normalize_project_path(record.relative_path).parts
+            )
+            workspace_parts = (
+                None
+                if record.workspace_path is None
+                else tuple(
+                    part.casefold()
+                    for part in normalize_project_path(record.workspace_path).parts
+                )
+            )
+            candidate_keys = {
+                parts[-1]
+                for parts in (relative_parts, workspace_parts)
+                if parts and parts[-1] in normalized_names
+            }
+            for name_key in candidate_keys:
+                normalized_name = normalized_names[name_key]
+                expected_relative = {
+                    CardImageVariant.LARGE: ("card", name_key),
+                    CardImageVariant.MINI: ("mini", name_key),
+                }
+                expected_workspace = {
+                    variant: ("data", *parts)
+                    for variant, parts in expected_relative.items()
+                }
+                for variant in CardImageVariant:
+                    relative_target = expected_relative[variant]
+                    workspace_target = expected_workspace[variant]
+                    relative_suffix_match = (
+                        len(relative_parts) >= len(relative_target)
+                        and relative_parts[-len(relative_target) :] == relative_target
+                    )
+                    workspace_suffix_match = bool(
+                        workspace_parts is not None
+                        and len(workspace_parts) >= len(workspace_target)
+                        and workspace_parts[-len(workspace_target) :]
+                        == workspace_target
+                    )
+                    if relative_suffix_match and relative_parts != relative_target:
+                        raise ValueError(
+                            f"Card image {normalized_name!r} is recorded outside "
+                            f"the canonical {relative_target[0]}/ namespace: "
+                            f"{record.relative_path}"
+                        )
+                    if workspace_suffix_match and (
+                        workspace_parts != workspace_target
+                        or relative_parts != relative_target
+                    ):
+                        raise ValueError(
+                            f"Card image {normalized_name!r} has an unrelated "
+                            f"workspace target: {record.workspace_path}"
+                        )
+                    if relative_parts == relative_target:
+                        matches[name_key][variant].append(record)
+
+        inspected_pairs: dict[str, _CardImagePairRecords | None] = {}
+        for name_key, normalized_name in normalized_names.items():
+            target_matches = matches[name_key]
+            counts = {
+                variant: len(records) for variant, records in target_matches.items()
+            }
+            if any(count > 1 for count in counts.values()):
+                raise ValueError(
+                    f"Card image {normalized_name!r} has duplicate physical variants."
+                )
+            present = {
+                variant: bool(records) for variant, records in target_matches.items()
+            }
+            if present[CardImageVariant.LARGE] != present[CardImageVariant.MINI]:
+                raise ValueError(
+                    f"Card image {normalized_name!r} has only one physical variant."
+                )
+            if not present[CardImageVariant.LARGE]:
+                inspected_pairs[name_key] = None
+                continue
+
+            inspected: dict[CardImageVariant, ProjectFileRecord] = {}
+            for variant, records in target_matches.items():
+                record = records[0]
+                folder = "card" if variant is CardImageVariant.LARGE else "mini"
+                expected_path = (folder, name_key)
+                expected_workspace_path = ("data", *expected_path)
+                if record.source_file.casefold() != data_source.casefold():
+                    raise ValueError(
+                        f"Card image {record.relative_path!r} belongs to "
+                        f"{record.source_file!r}, not {data_source!r}."
+                    )
+                if record.file_kind != "image" or record.storage_format != "binary":
+                    raise ValueError(
+                        f"Card image {record.relative_path!r} must use "
+                        "image/binary metadata."
+                    )
+                if record.virtual or record.generated_on_pack:
+                    raise ValueError(
+                        f"Card image {record.relative_path!r} must be a physical "
+                        "workspace resource."
+                    )
+                if record.workspace_path is None:
+                    raise ValueError(
+                        f"Card image {record.relative_path!r} has no workspace path."
+                    )
+                actual_workspace_path = tuple(
+                    part.casefold()
+                    for part in normalize_project_path(record.workspace_path).parts
+                )
+                if actual_workspace_path != expected_workspace_path:
+                    raise ValueError(
+                        f"Card image {record.relative_path!r} has workspace path "
+                        f"{record.workspace_path!r}; expected "
+                        f"{'/'.join(expected_workspace_path)!r}."
+                    )
+                actual_relative_path = tuple(
+                    part.casefold()
+                    for part in normalize_project_path(record.relative_path).parts
+                )
+                if actual_relative_path != expected_path:
+                    raise ValueError(
+                        f"Card image {record.relative_path!r} is outside the "
+                        "card image namespace."
+                    )
+                if not self._connection.exists(record.workspace_path):
+                    raise ValueError(
+                        f"Card image workspace file is missing: {record.workspace_path}"
+                    )
+                inspected[variant] = record
+
+            inspected_pairs[name_key] = _CardImagePairRecords(
+                large=inspected[CardImageVariant.LARGE],
+                mini=inspected[CardImageVariant.MINI],
+            )
+        return inspected_pairs
 
     def _write_prepared_card_image_pair(
         self,

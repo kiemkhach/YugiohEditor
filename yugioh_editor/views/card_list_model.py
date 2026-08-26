@@ -136,6 +136,9 @@ class CardListModel(QAbstractTableModel):
     def card_at(self, row: int) -> CardEditDraft:
         return self._cards[row].clone()
 
+    def card_index_at(self, row: int) -> int:
+        return self._cards[row].card_index
+
     def card_by_index(self, card_index: int) -> CardEditDraft | None:
         row = self.row_for_card_index(card_index)
         return None if row is None else self._cards[row].clone()
@@ -154,6 +157,24 @@ class CardListModel(QAbstractTableModel):
 
     def dirty_cards(self) -> tuple[CardEditDraft, ...]:
         return tuple(card.clone() for card in self._cards if card.dirty)
+
+    def dirty_card_save_sources(self) -> tuple[CardEditDraft, ...]:
+        """Return locked model-owned drafts for cloning by the Save worker."""
+
+        return tuple(card for card in self._cards if card.dirty)
+
+    def pending_card_image_names(self) -> tuple[str, ...]:
+        """Return names reserved by image payloads still staged in this model."""
+
+        return tuple(
+            card.image_name
+            for card in self._cards
+            if str(card.image_name).strip()
+            and (
+                card.large_image_source is not None
+                or card.small_image_source is not None
+            )
+        )
 
     def pack_at(self, row: int) -> str:
         return self._cards[row].pack
@@ -202,6 +223,68 @@ class CardListModel(QAbstractTableModel):
             self.index(row, 0),
             self.index(row, self.columnCount() - 1),
         )
+
+    def apply_saved_cards(self, cards: Sequence[CardEditDraft]) -> None:
+        """Transfer a completed Save snapshot with at most one display update."""
+
+        updates: list[
+            tuple[int, CardEditDraft, tuple[object, ...], tuple[object, ...]]
+        ] = []
+        seen_indexes: set[int] = set()
+        for card in cards:
+            if not isinstance(card, CardEditDraft):
+                raise TypeError("Saved cards must be CardEditDraft values.")
+            if card.card_index in seen_indexes:
+                raise ValueError(f"Duplicate saved card index {card.card_index}.")
+            seen_indexes.add(card.card_index)
+            row = self.row_for_card_index(card.card_index)
+            if row is None:
+                raise IndexError(f"Card index {card.card_index} is not in the model.")
+            updates.append(
+                (
+                    row,
+                    card,
+                    self._display_values(self._cards[row]),
+                    self._display_values(card),
+                )
+            )
+        if not updates:
+            return
+        for row, card, _before, _after in updates:
+            self._cards[row] = card
+        top: int | None = None
+        bottom: int | None = None
+        left: int | None = None
+        right: int | None = None
+        for row, _card, before, after in updates:
+            for column, (old_value, new_value) in enumerate(
+                zip(before, after, strict=True)
+            ):
+                if old_value == new_value:
+                    continue
+                top = row if top is None else min(top, row)
+                bottom = row if bottom is None else max(bottom, row)
+                left = column if left is None else min(left, column)
+                right = column if right is None else max(right, column)
+        if top is None or bottom is None or left is None or right is None:
+            return
+        self.dataChanged.emit(
+            self.index(top, left),
+            self.index(bottom, right),
+            [Qt.DisplayRole, Qt.UserRole],
+        )
+
+    def _display_values(self, card: CardEditDraft) -> tuple[object, ...]:
+        values: list[object] = []
+        for field_name, _label in self.COLUMNS:
+            if field_name == "name":
+                value = card.localized_text.names[self._display_language]
+            elif field_name == "description":
+                value = card.localized_text.descriptions[self._display_language]
+            else:
+                value = getattr(card, field_name)
+            values.append(value)
+        return tuple(values)
 
     def insert_card(self, card: CardDetailData | CardEditDraft) -> None:
         draft = card.clone() if isinstance(card, CardEditDraft) else card.to_draft()

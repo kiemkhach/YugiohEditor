@@ -139,6 +139,12 @@ registry view, without overwriting a nonempty field.
 
 ### Edit project files
 
+The Project window uses one menu bar with no duplicate command toolbar:
+**File** contains Save Current File (`Ctrl+S`), Export Files
+(`Ctrl+Shift+E`), and Close Project (`Ctrl+W`); **Tools** contains Card List;
+and **Build** contains Build (`Ctrl+Shift+B`) and Run (`F5`). The project tree
+and active editor fill the available height above the status/progress area.
+
 Open a file from the project tree. The editor is selected from the file type recorded in the manifest:
 
 - structured data → table editor;
@@ -174,8 +180,22 @@ raw.
 
 Open the Card List to work with a combined table containing card identifiers, localized names and descriptions, passcodes, pack assignments, properties, and image metadata.
 
+Card List also uses one menu bar: **File** provides Import (`Ctrl+O`), Export
+(`Ctrl+Shift+E`), Save (`Ctrl+S`), and Close (`Ctrl+W`); **Edit** provides Add
+Card (`Ctrl+N`), Update Card (`F2`), and `enable all`; **Tools** provides
+Suggest and Cancel Suggest. Display language, the exact
+`filter empty`/`un-filter empty` toggle, and the quick `enable all` control stay
+next to the table because they directly change its current view or state.
+
 Open a row by double-clicking it or selecting it and choosing Update. Card
 Detail saves validated changes through the card service and refreshes the list.
+An eligible existing-card edit uses a preflighted single-row CSV strategy inside
+the same atomic staging transaction; new cards and Card List batches retain the
+full composite strategy. Card List Save immediately shows an indeterminate
+progress bar, locks the complete window, performs cloning and persistence in a
+worker, and avoids proxy notifications when displayed values did not change.
+If save-time normalization changes visible data, reconciliation emits at most
+one scoped model notification, so the Qt event loop remains responsive.
 The list can display localized names and descriptions in any supported
 language, and its optional Unused filter shows cards whose pack is `disabled`.
 Add Card is bounded by Joey's 4094 active slots and allocates the lowest safe
@@ -198,7 +218,11 @@ or unknown parameters fail before resource lookup.
 PNG and JPEG card replacements are decoded with Pillow and saved as real BMP
 payloads. Mini images use the dimensions of an existing mini image when one is
 available. Custom image names are checked case-insensitively against both the
-manifest and workspace files. When new physical images are added, all records
+manifest and workspace files. If several staged cards target the same canonical
+image name, the last staged nonempty payload wins independently for large and
+mini variants, producing one validated physical pair that multiple card rows
+may share. Partial or structurally invalid pairs are rejected. When new
+physical images are added, all records
 for the actual `Data.dat` source are sorted lexicographically by normalized,
 case-insensitive complete relative path using a Windows-backslash comparison
 key and renumbered contiguously. This is a global path sort, not recursive
@@ -241,14 +265,14 @@ after the structural patch and the executable is then reopened for structural
 verification. Actual game/runtime verification remains distinct from static
 binary and Windows resource verification.
 
-The Project window's **Run** button only launches this already-packed
+The Project window's **Build > Run** action only launches this already-packed
 executable; it never starts Pack or Build implicitly. A successful launch does
 not show a modal dialog. It passes exactly `-full -speedy` and uses the packed
 executable's directory as cwd. A missing or unlaunchable executable is still
 reported through the existing error dialog, and both outcomes clean up the
 background task state without waiting for the game process to exit.
 
-**Export Files**, immediately left of Build, reconstructs the current project
+**File > Export Files** reconstructs the current project
 into `data/`, `voice/`, `deck/`, and `region/`. Data and Voice outputs are final
 decompressed/re-encoded entry bytes from the same pre-compression stage used by
 Pack, including virtual resources; they are not CSV files or extracts from the
@@ -259,7 +283,7 @@ Run so reconstruction sees one stable saved workspace state.
 Project creation and packing use staging directories. Successful work is
 committed with an atomic directory rename; a failure removes staging data and
 preserves the previous packed output.
-Pack runs in the background. The Pack button remains disabled until the task
+Pack runs in the background. The Build action remains disabled until the task
 finishes, full failures go to the application log, and the project window
 shows a short resource-aware error without closing.
 When the application is launched from a console, bounded Pack progress reports

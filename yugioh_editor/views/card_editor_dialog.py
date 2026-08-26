@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QRegularExpression, QSize, Qt, QThreadPool, Signal
@@ -88,13 +88,17 @@ class CardEditorDialog(QDialog):
         *,
         card_lookup: Callable[[int], CardEditDraft | None] | None = None,
         card_bounds: Callable[[], tuple[int, int]] | None = None,
+        additional_reserved_image_names: Callable[[], Iterable[str]] | None = None,
     ) -> None:
         super().__init__(parent)
         self._manifest = manifest
         self._service = card_service
         self._draft: CardEditDraft | None = None
+        self._save_original: CardEditDraft | None = None
+        self._single_save_eligible = False
         self._card_lookup = card_lookup
         self._card_bounds = card_bounds
+        self._additional_reserved_image_names = additional_reserved_image_names
         self._current_language = DEFAULT_LANGUAGE
         self._loading = True
         self._initializing = draft is None
@@ -102,7 +106,13 @@ class CardEditorDialog(QDialog):
         self._thread_pool = QThreadPool.globalInstance()
         self._suggest_runner: TaskRunner | None = None
         self._image_runner: TaskRunner | None = None
+        self._image_runners: set[TaskRunner] = set()
+        self._image_tasks: dict[
+            int,
+            tuple[TaskRunner, tuple[int, int, str]],
+        ] = {}
         self._save_runner: TaskRunner | None = None
+        self._pending_after_save: Callable[[], None] | None = None
         self._suggest_request = 0
         self._image_request = 0
         self._image_cache: dict[str, tuple[bytes, bytes]] = {}
@@ -226,6 +236,7 @@ class CardEditorDialog(QDialog):
 
     def initialize_draft(self, draft: CardEditDraft) -> None:
         self._draft = draft.clone()
+        self._record_save_original(source_was_clean=not draft.dirty)
         self._current_language = DEFAULT_LANGUAGE
         self._card_index.setText(str(self._draft.card_index))
         self._card_id.setText(str(self._draft.card_id))
@@ -294,6 +305,12 @@ class CardEditorDialog(QDialog):
         self._scale_image_previews()
 
     def closeEvent(self, event) -> None:
+        if self._background_runner_active():
+            event.ignore()
+            self._status.setText(
+                "Wait for the current card operation to finish before closing."
+            )
+            return
         if self._initializing or self._draft is None:
             event.ignore()
             self.reject()
@@ -318,6 +335,16 @@ class CardEditorDialog(QDialog):
             self.reject()
         else:
             event.ignore()
+
+    def reject(self) -> None:
+        """Keep runner-owned callbacks attached to a live dialog."""
+
+        if self._background_runner_active():
+            self._status.setText(
+                "Wait for the current card operation to finish before closing."
+            )
+            return
+        super().reject()
 
     def _change_language(self, language: str) -> None:
         if self._loading or self._draft is None or language == self._current_language:
@@ -366,7 +393,12 @@ class CardEditorDialog(QDialog):
         self._start_commit(self.accept)
 
     def _start_commit(self, after_success: Callable[[], None]) -> bool:
-        if self._initializing or self._draft is None or self._save_runner is not None:
+        if (
+            self._initializing
+            or self._draft is None
+            or self._save_runner is not None
+            or self._suggest_runner is not None
+        ):
             return False
         self._flush_controls()
         errors = self._service.validate_card_draft(self._draft)
@@ -379,15 +411,22 @@ class CardEditorDialog(QDialog):
             self._focus_first_error(errors[0])
             return False
         draft = self._draft.clone()
-        runner = TaskRunner(
-            lambda: (
-                self._service.create_card(self._manifest, draft)
-                if draft.is_new
-                else self._service.update_card(self._manifest, draft)
-            )
-        )
+        original = self._eligible_save_original(draft)
+
+        def save():
+            if draft.is_new:
+                return self._service.create_card(self._manifest, draft)
+            if original is not None:
+                return self._service.update_card(
+                    self._manifest,
+                    draft,
+                    original=original,
+                )
+            return self._service.update_card(self._manifest, draft)
+
+        runner = TaskRunner(save)
         self._save_runner = runner
-        self._save_button.setEnabled(False)
+        self._refresh_background_action_states()
         self._status.setText("Saving card...")
         runner.signals.succeeded.connect(
             lambda saved: self._commit_succeeded(saved, after_success)
@@ -400,9 +439,11 @@ class CardEditorDialog(QDialog):
     def _commit_succeeded(self, saved, after_success: Callable[[], None]) -> None:
         self._draft = saved.to_draft()
         self._draft.dirty = False
+        self._record_save_original(source_was_clean=True)
         self.saved.emit(self._draft.clone())
         self._status.setText("Card saved.")
-        after_success()
+        self._pending_after_save = after_success
+        self._resume_after_save()
 
     def _commit_failed(self, error: TaskError) -> None:
         self._status.setText("Card save failed.")
@@ -411,7 +452,8 @@ class CardEditorDialog(QDialog):
     def _commit_finished(self, runner: TaskRunner) -> None:
         if self._save_runner is runner:
             self._save_runner = None
-            self._save_button.setEnabled(True)
+            self._refresh_background_action_states()
+            self._resume_after_save()
 
     def _commit(self) -> bool:
         if self._initializing or self._draft is None:
@@ -427,11 +469,19 @@ class CardEditorDialog(QDialog):
             self._focus_first_error(errors[0])
             return False
         try:
-            saved = (
-                self._service.create_card(self._manifest, self._draft)
-                if self._draft.is_new
-                else self._service.update_card(self._manifest, self._draft)
-            )
+            if self._draft.is_new:
+                saved = self._service.create_card(self._manifest, self._draft)
+            else:
+                original = self._eligible_save_original(self._draft)
+                saved = (
+                    self._service.update_card(
+                        self._manifest,
+                        self._draft,
+                        original=original,
+                    )
+                    if original is not None
+                    else self._service.update_card(self._manifest, self._draft)
+                )
         except Exception as error:
             logging.exception(
                 "Saving card index %s (ID %s) failed.",
@@ -442,11 +492,17 @@ class CardEditorDialog(QDialog):
             return False
         self._draft = saved.to_draft()
         self._draft.dirty = False
+        self._record_save_original(source_was_clean=True)
         self.saved.emit(self._draft.clone())
         return True
 
     def _suggest(self) -> None:
-        if self._initializing or self._draft is None:
+        if (
+            self._initializing
+            or self._draft is None
+            or self._suggest_runner is not None
+            or self._save_runner is not None
+        ):
             return
         self._flush_controls()
         query = CardService.select_suggestion_query(
@@ -461,30 +517,46 @@ class CardEditorDialog(QDialog):
             )
             self._name.setFocus()
             return
-        self._suggest_button.setEnabled(False)
         self._status.setText("Looking up card reference data...")
         self._suggest_request += 1
         request = (self._suggest_request, self._draft.card_index)
+        draft = self._draft.clone()
+        preferred_language = self._current_language
+        additional_reserved_image_names = tuple(
+            self._additional_reserved_image_names()
+            if self._additional_reserved_image_names is not None
+            else ()
+        )
         runner = TaskRunner(
             lambda: (
                 request,
                 self._service.suggest_card_draft(
                     self._manifest,
-                    self._draft.clone(),
-                    preferred_language=self._current_language,
+                    draft,
+                    preferred_language=preferred_language,
+                    additional_reserved_image_names=(additional_reserved_image_names),
                 ),
             )
         )
         self._suggest_runner = runner
-        runner.signals.succeeded.connect(self._suggest_succeeded)
-        runner.signals.failed.connect(self._suggest_failed)
-        runner.signals.finished.connect(self._suggest_finished)
+        self._refresh_background_action_states()
+        runner.signals.succeeded.connect(
+            lambda payload: self._suggest_succeeded(payload, runner=runner)
+        )
+        runner.signals.failed.connect(
+            lambda error: self._suggest_failed(error, runner=runner)
+        )
+        runner.signals.finished.connect(lambda: self._suggest_finished(runner=runner))
         self._thread_pool.start(runner)
 
     def _suggest_succeeded(
         self,
         payload: tuple[tuple[int, int], CardSuggestionResult],
+        *,
+        runner: TaskRunner | None = None,
     ) -> None:
+        if runner is not None and self._suggest_runner is not runner:
+            return
         request, result = payload
         if request != (self._suggest_request, self._draft.card_index):
             return
@@ -506,7 +578,14 @@ class CardEditorDialog(QDialog):
             status += f". Card data applied; image unavailable: {result.image_error}"
         self._status.setText(status)
 
-    def _suggest_failed(self, error: TaskError) -> None:
+    def _suggest_failed(
+        self,
+        error: TaskError,
+        *,
+        runner: TaskRunner | None = None,
+    ) -> None:
+        if runner is not None and self._suggest_runner is not runner:
+            return
         message = str(error)
         self._status.setText(
             "Ambiguous card reference."
@@ -515,9 +594,55 @@ class CardEditorDialog(QDialog):
         )
         QMessageBox.warning(self, "Suggest Card Data", str(error))
 
-    def _suggest_finished(self) -> None:
-        self._suggest_button.setEnabled(True)
+    def _suggest_finished(self, *, runner: TaskRunner | None = None) -> None:
+        if runner is not None and self._suggest_runner is not runner:
+            return
         self._suggest_runner = None
+        self._refresh_background_action_states()
+
+    def _refresh_background_action_states(self) -> None:
+        enabled = bool(
+            not self._initializing
+            and self._save_runner is None
+            and self._suggest_runner is None
+        )
+        self._save_button.setEnabled(enabled)
+        self._suggest_button.setEnabled(enabled)
+        for control in (
+            self._language,
+            self._name,
+            self._description,
+            self._password,
+            self._level,
+            self._attack,
+            self._defense,
+            self._attribute,
+            self._card_type,
+            self._card_category,
+            self._pack,
+            self._large_image_frame,
+            self._small_image_frame,
+        ):
+            control.setEnabled(enabled)
+        if enabled:
+            self._update_navigation_buttons()
+        else:
+            self._previous_button.setEnabled(False)
+            self._next_button.setEnabled(False)
+        self._refresh_close_state()
+
+    def _background_runner_active(self) -> bool:
+        return bool(self._save_runner is not None or self._suggest_runner is not None)
+
+    def _refresh_close_state(self) -> None:
+        self._close_button.setEnabled(not self._background_runner_active())
+
+    def _resume_after_save(self) -> None:
+        if self._pending_after_save is None or self._save_runner is not None:
+            return
+        after_success = self._pending_after_save
+        self._pending_after_save = None
+        after_success()
 
     def _reload_from_draft(self) -> None:
         if self._draft is None:
@@ -536,7 +661,7 @@ class CardEditorDialog(QDialog):
         self._load_localized_text(self._current_language)
         self._loading = False
         self._refresh_image_previews()
-        self._update_navigation_buttons()
+        self._refresh_background_action_states()
 
     def _update_navigation_buttons(self) -> None:
         if self._draft is None:
@@ -561,7 +686,12 @@ class CardEditorDialog(QDialog):
         self._next_button.setEnabled(self._draft.card_index < maximum)
 
     def _navigate(self, offset: int) -> None:
-        if self._initializing or self._draft is None:
+        if (
+            self._initializing
+            or self._draft is None
+            or self._save_runner is not None
+            or self._suggest_runner is not None
+        ):
             return
         if self._draft.is_new or offset not in {-1, 1}:
             return
@@ -595,10 +725,14 @@ class CardEditorDialog(QDialog):
             logging.exception("Loading card index %s failed.", target_index)
             QMessageBox.warning(self, "Navigate Cards", str(error))
             return
+        source_was_clean = (
+            not detail.dirty if isinstance(detail, CardEditDraft) else True
+        )
         self._draft = (
             detail.clone() if isinstance(detail, CardEditDraft) else detail.to_draft()
         )
         self._draft.dirty = False
+        self._record_save_original(source_was_clean=source_was_clean)
         self._card_index.setText(str(self._draft.card_index))
         self._card_id.setText(str(self._draft.card_id))
         self.setWindowTitle("Card Detail")
@@ -607,8 +741,42 @@ class CardEditorDialog(QDialog):
         self._image_request += 1
         self._reload_from_draft()
 
+    def _record_save_original(self, *, source_was_clean: bool) -> None:
+        draft = self._draft
+        eligible = bool(
+            source_was_clean
+            and draft is not None
+            and not draft.is_new
+            and draft.large_image_source is None
+            and draft.small_image_source is None
+        )
+        self._single_save_eligible = eligible
+        self._save_original = draft.clone() if eligible and draft is not None else None
+        if self._save_original is not None:
+            self._save_original.dirty = False
+
+    def _eligible_save_original(
+        self,
+        draft: CardEditDraft,
+    ) -> CardEditDraft | None:
+        original = self._save_original
+        if (
+            not self._single_save_eligible
+            or original is None
+            or draft.is_new
+            or original.card_index != draft.card_index
+            or original.card_id != draft.card_id
+        ):
+            return None
+        return original.clone()
+
     def _choose_image(self, *, mini: bool) -> None:
-        if self._initializing or self._draft is None:
+        if (
+            self._initializing
+            or self._draft is None
+            or self._save_runner is not None
+            or self._suggest_runner is not None
+        ):
             return
         first = self._pick_image("small" if mini else "large")
         if first is None:
@@ -693,17 +861,15 @@ class CardEditorDialog(QDialog):
             return
         self._image_request += 1
         request = (self._image_request, self._draft.card_index, key)
-        runner = TaskRunner(
-            lambda: (request, self._service.load_card_images(self._manifest, key))
-        )
+        service = self._service
+        manifest = self._manifest
+        runner = TaskRunner(lambda: (request, service.load_card_images(manifest, key)))
         self._image_runner = runner
+        self._image_runners.add(runner)
+        self._image_tasks[id(runner.signals)] = (runner, request)
         runner.signals.succeeded.connect(self._image_pair_loaded)
-        runner.signals.failed.connect(
-            lambda error, active_request=request: self._image_pair_failed(
-                active_request, error
-            )
-        )
-        runner.signals.finished.connect(lambda: self._image_runner_finished(runner))
+        runner.signals.failed.connect(self._image_load_failed)
+        runner.signals.finished.connect(self._image_load_finished)
         self._thread_pool.start(runner)
 
     def _set_image_preview(
@@ -780,9 +946,21 @@ class CardEditorDialog(QDialog):
             self._set_image_preview(self._small_image, pair[1], mini=True)
         self._scale_image_previews()
 
-    def _image_runner_finished(self, runner: TaskRunner) -> None:
+    def _image_load_failed(self, error: TaskError) -> None:
+        active = self._image_tasks.get(id(self.sender()))
+        if active is not None:
+            _runner, request = active
+            self._image_pair_failed(request, error)
+
+    def _image_load_finished(self) -> None:
+        active = self._image_tasks.pop(id(self.sender()), None)
+        if active is None:
+            return
+        runner, _request = active
+        self._image_runners.discard(runner)
         if self._image_runner is runner:
             self._image_runner = None
+        self._resume_after_save()
 
     def _scale_image_previews(self) -> None:
         large_pixmap = self._original_image_pixmaps.get(False)

@@ -2,27 +2,15 @@
 <ui version="4.0">
  <class>CardListWindow</class>
  <widget class="QWidget" name="CardListWindow">
-  <property name="minimumSize"><size><width>1200</width><height>700</height></size></property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item><layout class="QHBoxLayout" name="displayControlsLayout">
     <item><widget class="QLabel" name="labelDisplayLanguage"><property name="text"><string>Display Language</string></property></widget></item>
     <item><widget class="QComboBox" name="cmbDisplayLanguage"/></item>
     <item><widget class="QPushButton" name="btnUnusedFilter"><property name="text"><string>filter empty</string></property><property name="checkable"><bool>true</bool></property></widget></item>
-    <item><widget class="QPushButton" name="btnEnableAll"><property name="text"><string>enable all</string></property><property name="toolTip"><string>Change eligible disabled cards to the joey pack while preserving protected cards.</string></property></widget></item>
+    <item><widget class="QToolButton" name="btnEnableAll"><property name="text"><string>enable all</string></property><property name="toolTip"><string>Change eligible disabled cards to the joey pack while preserving protected cards.</string></property></widget></item>
     <item><spacer name="displayControlsSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
    </layout></item>
    <item><widget class="QTableView" name="tableCards"><property name="horizontalScrollBarPolicy"><enum>Qt::ScrollBarAsNeeded</enum></property><property name="verticalScrollBarPolicy"><enum>Qt::ScrollBarAsNeeded</enum></property><property name="alternatingRowColors"><bool>true</bool></property><property name="selectionBehavior"><enum>QAbstractItemView::SelectRows</enum></property><property name="selectionMode"><enum>QAbstractItemView::SingleSelection</enum></property></widget></item>
-   <item><layout class="QHBoxLayout" name="buttonLayout">
-    <item><widget class="QPushButton" name="btnAdd"><property name="text"><string>Add Card</string></property></widget></item>
-    <item><widget class="QPushButton" name="btnUpdate"><property name="text"><string>Update Card</string></property><property name="enabled"><bool>false</bool></property></widget></item>
-    <item><widget class="QPushButton" name="btnImport"><property name="text"><string>Import</string></property></widget></item>
-    <item><widget class="QPushButton" name="btnExport"><property name="text"><string>Export</string></property></widget></item>
-    <item><widget class="QPushButton" name="btnSuggest"><property name="text"><string>Suggest</string></property></widget></item>
-    <item><widget class="QPushButton" name="btnCancelSuggest"><property name="text"><string>Cancel Suggest</string></property><property name="visible"><bool>false</bool></property></widget></item>
-    <item><spacer name="horizontalSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
-    <item><widget class="QPushButton" name="btnSave"><property name="text"><string>Save</string></property><property name="enabled"><bool>false</bool></property></widget></item>
-    <item><widget class="QPushButton" name="btnClose"><property name="text"><string>Close</string></property></widget></item>
-   </layout></item>
    <item><widget class="QProgressBar" name="pgbProgress"><property name="visible"><bool>false</bool></property><property name="minimum"><number>0</number></property><property name="maximum"><number>0</number></property><property name="textVisible"><bool>false</bool></property></widget></item>
   </layout>
  </widget>

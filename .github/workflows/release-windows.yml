@@ -1,0 +1,161 @@
+name: Release Windows
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".release/v0.1.0"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version tag to release (for example v0.2.0)"
+        required: true
+        default: "v0.1.0"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHON_VERSION: "3.11"
+      PYINSTALLER_VERSION: "6.22.2"
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'master' || github.sha }}
+          fetch-depth: 0
+
+      - name: Resolve and verify release target
+        shell: pwsh
+        run: |
+          git fetch origin master --no-tags
+          $head = (git rev-parse HEAD).Trim()
+
+          if ("${{ github.event_name }}" -eq "push") {
+            $version = "v0.1.0"
+            if ($head -ne "${{ github.sha }}") {
+              throw "Checked-out commit $head does not match triggering master commit ${{ github.sha }}."
+            }
+            $branches = git branch -r --contains $head
+            if (-not ($branches -match "origin/master")) {
+              throw "Release target $head is not reachable from origin/master."
+            }
+          }
+          else {
+            $version = "${{ inputs.version }}"
+            $master = (git rev-parse origin/master).Trim()
+            if ($head -ne $master) {
+              throw "Workflow-dispatch releases must use origin/master HEAD ($master), got $head."
+            }
+          }
+
+          if ($version -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Version '$version' must match vMAJOR.MINOR.PATCH."
+          }
+
+          $existingTag = git ls-remote --tags origin "refs/tags/$version"
+          if ($existingTag) {
+            throw "Tag $version already exists. Refusing to move or replace an existing release tag."
+          }
+
+          "VERSION=$version" >> $env:GITHUB_ENV
+          "TARGET_SHA=$head" >> $env:GITHUB_ENV
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
+          python -m pip install "pyinstaller==${{ env.PYINSTALLER_VERSION }}"
+
+      - name: Run test suite
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: "offscreen"
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Build portable Windows application
+        shell: pwsh
+        run: python -m PyInstaller --noconfirm --clean packaging/YugiohEditor.spec
+
+      - name: Validate packaged application
+        shell: pwsh
+        run: |
+          $exe = "dist/YugiohEditor/YugiohEditor.exe"
+          if (-not (Test-Path $exe -PathType Leaf)) {
+            throw "Packaged executable not found: $exe"
+          }
+
+          $requiredResources = @(
+            "dist/YugiohEditor/_internal/yugioh_editor/resources/app.icon",
+            "dist/YugiohEditor/_internal/yugioh_editor/resources/card_reading_jpn.csv",
+            "dist/YugiohEditor/_internal/yugioh_editor/ui/start_window.ui",
+            "dist/YugiohEditor/_internal/yugioh_editor/ui/project_window.ui",
+            "dist/YugiohEditor/_internal/yugioh_editor/ui/card_list_window.ui",
+            "dist/YugiohEditor/_internal/yugioh_editor/ui/card_editor_dialog.ui"
+          )
+          foreach ($resource in $requiredResources) {
+            if (-not (Test-Path $resource -PathType Leaf)) {
+              throw "Required packaged resource not found: $resource"
+            }
+          }
+
+          $process = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 5
+          if ($process.HasExited) {
+            throw "Packaged YugiohEditor exited during startup smoke test with code $($process.ExitCode)."
+          }
+          Stop-Process -Id $process.Id -Force
+
+      - name: Create release archive and checksum
+        shell: pwsh
+        run: |
+          $archive = "YugiohEditor-$env:VERSION-win-x64.zip"
+          Compress-Archive -Path "dist/YugiohEditor" -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content -Path "SHA256SUMS.txt" -Encoding ascii
+          "ARCHIVE=$archive" >> $env:GITHUB_ENV
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          @"
+          Initial YugiohEditor release.
+
+          Windows portable build:
+          1. Download `$env:ARCHIVE`.
+          2. Extract the ZIP.
+          3. Open the `YugiohEditor` folder.
+          4. Run `YugiohEditor.exe`.
+
+          The package includes Python, PySide6/Qt, pandas, Pillow, and YugiohEditor runtime resources. End users do not need to install Python.
+          "@ | Set-Content -Path RELEASE_NOTES.md -Encoding utf8
+
+          gh release create "$env:VERSION" `
+            "$env:ARCHIVE" `
+            "SHA256SUMS.txt" `
+            --target "$env:TARGET_SHA" `
+            --title "YugiohEditor $env:VERSION" `
+            --notes-file RELEASE_NOTES.md

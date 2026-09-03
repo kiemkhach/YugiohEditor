@@ -1,14 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
 from PyInstaller.utils.hooks import collect_data_files
+
+# PyInstaller resolves relative source paths from the directory containing the
+# spec file. Resolve the repository root explicitly so packaging works the same
+# locally and on GitHub-hosted Windows runners.
+project_root = os.path.abspath(os.path.join(SPECPATH, os.pardir))
+entry_point = os.path.join(project_root, "main.py")
 
 # Bundle all non-Python runtime data owned by the application package.
 # This includes resources/*.csv, resources/*.icon, and ui/*.ui.
 datas = collect_data_files("yugioh_editor")
 
 a = Analysis(
-    ["main.py"],
-    pathex=["."],
+    [entry_point],
+    pathex=[project_root],
     binaries=[],
     datas=datas,
     hiddenimports=[],
